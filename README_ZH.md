@@ -300,7 +300,7 @@ client := cachex.NewClient(
         if age < 5*time.Second {
             return cachex.StateFresh
         }
-        if age < 30*time.Second {
+        if age < 5*time.Second + 25*time.Second {
             return cachex.StateStale
         }
         return cachex.StateTooStale
