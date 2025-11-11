@@ -47,7 +47,7 @@ type Product struct {
 }
 
 func main() {
-    // Create data cache (L1)
+    // Create data cache
     cacheConfig := cachex.DefaultRistrettoCacheConfig[*cachex.Entry[*Product]]()
     cacheConfig.TTL = 30 * time.Second // 5s fresh + 25s stale
     cache, _ := cachex.NewRistrettoCache(cacheConfig)
