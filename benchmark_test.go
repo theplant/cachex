@@ -233,7 +233,6 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 		NotFoundWithTTL[*Entry[*Product]](notFoundCache, scenario.NotFoundFreshTTL, scenario.NotFoundStaleTTL),
 		WithServeStale[*Entry[*Product]](true),
 		WithFetchTimeout[*Entry[*Product]](5*time.Second),
-		WithFetchConcurrency[*Entry[*Product]](1), // Full singleflight (merge all concurrent requests)
 	)
 	b.Cleanup(func() {
 		_ = client.Close()

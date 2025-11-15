@@ -79,7 +79,6 @@ func main() {
         cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second), // 5s fresh, 25s stale
         cachex.NotFoundWithTTL[*cachex.Entry[*Product]](notFoundCache, 1*time.Second, 5*time.Second),
         cachex.WithServeStale[*cachex.Entry[*Product]](true),
-        cachex.WithFetchConcurrency[*cachex.Entry[*Product]](1), // Full singleflight
     )
     defer client.Close() // 清理资源
 
@@ -361,11 +360,19 @@ user, err := userCache.Get(ctx, "user:123")
 
 ### Q: 缓存击穿防护如何工作？
 
-**A:** Cachex 使用双层防御机制：
+**A:** Cachex 使用基于**并发探索 + 结果收敛**哲学的双层防御机制：
 
-1. **Singleflight**（主要）：对相同 key 的并发请求去重。只有一个 goroutine 从上游获取数据；其他 goroutine 等待并接收相同结果。这消除了 99%+ 的冗余拉取。通过 `WithFetchConcurrency` 配置。
+1. **Singleflight 并发控制**（主要）：
 
-2. **DoubleCheck**（辅助）：处理窄竞态窗口，即请求 B 在请求 A 完成写入之前检查缓存（miss）。当 B 进入 singleflight 并检测到 A 刚刚写入了 key，B 会重新检查本地缓存而不是再次拉取。此优化默认启用，窗口为 10ms。如不需要可通过 `WithDoubleCheck(nil, 0)` 禁用。
+   - **探索阶段**：缓存 miss 时，`WithFetchConcurrency` 允许 N 个并发 fetch 以最大化吞吐量
+   - **默认 (N=1)**：完全去重 - 仅一次 fetch，其他等待（消除 99%+ 冗余）
+   - **N > 1**：适度冗余 - 请求分布在 N 个 slot 中，提升吞吐量
+
+2. **DoubleCheck**（辅助）：
+   - 处理窄竞态窗口，即请求 B 在请求 A 完成写入之前检查缓存（miss）
+   - **跨所有 singleflight slot 工作**，确保首次成功 fetch 后快速收敛
+   - 默认启用 10ms 窗口，无论并发设置如何都能最大化缓存命中率
+   - 如不需要可通过 `WithDoubleCheck(nil, 0)` 禁用
 
 ### Q: 新鲜 TTL 和过期 TTL 有什么区别？
 

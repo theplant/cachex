@@ -235,7 +235,6 @@ func (c *Client[T]) setWithoutUpstream(ctx context.Context, key string, value T)
 		return errors.Wrapf(err, "set in backend failed for key: %s", key)
 	}
 
-	// Mark this key as recently set for double-check optimization
 	c.markRecentWrite(ctx, key)
 
 	return nil
@@ -271,6 +270,11 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 
 		// Double-check optimization: if this key was recently written, check cache again
 		// This handles the narrow window after a write completes but before singleflight releases
+		//
+		// Note: We use the original key (not sfKey) because:
+		// 1. fetchConcurrency allows multiple slots to fetch concurrently (exploration phase)
+		// 2. Once ANY slot completes, ALL slots should converge to reuse that result (convergence phase)
+		// 3. Using key ensures cross-slot visibility, maximizing result reuse after first completion
 		if c.wasRecentlyWritten(ctx, key) {
 			cachedValue, err := c.get(ctx, key, true)
 
@@ -462,8 +466,15 @@ func WithFetchTimeout[T any](timeout time.Duration) ClientOption[T] {
 }
 
 // WithFetchConcurrency sets the maximum number of concurrent fetch operations per key.
-// If set to 1 (default), all requests for the same key are merged into a single fetch.
-// If set to N > 1, requests are randomly distributed across N concurrent fetches.
+//
+// Philosophy: Concurrent exploration + Result convergence
+//   - Exploration phase: When cache misses, allow N concurrent fetches to maximize throughput
+//   - Convergence phase: Once any fetch completes, all subsequent requests reuse that result
+//
+// Behavior:
+//   - concurrency = 1 (default): Full singleflight, all requests wait for single fetch
+//   - concurrency > 1: Requests distributed across N slots, allowing moderate redundancy
+//
 // Example: WithFetchConcurrency(5) allows up to 5 concurrent upstream fetches for the same key.
 func WithFetchConcurrency[T any](concurrency int) ClientOption[T] {
 	return func(c *Client[T]) {

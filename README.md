@@ -79,7 +79,6 @@ func main() {
         cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second), // 5s fresh, 25s stale
         cachex.NotFoundWithTTL[*cachex.Entry[*Product]](notFoundCache, 1*time.Second, 5*time.Second),
         cachex.WithServeStale[*cachex.Entry[*Product]](true),
-        cachex.WithFetchConcurrency[*cachex.Entry[*Product]](1), // Full singleflight
     )
     defer client.Close() // Clean up resources
 
@@ -361,11 +360,19 @@ user, err := userCache.Get(ctx, "user:123")
 
 ### Q: How does cache stampede protection work?
 
-**A:** Cachex uses a two-layer defense:
+**A:** Cachex uses a two-layer defense based on the philosophy of **concurrent exploration + result convergence**:
 
-1. **Singleflight** (Primary): Deduplicates concurrent requests for the same key. Only one goroutine fetches from upstream; others wait and receive the same result. This eliminates 99%+ of redundant fetches. Configure with `WithFetchConcurrency`.
+1. **Singleflight with Concurrency Control** (Primary):
 
-2. **DoubleCheck** (Supplementary): Handles the narrow race window where Request B checks the cache (miss) before Request A completes its write. When B enters singleflight and detects A just wrote the key, B re-checks the local cache instead of fetching again. This optimization is enabled by default with a 10ms window. Disable with `WithDoubleCheck(nil, 0)` if not needed.
+   - **Exploration phase**: When cache misses, `WithFetchConcurrency` allows N concurrent fetches to maximize throughput
+   - **Default (N=1)**: Full deduplication - only one fetch, others wait (99%+ redundancy elimination)
+   - **N > 1**: Moderate redundancy - requests distributed across N slots for higher throughput
+
+2. **DoubleCheck** (Supplementary):
+   - Handles the narrow race window where Request B checks the cache (miss) before Request A completes its write
+   - Works **across all singleflight slots**, enabling fast convergence after first successful fetch
+   - Enabled by default with 10ms window, maximizing cache hit rate regardless of concurrency setting
+   - Disable with `WithDoubleCheck(nil, 0)` if not needed
 
 ### Q: What's the difference between fresh and stale TTL?
 
