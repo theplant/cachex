@@ -18,6 +18,8 @@ type RedisCache[T any] struct {
 	useBinary bool // true if T implements encoding.BinaryMarshaler and encoding.BinaryUnmarshaler
 }
 
+var _ Cache[any] = &RedisCache[any]{}
+
 // RedisCacheConfig holds configuration for RedisCache
 type RedisCacheConfig struct {
 	// Client is the Redis client (supports both single and cluster)
@@ -72,10 +74,10 @@ func (r *RedisCache[T]) Set(ctx context.Context, key string, value T) error {
 		if marshaler, ok := any(value).(encoding.BinaryMarshaler); ok {
 			data, err = marshaler.MarshalBinary()
 			if err != nil {
-				return errors.Wrap(err, "failed to marshal binary")
+				return errors.Wrapf(err, "failed to marshal binary for key: %s", key)
 			}
 		} else {
-			return errors.New("value does not implement encoding.BinaryMarshaler")
+			return errors.Errorf("value does not implement encoding.BinaryMarshaler for key: %s", key)
 		}
 	} else {
 		switch any(value).(type) {
@@ -85,23 +87,23 @@ func (r *RedisCache[T]) Set(ctx context.Context, key string, value T) error {
 			// For other types: marshal to JSON
 			data, err = json.Marshal(value)
 			if err != nil {
-				return errors.Wrap(err, "failed to marshal value")
+				return errors.Wrapf(err, "failed to marshal value for key: %s", key)
 			}
 		}
 	}
 
 	if err := r.client.Set(ctx, r.prefixedKey(key), data, r.ttl).Err(); err != nil {
-		return errors.Wrap(err, "failed to set cache entry")
+		return errors.Wrapf(err, "failed to set cache entry for key: %s", key)
 	}
 
 	return nil
 }
 
-func (r *RedisCache[T]) handleRedisError(err error) error {
+func (r *RedisCache[T]) handleRedisError(err error, key string) error {
 	if errors.Is(err, redis.Nil) {
-		return &ErrKeyNotFound{}
+		return errors.Wrapf(&ErrKeyNotFound{}, "key not found in redis cache for key: %s", key)
 	}
-	return errors.Wrap(err, "failed to get cache entry")
+	return errors.Wrapf(err, "failed to get cache entry for key: %s", key)
 }
 
 // Get retrieves a value from the cache
@@ -112,14 +114,14 @@ func (r *RedisCache[T]) Get(ctx context.Context, key string) (T, error) {
 	if _, ok := any(zero).(string); ok {
 		str, err := cmd.Result()
 		if err != nil {
-			return zero, r.handleRedisError(err)
+			return zero, r.handleRedisError(err, key)
 		}
 		return any(str).(T), nil
 	}
 
 	data, err := cmd.Bytes()
 	if err != nil {
-		return zero, r.handleRedisError(err)
+		return zero, r.handleRedisError(err, key)
 	}
 
 	if _, ok := any(zero).([]byte); ok {
@@ -130,7 +132,7 @@ func (r *RedisCache[T]) Get(ctx context.Context, key string) (T, error) {
 		var value T
 		if unmarshaler, ok := any(&value).(encoding.BinaryUnmarshaler); ok {
 			if err := unmarshaler.UnmarshalBinary(data); err != nil {
-				return zero, errors.Wrap(err, "failed to unmarshal binary")
+				return zero, errors.Wrapf(err, "failed to unmarshal binary for key: %s", key)
 			}
 		}
 		return value, nil
@@ -139,7 +141,7 @@ func (r *RedisCache[T]) Get(ctx context.Context, key string) (T, error) {
 	// For other types: unmarshal from JSON
 	var value T
 	if err := json.Unmarshal(data, &value); err != nil {
-		return zero, errors.Wrap(err, "failed to unmarshal value")
+		return zero, errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
 	}
 
 	return value, nil
@@ -148,7 +150,7 @@ func (r *RedisCache[T]) Get(ctx context.Context, key string) (T, error) {
 // Del removes a value from the cache
 func (r *RedisCache[T]) Del(ctx context.Context, key string) error {
 	if err := r.client.Del(ctx, r.prefixedKey(key)).Err(); err != nil {
-		return errors.Wrap(err, "failed to delete cache entry")
+		return errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
 	}
 	return nil
 }

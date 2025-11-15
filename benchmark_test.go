@@ -235,6 +235,9 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 		WithFetchTimeout[*Entry[*Product]](5*time.Second),
 		WithFetchConcurrency[*Entry[*Product]](1), // Full singleflight (merge all concurrent requests)
 	)
+	b.Cleanup(func() {
+		_ = client.Close()
+	})
 
 	// Warm up: pre-populate hot, warm, and cold products
 	ctx := context.Background()

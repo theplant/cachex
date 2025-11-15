@@ -10,7 +10,7 @@
 
 ## Features
 
-- **🛡️ Cache Stampede Protection** - Singleflight mechanism merges concurrent requests, preventing traffic surge when hot keys expire
+- **🛡️ Cache Stampede Protection** - Singleflight + DoubleCheck mechanisms eliminate redundant fetches, preventing traffic surge when hot keys expire
 - **🚫 Cache Penetration Defense** - Not-Found caching mechanism prevents malicious queries from overwhelming the database
 - **🔄 Serve-Stale** - Serves stale data while asynchronously refreshing, ensuring high availability and low latency
 - **🎪 Layered Caching** - Flexible multi-level caching (L1 Memory + L2 Redis), Client can also be used as upstream
@@ -81,6 +81,7 @@ func main() {
         cachex.WithServeStale[*cachex.Entry[*Product]](true),
         cachex.WithFetchConcurrency[*cachex.Entry[*Product]](1), // Full singleflight
     )
+    defer client.Close() // Clean up resources
 
     // Use the cache
     ctx := context.Background()
@@ -114,13 +115,15 @@ sequenceDiagram
         Client->>SF: Async refresh
         SF->>Upstream: Fetch(key)
         Upstream-->>SF: new value
-        SF->>Cache: Update(key, value)
+        SF->>NFCache: Del(key)
+        SF->>Cache: Set(key, value)
     else Cache Hit + Stale (serveStale=false) or TooStale
         Cache-->>Client: value (stale/too stale)
         Note over Client: Skip NotFoundCache, fetch directly<br/>(backend has data)
         Client->>SF: Fetch(key)
         SF->>Upstream: Fetch(key)
         Upstream-->>SF: value
+        SF->>NFCache: Del(key)
         SF->>Cache: Set(key, value)
         SF-->>Client: value
         Client-->>App: Return value
@@ -137,7 +140,8 @@ sequenceDiagram
             SF->>Upstream: Fetch(key)
             alt Key Still Not Found
                 Upstream-->>SF: ErrKeyNotFound
-                SF->>NFCache: Update not-found
+                SF->>Cache: Del(key)
+                SF->>NFCache: Set(key, timestamp)
             else Key Now Exists
                 Upstream-->>SF: value
                 SF->>NFCache: Del(key)
@@ -149,12 +153,14 @@ sequenceDiagram
             SF->>Upstream: Fetch(key)
             alt Key Exists
                 Upstream-->>SF: value
+                SF->>NFCache: Del(key)
                 SF->>Cache: Set(key, value)
                 SF-->>Client: value
                 Client-->>App: Return value
             else Key Not Found
                 Upstream-->>SF: ErrKeyNotFound
-                SF->>NFCache: Cache not-found
+                SF->>Cache: Del(key)
+                SF->>NFCache: Set(key, timestamp)
                 SF-->>Client: ErrKeyNotFound
                 Client-->>App: Return ErrKeyNotFound
             end
@@ -168,7 +174,8 @@ sequenceDiagram
 - **BackendCache** - Storage layer (Ristretto, Redis, GORM, or custom), also serves as Upstream interface
 - **NotFoundCache** - Dedicated cache for non-existent keys to prevent cache penetration
 - **Upstream** - Data source (database, API, another Client, or custom)
-- **Singleflight** - Deduplicates concurrent requests for the same key to prevent cache stampede
+- **Singleflight** - Deduplicates concurrent requests for the same key (primary defense against cache stampede)
+- **DoubleCheck** - Re-checks local cache for recently written keys within singleflight (eliminates remaining edge cases)
 - **Entry** - Wrapper with timestamp for time-based staleness checks
 
 ## Cache Backends
@@ -181,6 +188,7 @@ High-performance, TinyLFU-based in-memory cache.
 config := cachex.DefaultRistrettoCacheConfig[*Product]()
 config.TTL = 30 * time.Second
 cache, err := cachex.NewRistrettoCache(config)
+defer cache.Close()
 ```
 
 ### Redis
@@ -251,12 +259,14 @@ l2Client := cachex.NewClient(
     dbUpstream,
     cachex.EntryWithTTL[*Product](1*time.Minute, 9*time.Minute),
 )
+defer l2Client.Close()
 
 // L1: In-memory cache with L2 client as upstream
 // Client can be used directly as upstream for the next layer
 l1Cache, _ := cachex.NewRistrettoCache(
     cachex.DefaultRistrettoCacheConfig[*cachex.Entry[*Product]](),
 )
+defer l1Cache.Close()
 
 l1Client := cachex.NewClient(
     l1Cache,
@@ -264,6 +274,7 @@ l1Client := cachex.NewClient(
     cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second),
     cachex.WithServeStale[*cachex.Entry[*Product]](true),
 )
+defer l1Client.Close()
 ```
 
 ### Not-Found Caching
@@ -274,6 +285,7 @@ Prevent repeated lookups for non-existent keys:
 notFoundCache, _ := cachex.NewRistrettoCache(
     cachex.DefaultRistrettoCacheConfig[time.Time](),
 )
+defer notFoundCache.Close()
 
 client := cachex.NewClient(
     dataCache,
@@ -285,6 +297,7 @@ client := cachex.NewClient(
         5*time.Second,  // stale TTL
     ),
 )
+defer client.Close()
 ```
 
 ### Custom Staleness Logic
@@ -307,6 +320,7 @@ client := cachex.NewClient(
     }),
     cachex.WithServeStale[*Product](true),
 )
+defer client.Close()
 ```
 
 ### Type Transformation
@@ -345,9 +359,13 @@ user, err := userCache.Get(ctx, "user:123")
 
 **A:** Use `Entry[T]` with `EntryWithTTL` for simple time-based expiration. Use custom staleness checkers when you need domain-specific logic (e.g., checking a `version` field).
 
-### Q: How does singleflight work?
+### Q: How does cache stampede protection work?
 
-**A:** Singleflight deduplicates concurrent requests for the same key. Only one goroutine fetches from upstream; others wait and receive the same result. Configure with `WithFetchConcurrency`.
+**A:** Cachex uses a two-layer defense:
+
+1. **Singleflight** (Primary): Deduplicates concurrent requests for the same key. Only one goroutine fetches from upstream; others wait and receive the same result. This eliminates 99%+ of redundant fetches. Configure with `WithFetchConcurrency`.
+
+2. **DoubleCheck** (Supplementary): Handles the narrow race window where Request B checks the cache (miss) before Request A completes its write. When B enters singleflight and detects A just wrote the key, B re-checks the local cache instead of fetching again. This optimization is enabled by default with a 10ms window. Disable with `WithDoubleCheck(nil, 0)` if not needed.
 
 ### Q: What's the difference between fresh and stale TTL?
 
