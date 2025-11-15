@@ -10,7 +10,7 @@
 
 ## 特性
 
-- **🛡️ 防御缓存击穿** - 通过 Singleflight 机制，合并并发请求，防止热点 key 失效时的流量冲击
+- **🛡️ 防御缓存击穿** - Singleflight + DoubleCheck 双重机制消除冗余拉取，防止热点 key 失效时的流量冲击
 - **🚫 防御缓存穿透** - Not-Found 缓存机制，缓存不存在的 key，避免恶意查询打垮数据库
 - **🔄 Serve-Stale** - 提供陈旧数据的同时异步刷新，确保高可用性和低延迟
 - **🎪 分层缓存** - 灵活组合多级缓存（L1 内存 + L2 Redis），Client 可作为下层 Upstream
@@ -79,8 +79,8 @@ func main() {
         cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second), // 5s fresh, 25s stale
         cachex.NotFoundWithTTL[*cachex.Entry[*Product]](notFoundCache, 1*time.Second, 5*time.Second),
         cachex.WithServeStale[*cachex.Entry[*Product]](true),
-        cachex.WithFetchConcurrency[*cachex.Entry[*Product]](1), // Full singleflight
     )
+    defer client.Close() // 清理资源
 
     // Use the cache
     ctx := context.Background()
@@ -90,8 +90,6 @@ func main() {
 ```
 
 ## 架构设计
-
-Cachex 采用清晰的分层架构。
 
 ```mermaid
 sequenceDiagram
@@ -114,13 +112,15 @@ sequenceDiagram
         Client->>SF: Async refresh
         SF->>Upstream: Fetch(key)
         Upstream-->>SF: new value
-        SF->>Cache: Update(key, value)
+        SF->>NFCache: Del(key)
+        SF->>Cache: Set(key, value)
     else Cache Hit + Stale (serveStale=false) or TooStale
         Cache-->>Client: value (stale/too stale)
         Note over Client: Skip NotFoundCache, fetch directly<br/>(backend has data)
         Client->>SF: Fetch(key)
         SF->>Upstream: Fetch(key)
         Upstream-->>SF: value
+        SF->>NFCache: Del(key)
         SF->>Cache: Set(key, value)
         SF-->>Client: value
         Client-->>App: Return value
@@ -137,7 +137,8 @@ sequenceDiagram
             SF->>Upstream: Fetch(key)
             alt Key Still Not Found
                 Upstream-->>SF: ErrKeyNotFound
-                SF->>NFCache: Update not-found
+                SF->>Cache: Del(key)
+                SF->>NFCache: Set(key, timestamp)
             else Key Now Exists
                 Upstream-->>SF: value
                 SF->>NFCache: Del(key)
@@ -149,12 +150,14 @@ sequenceDiagram
             SF->>Upstream: Fetch(key)
             alt Key Exists
                 Upstream-->>SF: value
+                SF->>NFCache: Del(key)
                 SF->>Cache: Set(key, value)
                 SF-->>Client: value
                 Client-->>App: Return value
             else Key Not Found
                 Upstream-->>SF: ErrKeyNotFound
-                SF->>NFCache: Cache not-found
+                SF->>Cache: Del(key)
+                SF->>NFCache: Set(key, timestamp)
                 SF-->>Client: ErrKeyNotFound
                 Client-->>App: Return ErrKeyNotFound
             end
@@ -168,7 +171,8 @@ sequenceDiagram
 - **BackendCache** - 存储层（Ristretto、Redis、GORM 或自定义），同时也是 Upstream 接口
 - **NotFoundCache** - 专门缓存不存在的 key，防止缓存穿透
 - **Upstream** - 数据源（数据库、API、另一个 Client 或自定义）
-- **Singleflight** - 对相同 key 的并发请求去重，防止缓存击穿
+- **Singleflight** - 对相同 key 的并发请求去重（防御缓存击穿的主要机制）
+- **DoubleCheck** - 在 singleflight 内对最近写入的 key 重新检查本地缓存（消除剩余边界情况）
 - **Entry** - 带时间戳的包装器，用于基于时间的陈旧检查
 
 ## 缓存后端
@@ -181,6 +185,7 @@ sequenceDiagram
 config := cachex.DefaultRistrettoCacheConfig[*Product]()
 config.TTL = 30 * time.Second
 cache, err := cachex.NewRistrettoCache(config)
+defer cache.Close()
 ```
 
 ### Redis
@@ -251,12 +256,14 @@ l2Client := cachex.NewClient(
     dbUpstream,
     cachex.EntryWithTTL[*Product](1*time.Minute, 9*time.Minute),
 )
+defer l2Client.Close()
 
 // L1: In-memory cache with L2 client as upstream
 // Client can be used directly as upstream for the next layer
 l1Cache, _ := cachex.NewRistrettoCache(
     cachex.DefaultRistrettoCacheConfig[*cachex.Entry[*Product]](),
 )
+defer l1Cache.Close()
 
 l1Client := cachex.NewClient(
     l1Cache,
@@ -264,7 +271,42 @@ l1Client := cachex.NewClient(
     cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second),
     cachex.WithServeStale[*cachex.Entry[*Product]](true),
 )
+defer l1Client.Close()
+
+// 读取: L1 miss → L2 → 数据库 (如果 L2 也 miss)
+product, _ := l1Client.Get(ctx, "product-123")
 ```
+
+#### 写操作传播
+
+当你使用一个 `Client` 作为另一个 `Client` 的 upstream 时，写操作（`Set`/`Del`）会自动在所有缓存层传播，并在 upstream 未实现 `Cache[T]` 时自然停止：
+
+```
+L1 缓存 → L2 缓存 → L3 缓存 → 数据库
+   ✅        ✅         ✅        ❌ (自动停止)
+```
+
+传播机制基于**类型检测**：如果 upstream 实现了 `Cache[T]` 接口，写操作会传播；如果 upstream 未实现 `Cache[T]`（例如 `UpstreamFunc` 数据源），传播自动停止。
+
+**模式支持：**
+
+该设计自然支持两种缓存模式：
+
+- **Write-Through 模式（多级缓存）：**
+
+  ```go
+  // 所有缓存层保持同步
+  l1Client.Set(ctx, key, value)  // → L1 → L2 → ... → (在数据源处停止)
+  ```
+
+- **Cache-Aside 模式（缓存 + 数据库）：**
+  ```go
+  // 先更新数据库，再更新缓存
+  db.Update(user)
+  l1Client.Set(ctx, userID, user)  // 只更新缓存层，不写数据库
+  ```
+
+核心机制：**缓存写操作会在 `Cache[T]` 链上传播，但在 upstream 未实现 `Cache[T]` 时自动停止**，这使得两种模式都安全正确。
 
 ### Not-Found 缓存
 
@@ -274,6 +316,7 @@ l1Client := cachex.NewClient(
 notFoundCache, _ := cachex.NewRistrettoCache(
     cachex.DefaultRistrettoCacheConfig[time.Time](),
 )
+defer notFoundCache.Close()
 
 client := cachex.NewClient(
     dataCache,
@@ -285,6 +328,7 @@ client := cachex.NewClient(
         5*time.Second,  // 过期 TTL
     ),
 )
+defer client.Close()
 ```
 
 ### 自定义陈旧逻辑
@@ -307,6 +351,7 @@ client := cachex.NewClient(
     }),
     cachex.WithServeStale[*Product](true),
 )
+defer client.Close()
 ```
 
 ### 类型转换
@@ -328,16 +373,20 @@ user, err := userCache.Get(ctx, "user:123")
 
 > 详细结果见 [BENCHMARK_ZH.md](BENCHMARK_ZH.md)。
 
-### 关键指标（10K 商品，帕累托流量分布）
+### 关键指标（10K 商品，帕累托流量分布，**冷启动**）
 
-| 场景        | 应用层 QPS | 缓存命中率 |   P50 |     P99 | 吞吐量放大 |
-| :---------- | ---------: | ---------: | ----: | ------: | ---------: |
-| 高性能 DB   |     86,813 |     99.87% |   1µs | 4.042µs |        79x |
-| 云 1000QPS  |     86,287 |     99.88% | 917ns | 4.125µs |        82x |
-| 共享 100QPS |     86,827 |     99.88% | 959ns | 4.958µs |       827x |
-| 受限 50QPS  |     86,609 |     99.88% | 333ns | 2.375µs |     1,729x |
+| 场景      | 并发数 | 应用层 QPS | 缓存命中率 |   P50 |   P99 | DB 连接池 | DB QPS | DB 利用率 | 吞吐量放大 | 错误率 |
+| :-------- | -----: | ---------: | ---------: | ----: | ----: | --------: | -----: | --------: | ---------: | -----: |
+| 高性能 DB |    600 |    504,989 |     99.81% | 291ns | 3.3µs |       100 |  982.5 |     88.4% |     514.0x |     0% |
+| 云数据库  |    100 |     55,222 |     99.61% | 833ns |  12µs |        20 |  213.8 |     90.9% |     235.0x |     0% |
+| 共享 DB   |    100 |      7,306 |     98.59% | 791ns | 831ms |        13 |  103.0 |     99.0% |      70.2x |     0% |
+| 受限 DB   |    100 |        695 |     94.01% | 1.3µs | 2.04s |         8 |   41.6 |     98.8% |      16.7x |     0% |
 
-> 💡 通过自适应 TTL 策略，Cachex 提供 **79 倍到 1,729 倍的吞吐量放大**，且零错误。
+> 💡 **冷启动性能**：Cachex 即使在无预热的冷启动场景下也能实现 **94%+ 的缓存命中率**。如果缓存经过预热，吞吐量将显著提升（99%+ 命中率 → 极少的 DB 负载）。
+>
+> 🔥 **测试环境模拟**：所有 benchmark 场景均使用真实的数据库连接池模拟（基于 Semaphore），精确模拟真实数据库行为。
+>
+> 📊 **吞吐量放大** = 应用层 QPS / 理论 DB 吞吐量，其中理论 DB 吞吐量 = 连接池大小 / (延迟 / 1000ms)。
 
 ## 常见问题
 
@@ -345,9 +394,21 @@ user, err := userCache.Get(ctx, "user:123")
 
 **A:** 对于简单的基于时间的过期，使用 `Entry[T]` 配合 `EntryWithTTL`。当需要领域特定逻辑（如检查 `version` 字段）时，使用自定义陈旧检查器。
 
-### Q: Singleflight 如何工作？
+### Q: 缓存击穿防护如何工作？
 
-**A:** Singleflight 对相同 key 的并发请求去重。只有一个 goroutine 从上游获取数据；其他 goroutine 等待并接收相同结果。通过 `WithFetchConcurrency` 配置。
+**A:** Cachex 使用基于**并发探索 + 结果收敛**哲学的双层防御机制：
+
+1. **Singleflight 并发控制**（主要）：
+
+   - **探索阶段**：缓存 miss 时，`WithFetchConcurrency` 允许 N 个并发 fetch 以最大化吞吐量
+   - **默认 (N=1)**：完全去重 - 仅一次 fetch，其他等待（消除 99%+ 冗余）
+   - **N > 1**：适度冗余 - 请求分布在 N 个 slot 中，提升吞吐量
+
+2. **DoubleCheck**（辅助）：
+   - 处理窄竞态窗口，即请求 B 在请求 A 完成写入之前检查缓存（miss）
+   - **跨所有 singleflight slot 工作**，确保首次成功 fetch 后快速收敛
+   - 默认启用 10ms 窗口，无论并发设置如何都能最大化缓存命中率
+   - 如不需要可通过 `WithDoubleCheck(nil, 0)` 禁用
 
 ### Q: 新鲜 TTL 和过期 TTL 有什么区别？
 

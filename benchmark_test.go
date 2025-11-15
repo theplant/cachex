@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // Product represents a search result
@@ -20,21 +22,20 @@ type Product struct {
 	Description string
 }
 
-// mockDB simulates a database with QPS limit and latency
+// mockDB simulates a database with connection limit and latency
 type mockDB struct {
-	qpsLimit      int64 // 0 means unlimited
+	connLimit     int64 // 0 means unlimited, represents max concurrent connections
 	queryLatency  time.Duration
-	currentQPS    atomic.Int64
+	sem           *semaphore.Weighted
 	totalQueries  atomic.Int64
-	ticker        *time.Ticker
 	products      map[string]*Product
 	mu            sync.RWMutex
-	rejectedCount atomic.Int64
+	rejectedCount atomic.Int64 // Tracks queries that failed to acquire semaphore
 }
 
-func newMockDB(qpsLimit int64, queryLatency time.Duration) *mockDB {
+func newMockDB(connLimit int64, queryLatency time.Duration) *mockDB {
 	db := &mockDB{
-		qpsLimit:     qpsLimit,
+		connLimit:    connLimit,
 		queryLatency: queryLatency,
 		products:     make(map[string]*Product),
 	}
@@ -51,26 +52,22 @@ func newMockDB(qpsLimit int64, queryLatency time.Duration) *mockDB {
 		}
 	}
 
-	if qpsLimit > 0 {
-		db.ticker = time.NewTicker(time.Second)
-		go func() {
-			for range db.ticker.C {
-				db.currentQPS.Store(0)
-			}
-		}()
+	// Initialize semaphore for connection limit
+	if connLimit > 0 {
+		db.sem = semaphore.NewWeighted(connLimit)
 	}
 
 	return db
 }
 
 func (db *mockDB) Query(ctx context.Context, id string) (*Product, error) {
-	// Check QPS limit
-	if db.qpsLimit > 0 {
-		current := db.currentQPS.Add(1)
-		if current > db.qpsLimit {
+	// Acquire connection from semaphore (wait if all connections are busy)
+	if db.sem != nil {
+		if err := db.sem.Acquire(ctx, 1); err != nil {
 			db.rejectedCount.Add(1)
-			return nil, fmt.Errorf("DB QPS limit exceeded")
+			return nil, fmt.Errorf("failed to acquire DB connection: %w", err)
 		}
+		defer db.sem.Release(1)
 	}
 
 	db.totalQueries.Add(1)
@@ -90,9 +87,7 @@ func (db *mockDB) Query(ctx context.Context, id string) (*Product, error) {
 }
 
 func (db *mockDB) Close() {
-	if db.ticker != nil {
-		db.ticker.Stop()
-	}
+	// No cleanup needed for semaphore
 }
 
 func (db *mockDB) Stats() (total, rejected int64) {
@@ -102,8 +97,9 @@ func (db *mockDB) Stats() (total, rejected int64) {
 // BenchmarkScenario represents different DB configurations
 type BenchmarkScenario struct {
 	Name             string
-	DBQPSLimit       int64
-	DBLatency        time.Duration
+	DBConnLimit      int64         // Max concurrent DB connections (0=unlimited)
+	DBLatency        time.Duration // Simulated DB query latency
+	FetchTimeout     time.Duration // Timeout for upstream fetch
 	DataFreshTTL     time.Duration
 	DataStaleTTL     time.Duration
 	NotFoundFreshTTL time.Duration
@@ -132,23 +128,25 @@ func BenchmarkProductSearch(b *testing.B) {
 	scenarios := []BenchmarkScenario{
 		{
 			Name:             "High_Performance_DB",
-			DBQPSLimit:       0,
-			DBLatency:        5 * time.Millisecond,
-			DataFreshTTL:     30 * time.Second, // Aggressive: more refreshes
+			DBConnLimit:      100, // High-performance DB with large connection pool
+			DBLatency:        90 * time.Millisecond,
+			FetchTimeout:     2 * time.Second,
+			DataFreshTTL:     1 * time.Second,
 			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 10 * time.Second,
+			NotFoundFreshTTL: 500 * time.Millisecond,
 			NotFoundStaleTTL: 24 * time.Hour,
-			Concurrency:      100,
+			Concurrency:      600,
 			Duration:         10 * time.Second,
 			RequestsFunc:     realisticTrafficPattern,
 		},
 		{
 			Name:             "Cloud_DB_1000QPS",
-			DBQPSLimit:       1000,
-			DBLatency:        10 * time.Millisecond,
-			DataFreshTTL:     1 * time.Minute, // Moderate: balance freshness and load
+			DBConnLimit:      20, // Target 90-93% utilization
+			DBLatency:        85 * time.Millisecond,
+			FetchTimeout:     1 * time.Second,
+			DataFreshTTL:     5 * time.Second,
 			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 30 * time.Second,
+			NotFoundFreshTTL: 3 * time.Second,
 			NotFoundStaleTTL: 24 * time.Hour,
 			Concurrency:      100,
 			Duration:         10 * time.Second,
@@ -156,11 +154,12 @@ func BenchmarkProductSearch(b *testing.B) {
 		},
 		{
 			Name:             "Shared_DB_100QPS",
-			DBQPSLimit:       100,
-			DBLatency:        20 * time.Millisecond,
-			DataFreshTTL:     5 * time.Minute, // Conservative: reduce refresh pressure
+			DBConnLimit:      13, // Target 90-93% utilization
+			DBLatency:        125 * time.Millisecond,
+			FetchTimeout:     5 * time.Second,
+			DataFreshTTL:     10 * time.Second,
 			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 2 * time.Minute,
+			NotFoundFreshTTL: 5 * time.Second,
 			NotFoundStaleTTL: 24 * time.Hour,
 			Concurrency:      100,
 			Duration:         10 * time.Second,
@@ -168,11 +167,12 @@ func BenchmarkProductSearch(b *testing.B) {
 		},
 		{
 			Name:             "Constrained_DB_50QPS",
-			DBQPSLimit:       50,
-			DBLatency:        30 * time.Millisecond,
-			DataFreshTTL:     10 * time.Minute, // Very conservative: minimize DB load
+			DBConnLimit:      8, // Target 90-93% utilization
+			DBLatency:        190 * time.Millisecond,
+			FetchTimeout:     10 * time.Second,
+			DataFreshTTL:     20 * time.Second,
 			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 5 * time.Minute,
+			NotFoundFreshTTL: 10 * time.Second,
 			NotFoundStaleTTL: 24 * time.Hour,
 			Concurrency:      100,
 			Duration:         10 * time.Second,
@@ -189,7 +189,7 @@ func BenchmarkProductSearch(b *testing.B) {
 
 func runScenario(b *testing.B, scenario BenchmarkScenario) {
 	// Setup mock DB
-	db := newMockDB(scenario.DBQPSLimit, scenario.DBLatency)
+	db := newMockDB(scenario.DBConnLimit, scenario.DBLatency)
 	defer db.Close()
 
 	// Setup cache layers: Memory (L1)
@@ -232,35 +232,14 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 		EntryWithTTL[*Product](scenario.DataFreshTTL, scenario.DataStaleTTL),
 		NotFoundWithTTL[*Entry[*Product]](notFoundCache, scenario.NotFoundFreshTTL, scenario.NotFoundStaleTTL),
 		WithServeStale[*Entry[*Product]](true),
-		WithFetchTimeout[*Entry[*Product]](5*time.Second),
-		WithFetchConcurrency[*Entry[*Product]](1), // Full singleflight (merge all concurrent requests)
+		WithFetchTimeout[*Entry[*Product]](scenario.FetchTimeout),
 	)
+	b.Cleanup(func() {
+		_ = client.Close()
+	})
 
-	// Warm up: pre-populate hot, warm, and cold products
+	// No pre-warming - test cold start performance
 	ctx := context.Background()
-
-	// Warm up all hot products (top 20) - 100% coverage
-	for i := 1; i <= 20; i++ {
-		_, _ = client.Get(ctx, fmt.Sprintf("product-%d", i))
-	}
-
-	// Warm up all warm products (21-200) - 100% coverage
-	for i := 21; i <= 200; i++ {
-		_, _ = client.Get(ctx, fmt.Sprintf("product-%d", i))
-	}
-
-	// Warm up cold products (201-1000) - full coverage
-	for i := 201; i <= 1000; i++ {
-		_, _ = client.Get(ctx, fmt.Sprintf("product-%d", i))
-	}
-
-	// Warm up all not-found keys
-	for i := 0; i < 50; i++ {
-		_, _ = client.Get(ctx, fmt.Sprintf("product-notfound-%d", i))
-	}
-
-	// Wait for cache to settle
-	time.Sleep(1 * time.Second)
 
 	// Statistics
 	var (
@@ -358,8 +337,13 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 	fmt.Printf("\n")
 	fmt.Printf("========== Scenario: %s ==========\n", scenario.Name)
 	fmt.Printf("Configuration:\n")
-	fmt.Printf("  DB QPS Limit:        %d/s (0=unlimited)\n", scenario.DBQPSLimit)
+	if scenario.DBConnLimit > 0 {
+		fmt.Printf("  DB Conn Limit:       %d\n", scenario.DBConnLimit)
+	} else {
+		fmt.Printf("  DB Conn Limit:       unlimited\n")
+	}
 	fmt.Printf("  DB Latency:          %v\n", scenario.DBLatency)
+	fmt.Printf("  Fetch Timeout:       %v\n", scenario.FetchTimeout)
 	fmt.Printf("  Data Fresh TTL:      %v\n", scenario.DataFreshTTL)
 	fmt.Printf("  Data Stale TTL:      %v\n", scenario.DataStaleTTL)
 	fmt.Printf("  NotFound Fresh TTL:  %v\n", scenario.NotFoundFreshTTL)
@@ -377,10 +361,13 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 	fmt.Printf("Cache Performance:\n")
 	fmt.Printf("  Cache Hit Rate:   %.2f%%\n", cacheHitRate)
 	fmt.Printf("  DB Queries:       %d (%.1f%%)\n", dbTotal, float64(dbTotal)/float64(total)*100)
+	actualDBQPS := float64(dbTotal) / elapsed.Seconds()
+	fmt.Printf("  DB QPS:           %.1f req/s\n", actualDBQPS)
 	fmt.Printf("  DB Rejected:      %d\n", dbRejected)
-	if scenario.DBQPSLimit > 0 {
-		dbUtilization := float64(dbTotal) / float64(scenario.DBQPSLimit) / elapsed.Seconds() * 100
-		fmt.Printf("  DB Utilization:   %.1f%% of limit\n", dbUtilization)
+	if scenario.DBConnLimit > 0 {
+		expectedMaxQueries := float64(scenario.DBConnLimit) * elapsed.Seconds() / scenario.DBLatency.Seconds()
+		dbUtilization := float64(dbTotal) / expectedMaxQueries * 100
+		fmt.Printf("  DB Utilization:   %.1f%% of capacity\n", dbUtilization)
 	}
 	fmt.Printf("\n")
 	fmt.Printf("Latency:\n")

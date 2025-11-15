@@ -10,7 +10,7 @@
 
 ## Features
 
-- **🛡️ Cache Stampede Protection** - Singleflight mechanism merges concurrent requests, preventing traffic surge when hot keys expire
+- **🛡️ Cache Stampede Protection** - Singleflight + DoubleCheck mechanisms eliminate redundant fetches, preventing traffic surge when hot keys expire
 - **🚫 Cache Penetration Defense** - Not-Found caching mechanism prevents malicious queries from overwhelming the database
 - **🔄 Serve-Stale** - Serves stale data while asynchronously refreshing, ensuring high availability and low latency
 - **🎪 Layered Caching** - Flexible multi-level caching (L1 Memory + L2 Redis), Client can also be used as upstream
@@ -79,8 +79,8 @@ func main() {
         cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second), // 5s fresh, 25s stale
         cachex.NotFoundWithTTL[*cachex.Entry[*Product]](notFoundCache, 1*time.Second, 5*time.Second),
         cachex.WithServeStale[*cachex.Entry[*Product]](true),
-        cachex.WithFetchConcurrency[*cachex.Entry[*Product]](1), // Full singleflight
     )
+    defer client.Close() // Clean up resources
 
     // Use the cache
     ctx := context.Background()
@@ -90,8 +90,6 @@ func main() {
 ```
 
 ## Architecture
-
-Cachex follows a clean, layered architecture.
 
 ```mermaid
 sequenceDiagram
@@ -114,13 +112,15 @@ sequenceDiagram
         Client->>SF: Async refresh
         SF->>Upstream: Fetch(key)
         Upstream-->>SF: new value
-        SF->>Cache: Update(key, value)
+        SF->>NFCache: Del(key)
+        SF->>Cache: Set(key, value)
     else Cache Hit + Stale (serveStale=false) or TooStale
         Cache-->>Client: value (stale/too stale)
         Note over Client: Skip NotFoundCache, fetch directly<br/>(backend has data)
         Client->>SF: Fetch(key)
         SF->>Upstream: Fetch(key)
         Upstream-->>SF: value
+        SF->>NFCache: Del(key)
         SF->>Cache: Set(key, value)
         SF-->>Client: value
         Client-->>App: Return value
@@ -137,7 +137,8 @@ sequenceDiagram
             SF->>Upstream: Fetch(key)
             alt Key Still Not Found
                 Upstream-->>SF: ErrKeyNotFound
-                SF->>NFCache: Update not-found
+                SF->>Cache: Del(key)
+                SF->>NFCache: Set(key, timestamp)
             else Key Now Exists
                 Upstream-->>SF: value
                 SF->>NFCache: Del(key)
@@ -149,12 +150,14 @@ sequenceDiagram
             SF->>Upstream: Fetch(key)
             alt Key Exists
                 Upstream-->>SF: value
+                SF->>NFCache: Del(key)
                 SF->>Cache: Set(key, value)
                 SF-->>Client: value
                 Client-->>App: Return value
             else Key Not Found
                 Upstream-->>SF: ErrKeyNotFound
-                SF->>NFCache: Cache not-found
+                SF->>Cache: Del(key)
+                SF->>NFCache: Set(key, timestamp)
                 SF-->>Client: ErrKeyNotFound
                 Client-->>App: Return ErrKeyNotFound
             end
@@ -168,7 +171,8 @@ sequenceDiagram
 - **BackendCache** - Storage layer (Ristretto, Redis, GORM, or custom), also serves as Upstream interface
 - **NotFoundCache** - Dedicated cache for non-existent keys to prevent cache penetration
 - **Upstream** - Data source (database, API, another Client, or custom)
-- **Singleflight** - Deduplicates concurrent requests for the same key to prevent cache stampede
+- **Singleflight** - Deduplicates concurrent requests for the same key (primary defense against cache stampede)
+- **DoubleCheck** - Re-checks local cache for recently written keys within singleflight (eliminates remaining edge cases)
 - **Entry** - Wrapper with timestamp for time-based staleness checks
 
 ## Cache Backends
@@ -181,6 +185,7 @@ High-performance, TinyLFU-based in-memory cache.
 config := cachex.DefaultRistrettoCacheConfig[*Product]()
 config.TTL = 30 * time.Second
 cache, err := cachex.NewRistrettoCache(config)
+defer cache.Close()
 ```
 
 ### Redis
@@ -251,12 +256,14 @@ l2Client := cachex.NewClient(
     dbUpstream,
     cachex.EntryWithTTL[*Product](1*time.Minute, 9*time.Minute),
 )
+defer l2Client.Close()
 
 // L1: In-memory cache with L2 client as upstream
 // Client can be used directly as upstream for the next layer
 l1Cache, _ := cachex.NewRistrettoCache(
     cachex.DefaultRistrettoCacheConfig[*cachex.Entry[*Product]](),
 )
+defer l1Cache.Close()
 
 l1Client := cachex.NewClient(
     l1Cache,
@@ -264,7 +271,42 @@ l1Client := cachex.NewClient(
     cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second),
     cachex.WithServeStale[*cachex.Entry[*Product]](true),
 )
+defer l1Client.Close()
+
+// Read: L1 miss → L2 → Database (if L2 also misses)
+product, _ := l1Client.Get(ctx, "product-123")
 ```
+
+#### Write Propagation
+
+When you use a `Client` as the upstream for another `Client`, write operations (`Set`/`Del`) automatically propagate through all cache layers, stopping naturally when upstream doesn't implement `Cache[T]`:
+
+```
+L1 Cache → L2 Cache → L3 Cache → Database
+   ✅        ✅         ✅          ❌ (auto-stop)
+```
+
+The propagation works through **type-based detection**: if upstream implements `Cache[T]` interface, writes propagate; if upstream doesn't implement `Cache[T]` (e.g. `UpstreamFunc` for data sources), propagation stops.
+
+**Pattern Support:**
+
+This design naturally supports both caching patterns:
+
+- **Write-Through Pattern (Multi-Level Caches):**
+
+  ```go
+  // All cache layers stay in sync
+  l1Client.Set(ctx, key, value)  // → L1 → L2 → ... → (stops at data source)
+  ```
+
+- **Cache-Aside Pattern (Cache + Database):**
+  ```go
+  // Update database first, then cache
+  db.Update(user)
+  l1Client.Set(ctx, userID, user)  // Only updates cache layers, not DB
+  ```
+
+The key insight: **cache writes propagate through `Cache[T]` chains but stop when upstream doesn't implement `Cache[T]`**, making it safe and correct for both patterns.
 
 ### Not-Found Caching
 
@@ -274,6 +316,7 @@ Prevent repeated lookups for non-existent keys:
 notFoundCache, _ := cachex.NewRistrettoCache(
     cachex.DefaultRistrettoCacheConfig[time.Time](),
 )
+defer notFoundCache.Close()
 
 client := cachex.NewClient(
     dataCache,
@@ -285,6 +328,7 @@ client := cachex.NewClient(
         5*time.Second,  // stale TTL
     ),
 )
+defer client.Close()
 ```
 
 ### Custom Staleness Logic
@@ -307,6 +351,7 @@ client := cachex.NewClient(
     }),
     cachex.WithServeStale[*Product](true),
 )
+defer client.Close()
 ```
 
 ### Type Transformation
@@ -328,16 +373,20 @@ user, err := userCache.Get(ctx, "user:123")
 
 > See [BENCHMARK.md](BENCHMARK.md) for detailed results.
 
-### Key Metrics (10K products, Pareto traffic distribution)
+### Key Metrics (10K products, Pareto traffic distribution, **cold start**)
 
-| Scenario          | Application QPS | Cache Hit Rate |   P50 |     P99 | Amplification |
-| :---------------- | --------------: | -------------: | ----: | ------: | ------------: |
-| High Perf DB      |          86,813 |         99.87% |   1µs | 4.042µs |           79x |
-| Cloud 1000QPS     |          86,287 |         99.88% | 917ns | 4.125µs |           82x |
-| Shared 100QPS     |          86,827 |         99.88% | 959ns | 4.958µs |          827x |
-| Constrained 50QPS |          86,609 |         99.88% | 333ns | 2.375µs |        1,729x |
+| Scenario       | Concurrency | Application QPS | Cache Hit Rate |   P50 |   P99 | DB Conn Pool | DB QPS | DB Utilization | Amplification | Errors |
+| :------------- | ----------: | --------------: | -------------: | ----: | ----: | -----------: | -----: | -------------: | ------------: | -----: |
+| High Perf DB   |         600 |         504,989 |         99.81% | 291ns | 3.3µs |          100 |  982.5 |          88.4% |        514.0x |     0% |
+| Cloud DB       |         100 |          55,222 |         99.61% | 833ns |  12µs |           20 |  213.8 |          90.9% |        235.0x |     0% |
+| Shared DB      |         100 |           7,306 |         98.59% | 791ns | 831ms |           13 |  103.0 |          99.0% |         70.2x |     0% |
+| Constrained DB |         100 |             695 |         94.01% | 1.3µs | 2.04s |            8 |   41.6 |          98.8% |         16.7x |     0% |
 
-> 💡 Cachex provides **79x to 1,729x throughput amplification** with adaptive TTL strategies and zero errors.
+> 💡 **Cold Start Performance**: Cachex achieves **94%+ cache hit rate** even during cold start without pre-warming. With cache pre-warming, throughput can increase dramatically (99%+ hit rate → minimal DB load).
+>
+> 🔥 **Test Environment Simulation**: All benchmark scenarios use realistic database connection pool simulation (semaphore-based), accurately simulating real-world database behavior.
+>
+> 📊 **Throughput Amplification** = Application QPS / Theoretical DB Capacity, where Theoretical DB Capacity = Conn Pool / (Latency / 1000ms).
 
 ## FAQ
 
@@ -345,9 +394,21 @@ user, err := userCache.Get(ctx, "user:123")
 
 **A:** Use `Entry[T]` with `EntryWithTTL` for simple time-based expiration. Use custom staleness checkers when you need domain-specific logic (e.g., checking a `version` field).
 
-### Q: How does singleflight work?
+### Q: How does cache stampede protection work?
 
-**A:** Singleflight deduplicates concurrent requests for the same key. Only one goroutine fetches from upstream; others wait and receive the same result. Configure with `WithFetchConcurrency`.
+**A:** Cachex uses a two-layer defense based on the philosophy of **concurrent exploration + result convergence**:
+
+1. **Singleflight with Concurrency Control** (Primary):
+
+   - **Exploration phase**: When cache misses, `WithFetchConcurrency` allows N concurrent fetches to maximize throughput
+   - **Default (N=1)**: Full deduplication - only one fetch, others wait (99%+ redundancy elimination)
+   - **N > 1**: Moderate redundancy - requests distributed across N slots for higher throughput
+
+2. **DoubleCheck** (Supplementary):
+   - Handles the narrow race window where Request B checks the cache (miss) before Request A completes its write
+   - Works **across all singleflight slots**, enabling fast convergence after first successful fetch
+   - Enabled by default with 10ms window, maximizing cache hit rate regardless of concurrency setting
+   - Disable with `WithDoubleCheck(nil, 0)` if not needed
 
 ### Q: What's the difference between fresh and stale TTL?
 

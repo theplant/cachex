@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto/v2"
+	"github.com/pkg/errors"
 )
 
 // RistrettoCache is a cache implementation using ristretto
@@ -12,6 +13,8 @@ type RistrettoCache[T any] struct {
 	cache *ristretto.Cache[string, T]
 	ttl   time.Duration
 }
+
+var _ Cache[any] = &RistrettoCache[any]{}
 
 // RistrettoCacheConfig holds configuration for RistrettoCache
 type RistrettoCacheConfig[T any] struct {
@@ -39,7 +42,7 @@ func DefaultRistrettoCacheConfig[T any]() *RistrettoCacheConfig[T] {
 func NewRistrettoCache[T any](config *RistrettoCacheConfig[T]) (*RistrettoCache[T], error) {
 	cache, err := ristretto.NewCache(config.Config)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to create ristretto cache")
 	}
 
 	return &RistrettoCache[T]{
@@ -70,7 +73,7 @@ func (r *RistrettoCache[T]) Get(_ context.Context, key string) (T, error) {
 	var zero T
 	value, found := r.cache.Get(key)
 	if !found {
-		return zero, &ErrKeyNotFound{}
+		return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in ristretto cache for key: %s", key)
 	}
 	return value, nil
 }
@@ -93,6 +96,7 @@ func (r *RistrettoCache[T]) Del(_ context.Context, key string) error {
 }
 
 // Close closes the cache and stops all background goroutines
-func (r *RistrettoCache[T]) Close() {
+func (r *RistrettoCache[T]) Close() error {
 	r.cache.Close()
+	return nil
 }

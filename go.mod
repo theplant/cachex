@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/dgraph-io/ristretto/v2 v2.3.0
 	github.com/pkg/errors v0.9.1
 	github.com/redis/go-redis/v9 v9.16.0

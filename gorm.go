@@ -18,6 +18,8 @@ type GORMCache[T any] struct {
 	keyPrefix string
 }
 
+var _ Cache[any] = &GORMCache[any]{}
+
 type cacheEntry struct {
 	Key       string         `gorm:"not null;primaryKey;size:255"`
 	Value     datatypes.JSON `gorm:"not null;type:json"`
@@ -59,7 +61,7 @@ func (g *GORMCache[T]) prefixedKey(key string) string {
 // Migrate creates or updates the cache table schema
 func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 	if err := g.db.WithContext(ctx).Table(g.tableName).AutoMigrate(&cacheEntry{}); err != nil {
-		return errors.Wrap(err, "failed to migrate cache table")
+		return errors.Wrapf(err, "failed to migrate cache table for table: %s", g.tableName)
 	}
 	return nil
 }
@@ -68,7 +70,7 @@ func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 func (g *GORMCache[T]) Set(ctx context.Context, key string, value T) error {
 	data, err := json.Marshal(value)
 	if err != nil {
-		return errors.Wrap(err, "failed to marshal value")
+		return errors.Wrapf(err, "failed to marshal value for key: %s", key)
 	}
 
 	entry := cacheEntry{
@@ -83,7 +85,7 @@ func (g *GORMCache[T]) Set(ctx context.Context, key string, value T) error {
 			UpdateAll: true,
 		}).
 		Create(&entry).Error; err != nil {
-		return errors.Wrap(err, "failed to set cache entry")
+		return errors.Wrapf(err, "failed to set cache entry for key: %s", key)
 	}
 
 	return nil
@@ -99,14 +101,14 @@ func (g *GORMCache[T]) Get(ctx context.Context, key string) (T, error) {
 		Where("key = ?", g.prefixedKey(key)).
 		First(&entry).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return zero, &ErrKeyNotFound{}
+			return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in gorm cache for key: %s", key)
 		}
-		return zero, errors.Wrap(err, "failed to get cache entry")
+		return zero, errors.Wrapf(err, "failed to get cache entry for key: %s", key)
 	}
 
 	var value T
 	if err := json.Unmarshal(entry.Value, &value); err != nil {
-		return zero, errors.Wrap(err, "failed to unmarshal value")
+		return zero, errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
 	}
 
 	return value, nil
@@ -118,7 +120,7 @@ func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
 		Table(g.tableName).
 		Where("key = ?", g.prefixedKey(key)).
 		Delete(nil).Error; err != nil {
-		return errors.Wrap(err, "failed to delete cache entry")
+		return errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
 	}
 	return nil
 }
