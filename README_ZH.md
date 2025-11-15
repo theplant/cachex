@@ -91,8 +91,6 @@ func main() {
 
 ## 架构设计
 
-Cachex 采用清晰的分层架构。
-
 ```mermaid
 sequenceDiagram
     participant App as Application
@@ -274,7 +272,41 @@ l1Client := cachex.NewClient(
     cachex.WithServeStale[*cachex.Entry[*Product]](true),
 )
 defer l1Client.Close()
+
+// 读取: L1 miss → L2 → 数据库 (如果 L2 也 miss)
+product, _ := l1Client.Get(ctx, "product-123")
 ```
+
+#### 写操作传播
+
+当你使用一个 `Client` 作为另一个 `Client` 的 upstream 时，写操作（`Set`/`Del`）会自动在所有缓存层传播，并在 upstream 未实现 `Cache[T]` 时自然停止：
+
+```
+L1 缓存 → L2 缓存 → L3 缓存 → 数据库
+   ✅        ✅         ✅        ❌ (自动停止)
+```
+
+传播机制基于**类型检测**：如果 upstream 实现了 `Cache[T]` 接口，写操作会传播；如果 upstream 未实现 `Cache[T]`（例如 `UpstreamFunc` 数据源），传播自动停止。
+
+**模式支持：**
+
+该设计自然支持两种缓存模式：
+
+- **Write-Through 模式（多级缓存）：**
+
+  ```go
+  // 所有缓存层保持同步
+  l1Client.Set(ctx, key, value)  // → L1 → L2 → ... → (在数据源处停止)
+  ```
+
+- **Cache-Aside 模式（缓存 + 数据库）：**
+  ```go
+  // 先更新数据库，再更新缓存
+  db.Update(user)
+  l1Client.Set(ctx, userID, user)  // 只更新缓存层，不写数据库
+  ```
+
+核心机制：**缓存写操作会在 `Cache[T]` 链上传播，但在 upstream 未实现 `Cache[T]` 时自动停止**，这使得两种模式都安全正确。
 
 ### Not-Found 缓存
 

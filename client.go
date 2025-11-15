@@ -178,7 +178,23 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 	return c.fetchFromUpstream(ctx, key)
 }
 
-// Del removes a value from the cache
+// Del removes a value from the cache and propagates deletion through cache layers.
+//
+// Cache Layer Propagation:
+// Del will propagate through all cache layers where upstream implements Cache[T],
+// automatically stopping when upstream doesn't implement Cache[T] (e.g. UpstreamFunc
+// for databases). This ensures consistency across multi-level cache architectures.
+//
+// Examples:
+//
+//	Single-level (L1 -> Database):
+//	  client.Del(ctx, key)  // Deletes from L1 only
+//
+//	Multi-level (L1 -> L2 -> Database):
+//	  l1Client.Del(ctx, key)  // Deletes from L1 and L2, stops at Database
+//
+// This supports both write-through and cache-aside patterns, as the chain
+// naturally terminates when upstream is not a Cache[T] implementation.
 func (c *Client[T]) Del(ctx context.Context, key string) error {
 	if err := c.delWithoutUpstream(ctx, key); err != nil {
 		return err
@@ -209,7 +225,25 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 	return nil
 }
 
-// Set stores a value in the cache
+// Set stores a value in the cache and propagates through cache layers.
+//
+// Cache Layer Propagation:
+// Set will propagate through all cache layers where upstream implements Cache[T],
+// automatically stopping when upstream doesn't implement Cache[T] (e.g. UpstreamFunc
+// for databases). This ensures consistency across multi-level cache architectures.
+//
+// Examples:
+//
+//	Single-level cache-aside pattern (L1 -> Database):
+//	  db.Update(user)           // Update database first
+//	  client.Set(ctx, key, user) // Then update L1 cache only
+//
+//	Multi-level cache-aside pattern (L1 -> L2 -> Database):
+//	  db.Update(user)             // Update database first
+//	  l1Client.Set(ctx, key, user) // Then update L1 and L2, stops at Database
+//
+// The type-based propagation automatically handles both write-through (multi-level caches)
+// and cache-aside (with data source) patterns correctly.
 func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
 	if err := c.setWithoutUpstream(ctx, key, value); err != nil {
 		return err

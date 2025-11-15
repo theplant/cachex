@@ -91,8 +91,6 @@ func main() {
 
 ## Architecture
 
-Cachex follows a clean, layered architecture.
-
 ```mermaid
 sequenceDiagram
     participant App as Application
@@ -274,7 +272,41 @@ l1Client := cachex.NewClient(
     cachex.WithServeStale[*cachex.Entry[*Product]](true),
 )
 defer l1Client.Close()
+
+// Read: L1 miss → L2 → Database (if L2 also misses)
+product, _ := l1Client.Get(ctx, "product-123")
 ```
+
+#### Write Propagation
+
+When you use a `Client` as the upstream for another `Client`, write operations (`Set`/`Del`) automatically propagate through all cache layers, stopping naturally when upstream doesn't implement `Cache[T]`:
+
+```
+L1 Cache → L2 Cache → L3 Cache → Database
+   ✅        ✅         ✅          ❌ (auto-stop)
+```
+
+The propagation works through **type-based detection**: if upstream implements `Cache[T]` interface, writes propagate; if upstream doesn't implement `Cache[T]` (e.g. `UpstreamFunc` for data sources), propagation stops.
+
+**Pattern Support:**
+
+This design naturally supports both caching patterns:
+
+- **Write-Through Pattern (Multi-Level Caches):**
+
+  ```go
+  // All cache layers stay in sync
+  l1Client.Set(ctx, key, value)  // → L1 → L2 → ... → (stops at data source)
+  ```
+
+- **Cache-Aside Pattern (Cache + Database):**
+  ```go
+  // Update database first, then cache
+  db.Update(user)
+  l1Client.Set(ctx, userID, user)  // Only updates cache layers, not DB
+  ```
+
+The key insight: **cache writes propagate through `Cache[T]` chains but stop when upstream doesn't implement `Cache[T]`**, making it safe and correct for both patterns.
 
 ### Not-Found Caching
 

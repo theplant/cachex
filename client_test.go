@@ -3,6 +3,8 @@ package cachex
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -612,4 +614,306 @@ func (t *trackedCache[T]) Set(ctx context.Context, key string, value T) error {
 
 func (t *trackedCache[T]) Del(ctx context.Context, key string) error {
 	return t.onDel(key)
+}
+
+func TestNotFoundCacheStale(t *testing.T) {
+	ctx := context.Background()
+	clock := NewMockClock(time.Now())
+	defer clock.Install()()
+
+	backend := newRistrettoCache[string](t)
+	notFoundCache := newRistrettoCache[time.Time](t)
+
+	fetchCount := 0
+	upstream := UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
+		fetchCount++
+		if key == "not-exist" {
+			return "", &ErrKeyNotFound{}
+		}
+		return "value-" + key, nil
+	})
+
+	cli := NewClient(backend, upstream,
+		NotFoundWithTTL[string](notFoundCache, 100*time.Millisecond, 500*time.Millisecond),
+		WithServeStale[string](true),
+	)
+	defer func() {
+		assert.NoError(t, cli.Close())
+	}()
+
+	t.Run("first fetch caches not found", func(t *testing.T) {
+		_, err := cli.Get(ctx, "not-exist")
+		var e *ErrKeyNotFound
+		assert.True(t, errors.As(err, &e))
+		assert.False(t, e.Cached, "first fetch should not be cached")
+		assert.Equal(t, 1, fetchCount)
+	})
+
+	t.Run("second fetch serves from cache", func(t *testing.T) {
+		_, err := cli.Get(ctx, "not-exist")
+		var e *ErrKeyNotFound
+		assert.True(t, errors.As(err, &e))
+		assert.True(t, e.Cached, "second fetch should be from cache")
+		assert.Equal(t, StateFresh, e.CacheState)
+		assert.Equal(t, 1, fetchCount, "should not refetch")
+	})
+
+	t.Run("serve stale not found", func(t *testing.T) {
+		clock.Advance(150 * time.Millisecond) // Beyond fresh, within stale
+
+		_, err := cli.Get(ctx, "not-exist")
+		var e *ErrKeyNotFound
+		assert.True(t, errors.As(err, &e))
+		assert.True(t, e.Cached)
+		assert.Equal(t, StateStale, e.CacheState)
+		// Should still be 1 fetch (serving stale, async refresh will happen)
+		assert.Equal(t, 1, fetchCount)
+
+		// Wait a bit for async refresh to complete
+		time.Sleep(50 * time.Millisecond)
+		assert.Equal(t, 2, fetchCount, "async refresh should have happened")
+	})
+
+	t.Run("too stale triggers immediate fetch", func(t *testing.T) {
+		clock.Advance(600 * time.Millisecond) // Beyond stale TTL
+
+		_, err := cli.Get(ctx, "not-exist")
+		var e *ErrKeyNotFound
+		assert.True(t, errors.As(err, &e))
+		// After refetch, error comes from upstream (not cached)
+		assert.False(t, e.Cached, "too stale refetch returns fresh upstream error")
+		assert.Equal(t, 3, fetchCount, "should refetch immediately when too stale")
+	})
+}
+
+func TestUpstreamPanicRecovery(t *testing.T) {
+	ctx := context.Background()
+
+	backend := newRistrettoCache[string](t)
+
+	t.Run("panic in upstream is recovered", func(t *testing.T) {
+		panicUpstream := UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
+			panic("upstream panic!")
+		})
+
+		cli := NewClient(backend, panicUpstream)
+		defer func() {
+			assert.NoError(t, cli.Close())
+		}()
+
+		// Should not panic, should return error
+		_, err := cli.Get(ctx, "key1")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "panic during upstream fetch")
+		assert.Contains(t, err.Error(), "upstream panic!")
+	})
+
+	t.Run("normal operation after panic", func(t *testing.T) {
+		callCount := 0
+		conditionalPanicUpstream := UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
+			callCount++
+			if callCount == 1 {
+				panic("first call panics")
+			}
+			return "value-" + key, nil
+		})
+
+		cli := NewClient(backend, conditionalPanicUpstream)
+		defer func() {
+			assert.NoError(t, cli.Close())
+		}()
+
+		// First call should panic and recover
+		_, err := cli.Get(ctx, "key3")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "panic during upstream fetch")
+
+		// Second call should succeed
+		val, err := cli.Get(ctx, "key3")
+		assert.NoError(t, err)
+		assert.Equal(t, "value-key3", val)
+	})
+}
+
+func TestWithLogger(t *testing.T) {
+	ctx := context.Background()
+
+	// Custom logger to capture logs
+	var logBuf strings.Builder
+	customLogger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	}))
+
+	// Create a backend that fails on Set to trigger a warning log
+	realBackend := newRistrettoCache[string](t)
+	failingBackend := &trackedCache[string]{
+		onGet: func(key string) (string, error) {
+			return realBackend.Get(ctx, key)
+		},
+		onSet: func(key string, value string) error {
+			return errors.New("backend set failed")
+		},
+		onDel: func(key string) error {
+			return realBackend.Del(ctx, key)
+		},
+	}
+
+	upstream := UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "value-" + key, nil
+	})
+
+	cli := NewClient(failingBackend, upstream,
+		WithLogger[string](customLogger),
+	)
+	defer func() {
+		assert.NoError(t, cli.Close())
+	}()
+
+	// Trigger a fetch that will log a warning (failed to set cache entry)
+	val, err := cli.Get(ctx, "test-key")
+	assert.NoError(t, err, "should return value despite cache set failure")
+	assert.Equal(t, "value-test-key", val)
+
+	// Verify custom logger was used (logs should be captured)
+	logs := logBuf.String()
+	assert.NotEmpty(t, logs, "custom logger should have captured logs")
+	assert.Contains(t, logs, "failed to set cache entry", "should log cache set failure")
+}
+
+func TestSetDelWithUpstreamCache(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Set propagates to upstream cache", func(t *testing.T) {
+		backend := newRistrettoCache[string](t)
+		upstream := newRistrettoCache[string](t)
+
+		// Use upstream cache as the upstream
+		cli := NewClient(backend, upstream)
+		defer func() {
+			assert.NoError(t, cli.Close())
+		}()
+
+		// Set value
+		err := cli.Set(ctx, "key1", "value1")
+		assert.NoError(t, err)
+
+		// Verify it's in backend
+		val, err := backend.Get(ctx, "key1")
+		assert.NoError(t, err)
+		assert.Equal(t, "value1", val)
+
+		// Verify it's also in upstream cache
+		val, err = upstream.Get(ctx, "key1")
+		assert.NoError(t, err)
+		assert.Equal(t, "value1", val)
+	})
+
+	t.Run("Set fails when upstream cache fails", func(t *testing.T) {
+		backend := newRistrettoCache[string](t)
+		realCache := newRistrettoCache[string](t)
+
+		// Create a cache that fails on Set
+		upstream := &trackedCache[string]{
+			onGet: func(key string) (string, error) {
+				return realCache.Get(ctx, key)
+			},
+			onSet: func(key string, value string) error {
+				return errors.New("upstream set failed")
+			},
+			onDel: func(key string) error {
+				return realCache.Del(ctx, key)
+			},
+		}
+
+		cli := NewClient(backend, upstream)
+		defer func() {
+			assert.NoError(t, cli.Close())
+		}()
+
+		// Set should fail
+		err := cli.Set(ctx, "key2", "value2")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "set in upstream failed")
+		assert.Contains(t, err.Error(), "upstream set failed")
+	})
+
+	t.Run("Del propagates to upstream cache", func(t *testing.T) {
+		backend := newRistrettoCache[string](t)
+		upstream := newRistrettoCache[string](t)
+
+		// Pre-populate both caches
+		_ = backend.Set(ctx, "key3", "value3")
+		_ = upstream.Set(ctx, "key3", "value3")
+
+		cli := NewClient(backend, upstream)
+		defer func() {
+			assert.NoError(t, cli.Close())
+		}()
+
+		// Delete value
+		err := cli.Del(ctx, "key3")
+		assert.NoError(t, err)
+
+		// Verify it's deleted from backend
+		_, err = backend.Get(ctx, "key3")
+		assert.True(t, IsErrKeyNotFound(err))
+
+		// Verify it's also deleted from upstream cache
+		_, err = upstream.Get(ctx, "key3")
+		assert.True(t, IsErrKeyNotFound(err))
+	})
+
+	t.Run("Del fails when upstream cache fails", func(t *testing.T) {
+		backend := newRistrettoCache[string](t)
+		realCache := newRistrettoCache[string](t)
+
+		// Create a cache that fails on Del
+		upstream := &trackedCache[string]{
+			onGet: func(key string) (string, error) {
+				return realCache.Get(ctx, key)
+			},
+			onSet: func(key string, value string) error {
+				return realCache.Set(ctx, key, value)
+			},
+			onDel: func(key string) error {
+				return errors.New("upstream del failed")
+			},
+		}
+
+		// Pre-populate backend
+		_ = backend.Set(ctx, "key4", "value4")
+
+		cli := NewClient(backend, upstream)
+		defer func() {
+			assert.NoError(t, cli.Close())
+		}()
+
+		// Del should fail
+		err := cli.Del(ctx, "key4")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "delete from upstream failed")
+		assert.Contains(t, err.Error(), "upstream del failed")
+	})
+
+	t.Run("Set and Del with non-cache upstream", func(t *testing.T) {
+		backend := newRistrettoCache[string](t)
+
+		// Use a simple UpstreamFunc (not a Cache interface)
+		upstream := UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
+			return "fetched-" + key, nil
+		})
+
+		cli := NewClient(backend, upstream)
+		defer func() {
+			assert.NoError(t, cli.Close())
+		}()
+
+		// Set should succeed (upstream is not Cache, so no propagation)
+		err := cli.Set(ctx, "key5", "value5")
+		assert.NoError(t, err)
+
+		// Del should succeed (upstream is not Cache, so no propagation)
+		err = cli.Del(ctx, "key5")
+		assert.NoError(t, err)
+	})
 }
