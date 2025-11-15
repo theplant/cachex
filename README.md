@@ -373,16 +373,20 @@ user, err := userCache.Get(ctx, "user:123")
 
 > See [BENCHMARK.md](BENCHMARK.md) for detailed results.
 
-### Key Metrics (10K products, Pareto traffic distribution)
+### Key Metrics (10K products, Pareto traffic distribution, **cold start**)
 
-| Scenario          | Application QPS | Cache Hit Rate |   P50 |     P99 | Amplification |
-| :---------------- | --------------: | -------------: | ----: | ------: | ------------: |
-| High Perf DB      |          86,813 |         99.87% |   1µs | 4.042µs |           79x |
-| Cloud 1000QPS     |          86,287 |         99.88% | 917ns | 4.125µs |           82x |
-| Shared 100QPS     |          86,827 |         99.88% | 959ns | 4.958µs |          827x |
-| Constrained 50QPS |          86,609 |         99.88% | 333ns | 2.375µs |        1,729x |
+| Scenario       | Concurrency | Application QPS | Cache Hit Rate |   P50 |   P99 | DB Conn Pool | DB QPS | DB Utilization | Amplification | Errors |
+| :------------- | ----------: | --------------: | -------------: | ----: | ----: | -----------: | -----: | -------------: | ------------: | -----: |
+| High Perf DB   |         600 |         504,989 |         99.81% | 291ns | 3.3µs |          100 |  982.5 |          88.4% |        514.0x |     0% |
+| Cloud DB       |         100 |          55,222 |         99.61% | 833ns |  12µs |           20 |  213.8 |          90.9% |        235.0x |     0% |
+| Shared DB      |         100 |           7,306 |         98.59% | 791ns | 831ms |           13 |  103.0 |          99.0% |         70.2x |     0% |
+| Constrained DB |         100 |             695 |         94.01% | 1.3µs | 2.04s |            8 |   41.6 |          98.8% |         16.7x |     0% |
 
-> 💡 Cachex provides **79x to 1,729x throughput amplification** with adaptive TTL strategies and zero errors.
+> 💡 **Cold Start Performance**: Cachex achieves **94%+ cache hit rate** even during cold start without pre-warming. With cache pre-warming, throughput can increase dramatically (99%+ hit rate → minimal DB load).
+>
+> 🔥 **Test Environment Simulation**: All benchmark scenarios use realistic database connection pool simulation (semaphore-based), accurately simulating real-world database behavior.
+>
+> 📊 **Throughput Amplification** = Application QPS / Theoretical DB Capacity, where Theoretical DB Capacity = Conn Pool / (Latency / 1000ms).
 
 ## FAQ
 
