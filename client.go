@@ -51,7 +51,7 @@ type Client[T any] struct {
 type testHooks struct {
 	beforeSingleflightStart func(ctx context.Context, key string)
 	afterSingleflightStart  func(ctx context.Context, key string)
-	afterMarkRecentWrite    func(ctx context.Context, key string)
+	afterSingleflightEnd    func(ctx context.Context, key string)
 }
 
 // NewClient creates a new client that manages the backend cache and fetches from upstream.
@@ -332,6 +332,9 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 	case <-ctx.Done():
 		return zero, errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", key)
 	case res := <-resChan:
+		if c.testHooks != nil && c.testHooks.afterSingleflightEnd != nil {
+			c.testHooks.afterSingleflightEnd(ctx, key)
+		}
 		if res.Err != nil {
 			return zero, res.Err
 		}
@@ -393,10 +396,6 @@ func (c *Client[T]) markRecentWrite(ctx context.Context, key string) {
 	err := c.recentWrites.Set(ctx, key, []byte{byte(ms >> 8), byte(ms)})
 	if err != nil {
 		c.logger.WarnContext(ctx, "failed to mark recent write", "key", key, "error", err)
-	}
-
-	if c.testHooks != nil && c.testHooks.afterMarkRecentWrite != nil {
-		c.testHooks.afterMarkRecentWrite(ctx, key)
 	}
 }
 

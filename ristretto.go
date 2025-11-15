@@ -57,14 +57,20 @@ func (r *RistrettoCache[T]) Set(_ context.Context, key string, value T) error {
 	// 1. Cost exceeds MaxCost (unlikely with cost=1)
 	// 2. Rejected by admission policy (W-TinyLFU)
 	//
+	// When false is returned, the item is dropped and not added to the cache.
+	// When true is returned, the item enters the buffer and will be processed.
+	//
 	// We don't treat rejection as an error because:
 	// - Admission policy rejection is a feature, not a bug
 	// - It prevents cache pollution by low-value entries
 	// - The cache remains consistent and functional
+	// - Callers can still retrieve data from upstream on cache miss
 	success := r.cache.SetWithTTL(key, value, 1, r.ttl)
 	if success {
+		// Wait ensures all buffered writes are applied before returning
 		r.cache.Wait()
 	}
+	// Note: When success is false, there are no buffered writes to wait for
 	return nil
 }
 
