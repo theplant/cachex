@@ -272,8 +272,8 @@ func TestDoubleCheck(t *testing.T) {
 						<-aCanContinue
 					}
 				},
-				// Hook 2: Confirm A completed marking recent write
-				afterMarkRecentWrite: func(ctx context.Context, key string) {
+				// Hook 2: Confirm A's singleflight completely finished
+				afterSingleflightEnd: func(ctx context.Context, key string) {
 					if key == "key1" && ctx.Value(ctxKeyRequestA) != nil {
 						close(aCompleted)
 					}
@@ -312,7 +312,7 @@ func TestDoubleCheck(t *testing.T) {
 				valueB, errB = client.Get(ctxB, "key1")
 			}()
 
-			// Wait for A to complete marking recent write
+			// Wait for A to complete singleflight (including cleanup)
 			<-aCompleted
 
 			// Advance time if needed (for beyond-window test)
