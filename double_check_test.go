@@ -7,27 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/allegro/bigcache/v3"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func newTestBigCache(t *testing.T, window time.Duration) Cache[[]byte] {
-	t.Helper()
-	cache, err := NewBigCache(context.Background(), BigCacheConfig{
-		Config: bigcache.Config{
-			Shards:             16,
-			LifeWindow:         window,
-			MaxEntriesInWindow: 100,
-			MaxEntrySize:       2,
-			CleanWindow:        1 * time.Second,
-		},
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { cache.Close() })
-	return cache
-}
 
 func TestWithDoubleCheckValidation(t *testing.T) {
 	backend := newRistrettoCache[string](t)
@@ -35,111 +18,44 @@ func TestWithDoubleCheckValidation(t *testing.T) {
 		return "value", nil
 	})
 
-	t.Run("default double-check enabled", func(t *testing.T) {
+	t.Run("default auto mode", func(t *testing.T) {
 		client := NewClient(backend, upstream)
-		assert.NotNil(t, client.recentWrites, "double-check should be enabled by default")
-		assert.True(t, client.ownRecentWrites, "default double-check cache should be owned by client")
-		assert.Equal(t, int64(10), client.recentWritesWindowMS, "default window should be 10ms")
-		assert.NoError(t, client.Close(), "closing should work")
+		assert.Equal(t, DoubleCheckAuto, client.doubleCheckMode)
+		assert.False(t, client.enableDoubleCheck, "should be disabled when no notFoundCache")
 	})
 
-	t.Run("disable double-check with nil option", func(t *testing.T) {
-		client := NewClient(backend, upstream, WithDoubleCheck[string](nil, 0))
-		assert.Nil(t, client.recentWrites, "double-check should be disabled")
-		assert.True(t, client.ownRecentWrites, "should be marked as explicitly configured")
-		assert.NoError(t, client.Close(), "closing should work even when disabled")
+	t.Run("explicitly disabled", func(t *testing.T) {
+		client := NewClient(backend, upstream,
+			WithDoubleCheck[string](DoubleCheckDisabled),
+		)
+		assert.Equal(t, DoubleCheckDisabled, client.doubleCheckMode)
+		assert.False(t, client.enableDoubleCheck)
 	})
 
-	t.Run("disable double-check by setting global func to nil", func(t *testing.T) {
-		originalFunc := NewDefaultDoubleCheckFunc
-		NewDefaultDoubleCheckFunc = nil
-		defer func() { NewDefaultDoubleCheckFunc = originalFunc }()
-
-		client := NewClient(backend, upstream)
-		assert.Nil(t, client.recentWrites, "double-check should be disabled when global func is nil")
-		assert.False(t, client.ownRecentWrites, "should not be marked as owned")
-		assert.NoError(t, client.Close(), "closing should work")
+	t.Run("explicitly enabled", func(t *testing.T) {
+		client := NewClient(backend, upstream,
+			WithDoubleCheck[string](DoubleCheckEnabled),
+		)
+		assert.Equal(t, DoubleCheckEnabled, client.doubleCheckMode)
+		assert.True(t, client.enableDoubleCheck)
 	})
 
-	t.Run("accepts valid windows", func(t *testing.T) {
-		tests := []time.Duration{
-			1 * time.Millisecond,
-			50 * time.Millisecond,
-			1000 * time.Millisecond,
-			1 * time.Second,
-			65535 * time.Millisecond,
-		}
-		for _, window := range tests {
-			t.Run(fmt.Sprintf("%v", window), func(t *testing.T) {
-				cache := newTestBigCache(t, window)
-				client := NewClient(backend, upstream, WithDoubleCheck[string](cache, window))
-				defer func() {
-					assert.NoError(t, client.Close())
-				}()
-				assert.NotPanics(t, func() {
-					_ = client
-				})
-				assert.False(t, client.ownRecentWrites, "custom cache should not be owned by client")
-			})
-		}
+	t.Run("auto mode without notFoundCache", func(t *testing.T) {
+		client := NewClient(backend, upstream,
+			WithDoubleCheck[string](DoubleCheckAuto),
+		)
+		assert.Equal(t, DoubleCheckAuto, client.doubleCheckMode, "should preserve original config")
+		assert.False(t, client.enableDoubleCheck, "should be disabled when no notFoundCache")
 	})
 
-	t.Run("rejects invalid windows", func(t *testing.T) {
-		tests := []struct {
-			name   string
-			window time.Duration
-			panic  string
-		}{
-			{
-				name:   "sub-millisecond nanosecond",
-				window: 1 * time.Nanosecond,
-				panic:  "window 1ns is not a whole number of milliseconds (precision limited to 1ms)",
-			},
-			{
-				name:   "sub-millisecond microsecond",
-				window: 500 * time.Microsecond,
-				panic:  "window 500µs is not a whole number of milliseconds (precision limited to 1ms)",
-			},
-			{
-				name:   "fractional millisecond",
-				window: 1500 * time.Microsecond,
-				panic:  "window 1.5ms is not a whole number of milliseconds (precision limited to 1ms)",
-			},
-			{
-				name:   "mixed precision",
-				window: 2*time.Millisecond + 1*time.Microsecond,
-				panic:  "window 2.001ms is not a whole number of milliseconds (precision limited to 1ms)",
-			},
-			{
-				name:   "zero window",
-				window: 0,
-				panic:  "window must be at least 1 millisecond",
-			},
-			{
-				name:   "negative window",
-				window: -1 * time.Millisecond,
-				panic:  "window must be at least 1 millisecond",
-			},
-			{
-				name:   "exceeds maximum",
-				window: 65536 * time.Millisecond,
-				panic:  "window 1m5.536s exceeds maximum of 65535ms (65.5s) due to uint16 storage with millisecond precision",
-			},
-			{
-				name:   "way over maximum",
-				window: 2 * time.Minute,
-				panic:  "window 2m0s exceeds maximum of 65535ms (65.5s) due to uint16 storage with millisecond precision",
-			},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				cache := newTestBigCache(t, 10*time.Millisecond)
-				assert.PanicsWithError(t, tt.panic, func() {
-					_ = NewClient(backend, upstream, WithDoubleCheck[string](cache, tt.window))
-				})
-			})
-		}
+	t.Run("auto mode with notFoundCache", func(t *testing.T) {
+		notFoundCache := newRistrettoCache[time.Time](t)
+		client := NewClient(backend, upstream,
+			NotFoundWithTTL[string](notFoundCache, 1*time.Second, 0),
+			WithDoubleCheck[string](DoubleCheckAuto),
+		)
+		assert.Equal(t, DoubleCheckAuto, client.doubleCheckMode, "should preserve original config")
+		assert.True(t, client.enableDoubleCheck, "should be enabled when notFoundCache exists")
 	})
 }
 
@@ -152,11 +68,9 @@ func TestDoubleCheck(t *testing.T) {
 	)
 
 	tests := []struct {
-		name              string
-		upstreamFunc      func(fetchCount *int, fetchMu *sync.Mutex) UpstreamFunc[string]
-		verifyResults     func(t *testing.T, valueA string, errA error, valueB string, errB error, fetchCount int)
-		withNotFound      bool
-		advanceTimeAfterA time.Duration
+		name          string
+		upstreamFunc  func(fetchCount *int, fetchMu *sync.Mutex) UpstreamFunc[string]
+		verifyResults func(t *testing.T, valueA string, errA error, valueB string, errB error, fetchCount int)
 	}{
 		{
 			name: "double-check finds value in backend",
@@ -176,7 +90,6 @@ func TestDoubleCheck(t *testing.T) {
 				assert.Equal(t, "fetched-1", valueB)
 				assert.Equal(t, 1, fetchCount, "double-check should prevent redundant fetch")
 			},
-			withNotFound: false,
 		},
 		{
 			name: "double-check finds cached not found",
@@ -204,28 +117,6 @@ func TestDoubleCheck(t *testing.T) {
 
 				assert.Equal(t, 1, fetchCount, "double-check should prevent redundant fetch")
 			},
-			withNotFound: true,
-		},
-		{
-			name: "beyond window triggers new fetch",
-			upstreamFunc: func(fetchCount *int, fetchMu *sync.Mutex) UpstreamFunc[string] {
-				return UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
-					fetchMu.Lock()
-					(*fetchCount)++
-					count := *fetchCount
-					fetchMu.Unlock()
-					return fmt.Sprintf("fetched-%d", count), nil
-				})
-			},
-			verifyResults: func(t *testing.T, valueA string, errA error, valueB string, errB error, fetchCount int) {
-				require.NoError(t, errA)
-				require.NoError(t, errB)
-				assert.Equal(t, "fetched-1", valueA)
-				assert.Equal(t, "fetched-2", valueB, "Request B should fetch new value beyond window")
-				assert.Equal(t, 2, fetchCount, "Request B should trigger new fetch beyond window")
-			},
-			withNotFound:      false,
-			advanceTimeAfterA: 15 * time.Millisecond,
 		},
 	}
 
@@ -233,12 +124,7 @@ func TestDoubleCheck(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 
-			// Setup mock clock if we need to advance time
-			clock := NewMockClock(time.Now())
-			defer clock.Install()()
-
 			backend := newRistrettoCache[string](t)
-			recentWrites := newTestBigCache(t, 10*time.Millisecond)
 
 			// Channels for timing control
 			aEntered := make(chan struct{})
@@ -250,18 +136,10 @@ func TestDoubleCheck(t *testing.T) {
 			var fetchMu sync.Mutex
 			upstream := tt.upstreamFunc(&fetchCount, &fetchMu)
 
-			var client *Client[string]
-			if tt.withNotFound {
-				notFoundCache := newRistrettoCache[time.Time](t)
-				client = NewClient(backend, upstream,
-					WithDoubleCheck[string](recentWrites, 10*time.Millisecond),
-					NotFoundWithTTL[string](notFoundCache, 1*time.Second, 0))
-			} else {
-				client = NewClient(backend, upstream, WithDoubleCheck[string](recentWrites, 10*time.Millisecond))
-			}
-			defer func() {
-				assert.NoError(t, client.Close())
-			}()
+			notFoundCache := newRistrettoCache[time.Time](t)
+			client := NewClient(backend, upstream,
+				WithDoubleCheck[string](DoubleCheckEnabled),
+				NotFoundWithTTL[string](notFoundCache, 1*time.Second, 0))
 
 			// Use only 3 essential hooks
 			client.testHooks = &testHooks{
@@ -315,11 +193,6 @@ func TestDoubleCheck(t *testing.T) {
 			// Wait for A to complete singleflight (including cleanup)
 			<-aCompleted
 
-			// Advance time if needed (for beyond-window test)
-			if tt.advanceTimeAfterA > 0 {
-				clock.Advance(tt.advanceTimeAfterA)
-			}
-
 			// Let B proceed (it will enter its own singleflight and double-check)
 			close(bCanProceed)
 
@@ -351,6 +224,7 @@ func TestDoubleCheckRaceWindowProbability(t *testing.T) {
 	runTest := func(withDoubleCheck bool) (totalFetches int, raceDetected int) {
 		for i := 0; i < iterations; i++ {
 			backend := newRistrettoCache[string](t)
+			notFoundCache := newRistrettoCache[time.Time](t)
 
 			fetchCount := 0
 			var fetchMu sync.Mutex
@@ -363,16 +237,13 @@ func TestDoubleCheckRaceWindowProbability(t *testing.T) {
 				return "value", nil
 			})
 
-			var client *Client[string]
+			mode := DoubleCheckDisabled
 			if withDoubleCheck {
-				recentWrites := newTestBigCache(t, 10*time.Millisecond)
-				client = NewClient(backend, upstream, WithDoubleCheck[string](recentWrites, 10*time.Millisecond))
-			} else {
-				client = NewClient(backend, upstream, WithDoubleCheck[string](nil, 0))
+				mode = DoubleCheckEnabled
 			}
-			defer func() {
-				assert.NoError(t, client.Close())
-			}()
+			client := NewClient(backend, upstream,
+				NotFoundWithTTL[string](notFoundCache, 30*time.Second, 0),
+				WithDoubleCheck[string](mode))
 
 			var wg sync.WaitGroup
 

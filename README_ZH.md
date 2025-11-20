@@ -80,7 +80,6 @@ func main() {
         cachex.NotFoundWithTTL[*cachex.Entry[*Product]](notFoundCache, 1*time.Second, 5*time.Second),
         cachex.WithServeStale[*cachex.Entry[*Product]](true),
     )
-    defer client.Close() // 清理资源
 
     // Use the cache
     ctx := context.Background()
@@ -172,7 +171,7 @@ sequenceDiagram
 - **NotFoundCache** - 专门缓存不存在的 key，防止缓存穿透
 - **Upstream** - 数据源（数据库、API、另一个 Client 或自定义）
 - **Singleflight** - 对相同 key 的并发请求去重（防御缓存击穿的主要机制）
-- **DoubleCheck** - 在 singleflight 内对最近写入的 key 重新检查本地缓存（消除剩余边界情况）
+- **DoubleCheck** - 在查询 upstream 前重新检查 backend 和 notFoundCache 以捕获并发写入（消除竞态窗口）
 - **Entry** - 带时间戳的包装器，用于基于时间的陈旧检查
 
 ## 缓存后端
@@ -256,7 +255,6 @@ l2Client := cachex.NewClient(
     dbUpstream,
     cachex.EntryWithTTL[*Product](1*time.Minute, 9*time.Minute),
 )
-defer l2Client.Close()
 
 // L1: In-memory cache with L2 client as upstream
 // Client can be used directly as upstream for the next layer
@@ -271,7 +269,6 @@ l1Client := cachex.NewClient(
     cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second),
     cachex.WithServeStale[*cachex.Entry[*Product]](true),
 )
-defer l1Client.Close()
 
 // 读取: L1 miss → L2 → 数据库 (如果 L2 也 miss)
 product, _ := l1Client.Get(ctx, "product-123")
@@ -328,7 +325,6 @@ client := cachex.NewClient(
         5*time.Second,  // 过期 TTL
     ),
 )
-defer client.Close()
 ```
 
 ### 自定义陈旧逻辑
@@ -351,7 +347,6 @@ client := cachex.NewClient(
     }),
     cachex.WithServeStale[*Product](true),
 )
-defer client.Close()
 ```
 
 ### 类型转换
@@ -407,8 +402,8 @@ user, err := userCache.Get(ctx, "user:123")
 2. **DoubleCheck**（辅助）：
    - 处理窄竞态窗口，即请求 B 在请求 A 完成写入之前检查缓存（miss）
    - **跨所有 singleflight slot 工作**，确保首次成功 fetch 后快速收敛
-   - 默认启用 10ms 窗口，无论并发设置如何都能最大化缓存命中率
-   - 如不需要可通过 `WithDoubleCheck(nil, 0)` 禁用
+   - 默认情况下当配置了 notFoundCache 时自动启用（智能检测）
+   - 可通过 `WithDoubleCheck(DoubleCheckEnabled/Disabled/Auto)` 根据场景配置
 
 ### Q: 新鲜 TTL 和过期 TTL 有什么区别？
 

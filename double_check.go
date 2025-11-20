@@ -1,126 +1,71 @@
 package cachex
 
-import (
-	"context"
-	"fmt"
-	"time"
+// DoubleCheckMode defines the double-check optimization strategy
+type DoubleCheckMode int
 
-	"github.com/allegro/bigcache/v3"
-	"github.com/pkg/errors"
+const (
+	// DoubleCheckDisabled turns off double-check optimization
+	DoubleCheckDisabled DoubleCheckMode = iota
+
+	// DoubleCheckEnabled always performs double-check before upstream fetch
+	DoubleCheckEnabled
+
+	// DoubleCheckAuto enables double-check based on configuration (default):
+	// - Enabled when notFoundCache exists (can leverage it to catch not-found in race window)
+	// - Disabled when no notFoundCache (cost limited to backend only)
+	DoubleCheckAuto
 )
 
-// NewDefaultDoubleCheckFunc creates the default double-check cache with 10ms window.
-// Can be overridden to customize default behavior or set to nil to disable by default.
-var NewDefaultDoubleCheckFunc = func() (Cache[[]byte], time.Duration, error) {
-	cache, err := NewBigCache(context.Background(), BigCacheConfig{
-		Config: bigcache.Config{
-			Shards:             16,
-			LifeWindow:         10 * time.Millisecond,
-			MaxEntriesInWindow: 10000,
-			MaxEntrySize:       2, // Only store 2-byte timestamp
-			CleanWindow:        1 * time.Second,
-		},
-	})
-	if err != nil {
-		return nil, 0, errors.Wrap(err, "failed to create default double-check cache")
-	}
-	return cache, 10 * time.Millisecond, nil
-}
-
-// parseDoubleCheckWindow validates and converts the window parameter for double-check optimization.
-// Returns windowMS in milliseconds or an error if invalid.
-func parseDoubleCheckWindow(window time.Duration) (int64, error) {
-	windowMS := window.Milliseconds()
-
-	// Strict check: window must be exactly representable in milliseconds
-	if window != time.Duration(windowMS)*time.Millisecond {
-		return 0, fmt.Errorf(
-			"window %v is not a whole number of milliseconds (precision limited to 1ms)",
-			window,
-		)
-	}
-
-	if windowMS <= 0 {
-		return 0, fmt.Errorf("window must be at least 1 millisecond")
-	}
-
-	if windowMS > 65535 {
-		return 0, fmt.Errorf(
-			"window %v exceeds maximum of 65535ms (65.5s) due to uint16 storage with millisecond precision",
-			window,
-		)
-	}
-
-	return windowMS, nil
-}
-
-// WithDoubleCheck configures or disables the double-check optimization.
+// WithDoubleCheck configures the double-check optimization mode.
 //
-// Note: Double-check is ENABLED BY DEFAULT with an internal 10ms window BigCache.
-// Singleflight already prevents 99%+ of redundant fetches by deduplicating
-// concurrent requests for the same key. Double-check is a supplementary optimization
-// that eliminates the remaining edge cases in the narrow race window.
+// Default: DoubleCheckAuto (smart detection based on notFoundCache configuration)
 //
-// Problem: When multiple requests concurrently access a missing key, Request B may
-// check the cache (miss) while Request A is fetching. After A completes and writes
-// the result, B would normally fetch again, causing redundant upstream calls.
+// Background: Double-check works together with singleflight to reduce redundant upstream calls:
+//   - Singleflight: Deduplicates concurrent requests for the same key (same moment)
+//   - Double-check: Handles slightly staggered requests in race window (near-miss timing)
 //
-// Solution: After A writes, it marks the key as "recently written". When B enters
-// its fetch path, it detects this marker and re-checks the cache first, finding
-// A's result and avoiding the redundant fetch.
+// Double-check queries backend (and notFoundCache if configured) one more time
+// before going to upstream. This addresses the race window where:
+//  1. Request A writes to cache
+//  2. Request B misses cache (A's write not yet visible or in-flight)
+//  3. Request B enters fetch path and would normally query upstream
+//  4. Double-check catches A's write, avoiding redundant upstream query
 //
-// The window parameter defines how long a key is considered "recently written"
-// (max 65535ms, must be whole milliseconds).
+// Effectiveness (see TestDoubleCheckRaceWindowProbability for controlled test):
+//   - Test simulates worst-case scenario: two-wave concurrent pattern with precise timing
+//   - Test results: ~40% redundant fetches without double-check, 0% with double-check
+//   - Real-world impact: typically much lower race window probability, actual benefit varies
 //
-// See TestDoubleCheckRaceWindowProbability for a controlled test that demonstrates
-// the race window scenario and double-check's effectiveness.
+// Effectiveness depends on:
+//   - Concurrent access patterns (higher concurrency = more benefit)
+//   - Race window duration (network latency, cache propagation delay)
+//   - Cost ratio between double-check and upstream query
 //
-// Usage:
-//   - WithDoubleCheck(nil, 0): Disable double-check optimization
-//   - WithDoubleCheck(customCache, window): Use custom cache and window
+// Modes:
+//   - DoubleCheckDisabled: Skip double-check
+//     Use when: backend query cost >= upstream cost, or backend is unreliable/slow,
+//     or without notFoundCache in scenarios where upstream frequently returns not-found
+//     (double-check cannot catch not-found without notFoundCache, reducing effectiveness)
+//   - DoubleCheckEnabled: Always double-check (adds query cost, reduces upstream calls)
+//     Use when: upstream is significantly more expensive than backend queries
+//   - DoubleCheckAuto: Smart detection based on notFoundCache (default)
+//     Enables when notFoundCache exists (double-check covers both found and not-found scenarios),
+//     disables otherwise (double-check only covers found scenario, limited effectiveness)
 //
-// Parameters:
-//   - cache: Cache to track recently written keys, or nil to disable
-//   - window: Time window to consider a write as "recent" (whole milliseconds, max 65535ms)
+// Cost-benefit analysis:
 //
-// Resource Management:
-//   - When using custom cache, you are responsible for closing it
-//   - The client will NOT close custom caches provided via this option
-//   - Always call defer client.Close() to clean up default resources
+//	Cost = backend_query [+ notFoundCache_query if configured]
+//	Benefit = Avoid upstream_query when hitting race window
 //
-// Example (disable):
+//	Worth enabling when: upstream_cost >> (backend_cost + notFoundCache_cost)
 //
-//	client := cachex.NewClient(backend, upstream,
-//	    cachex.WithDoubleCheck[string](nil, 0),
-//	)
-//	defer client.Close()
-//
-// Example (custom):
-//
-//	cache, _ := cachex.NewBigCache(ctx, cachex.BigCacheConfig{...})
-//	defer cache.Close() // You must close custom cache yourself
-//	client := cachex.NewClient(backend, upstream,
-//	    cachex.WithDoubleCheck[string](cache, 100*time.Millisecond),
-//	)
-//	defer client.Close()
-func WithDoubleCheck[T any](cache Cache[[]byte], window time.Duration) ClientOption[T] {
-	// Allow nil cache to disable double-check
-	if cache == nil {
-		return func(c *Client[T]) {
-			c.recentWrites = nil
-			c.recentWritesWindowMS = 0
-			c.ownRecentWrites = true // Mark as explicitly configured
-		}
-	}
-
-	windowMS, err := parseDoubleCheckWindow(window)
-	if err != nil {
-		panic(err)
-	}
-
+// Recommendations by scenario:
+//   - Memory cache -> DB: DoubleCheckEnabled (DB ≫ memory, ~10000x difference)
+//   - Redis -> DB: DoubleCheckEnabled (DB ≫ Redis, ~10-50x difference)
+//   - Redis (+ notFoundCache) -> Redis: DoubleCheckDisabled (cost ≈ benefit)
+//   - Default/Uncertain: DoubleCheckAuto (smart heuristic)
+func WithDoubleCheck[T any](mode DoubleCheckMode) ClientOption[T] {
 	return func(c *Client[T]) {
-		c.recentWrites = cache
-		c.recentWritesWindowMS = windowMS
-		c.ownRecentWrites = false // User-provided cache, not managed by Client
+		c.doubleCheckMode = mode
 	}
 }

@@ -234,9 +234,6 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 		WithServeStale[*Entry[*Product]](true),
 		WithFetchTimeout[*Entry[*Product]](scenario.FetchTimeout),
 	)
-	b.Cleanup(func() {
-		_ = client.Close()
-	})
 
 	// No pre-warming - test cold start performance
 	ctx := context.Background()

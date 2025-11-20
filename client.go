@@ -3,7 +3,6 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand/v2"
 	"runtime/debug"
@@ -34,15 +33,12 @@ type Client[T any] struct {
 	fetchConcurrency int
 	logger           *slog.Logger
 
-	closeOnce       sync.Once
-	startTime       time.Time
 	sfg             singleflight.Group
 	asyncRefreshing sync.Map
 
 	// Double-check optimization
-	recentWrites         Cache[[]byte]
-	recentWritesWindowMS int64
-	ownRecentWrites      bool // true if recentWrites is created and managed by Client
+	doubleCheckMode   DoubleCheckMode // User configuration (immutable)
+	enableDoubleCheck bool            // Resolved execution decision
 
 	// Test hooks for simulating race conditions
 	testHooks *testHooks
@@ -69,28 +65,16 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		fetchTimeout:     DefaultFetchTimeout,
 		fetchConcurrency: DefaultFetchConcurrency,
 		logger:           slog.Default(),
-		startTime:        time.Now(),
+		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
 	}
 
-	// Apply user options first
+	// Apply user options
 	for _, opt := range opts {
 		opt(c)
 	}
 
-	// Enable double-check by default if not explicitly configured
-	if c.recentWrites == nil && !c.ownRecentWrites && NewDefaultDoubleCheckFunc != nil {
-		cache, window, err := NewDefaultDoubleCheckFunc()
-		if err != nil {
-			panic(err)
-		}
-		windowMS, err := parseDoubleCheckWindow(window)
-		if err != nil {
-			panic(err)
-		}
-		c.recentWrites = cache
-		c.recentWritesWindowMS = windowMS
-		c.ownRecentWrites = true
-	}
+	// Resolve double-check mode to boolean flag
+	c.enableDoubleCheck = c.resolveDoubleCheckMode()
 
 	if c.fetchTimeout <= 0 {
 		panic("fetchTimeout must be positive")
@@ -220,8 +204,6 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 		return errors.Wrapf(err, "delete from backend failed for key: %s", key)
 	}
 
-	c.markRecentWrite(ctx, key)
-
 	return nil
 }
 
@@ -269,8 +251,6 @@ func (c *Client[T]) setWithoutUpstream(ctx context.Context, key string, value T)
 		return errors.Wrapf(err, "set in backend failed for key: %s", key)
 	}
 
-	c.markRecentWrite(ctx, key)
-
 	return nil
 }
 
@@ -302,14 +282,14 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 			}
 		}()
 
-		// Double-check optimization: if this key was recently written, check cache again
+		// Double-check optimization: check cache again before fetching from upstream
 		// This handles the narrow window after a write completes but before singleflight releases
 		//
 		// Note: We use the original key (not sfKey) because:
 		// 1. fetchConcurrency allows multiple slots to fetch concurrently (exploration phase)
 		// 2. Once ANY slot completes, ALL slots should converge to reuse that result (convergence phase)
 		// 3. Using key ensures cross-slot visibility, maximizing result reuse after first completion
-		if c.wasRecentlyWritten(ctx, key) {
+		if c.enableDoubleCheck {
 			cachedValue, err := c.get(ctx, key, true)
 
 			if err == nil {
@@ -385,64 +365,19 @@ func (c *Client[T]) doFetch(ctx context.Context, key string) (T, error) {
 	return value, nil
 }
 
-// markRecentWrite records that a key was recently written (Set or Del) with compressed timestamp
-func (c *Client[T]) markRecentWrite(ctx context.Context, key string) {
-	if c.recentWrites == nil {
-		return
-	}
-
-	// Compress timestamp to 2 bytes: relative milliseconds modulo 65536
-	ms := uint16(NowFunc().Sub(c.startTime).Milliseconds() % 65536)
-	err := c.recentWrites.Set(ctx, key, []byte{byte(ms >> 8), byte(ms)})
-	if err != nil {
-		c.logger.WarnContext(ctx, "failed to mark recent write", "key", key, "error", err)
-	}
-}
-
-// wasRecentlyWritten checks if a key was written (Set or Del) recently
-// within the configured window, based on compressed timestamps
-func (c *Client[T]) wasRecentlyWritten(ctx context.Context, key string) bool {
-	if c.recentWrites == nil {
+// resolveDoubleCheckMode converts the mode to a boolean decision
+func (c *Client[T]) resolveDoubleCheckMode() bool {
+	switch c.doubleCheckMode {
+	case DoubleCheckEnabled:
+		return true
+	case DoubleCheckDisabled:
+		return false
+	case DoubleCheckAuto:
+		// Auto mode: enable when notFoundCache exists (can leverage it in double-check)
+		return c.notFoundCache != nil
+	default:
 		return false
 	}
-
-	data, err := c.recentWrites.Get(ctx, key)
-	if err != nil {
-		if !IsErrKeyNotFound(err) {
-			c.logger.WarnContext(ctx, "failed to get recent write", "key", key, "error", err)
-		}
-		return false
-	}
-
-	// Decode 2-byte compressed timestamp
-	storedMS := uint16(data[0])<<8 | uint16(data[1])
-	currentMS := uint16(NowFunc().Sub(c.startTime).Milliseconds() % 65536)
-
-	// Calculate elapsed time handling wraparound (use uint32 to avoid overflow)
-	var elapsed uint16
-	if currentMS >= storedMS {
-		elapsed = currentMS - storedMS
-	} else {
-		// Handle wraparound (65536ms = ~65 seconds)
-		elapsed = uint16((uint32(1)<<16 - uint32(storedMS)) + uint32(currentMS))
-	}
-
-	return elapsed <= uint16(c.recentWritesWindowMS)
-}
-
-// Close releases resources used by the client.
-// If double-check optimization was enabled by default, its cache is closed here.
-// Custom recentWrites caches provided via WithDoubleCheck are not closed by the client.
-func (c *Client[T]) Close() error {
-	var closeErr error
-	c.closeOnce.Do(func() {
-		if c.ownRecentWrites && c.recentWrites != nil {
-			if closer, ok := c.recentWrites.(io.Closer); ok {
-				closeErr = closer.Close()
-			}
-		}
-	})
-	return closeErr
 }
 
 // ClientOption is a functional option for configuring a Client

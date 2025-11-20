@@ -80,7 +80,6 @@ func main() {
         cachex.NotFoundWithTTL[*cachex.Entry[*Product]](notFoundCache, 1*time.Second, 5*time.Second),
         cachex.WithServeStale[*cachex.Entry[*Product]](true),
     )
-    defer client.Close() // Clean up resources
 
     // Use the cache
     ctx := context.Background()
@@ -172,7 +171,7 @@ sequenceDiagram
 - **NotFoundCache** - Dedicated cache for non-existent keys to prevent cache penetration
 - **Upstream** - Data source (database, API, another Client, or custom)
 - **Singleflight** - Deduplicates concurrent requests for the same key (primary defense against cache stampede)
-- **DoubleCheck** - Re-checks local cache for recently written keys within singleflight (eliminates remaining edge cases)
+- **DoubleCheck** - Re-checks backend and notFoundCache before upstream fetch to catch concurrent writes (eliminates race window)
 - **Entry** - Wrapper with timestamp for time-based staleness checks
 
 ## Cache Backends
@@ -256,7 +255,6 @@ l2Client := cachex.NewClient(
     dbUpstream,
     cachex.EntryWithTTL[*Product](1*time.Minute, 9*time.Minute),
 )
-defer l2Client.Close()
 
 // L1: In-memory cache with L2 client as upstream
 // Client can be used directly as upstream for the next layer
@@ -271,7 +269,6 @@ l1Client := cachex.NewClient(
     cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second),
     cachex.WithServeStale[*cachex.Entry[*Product]](true),
 )
-defer l1Client.Close()
 
 // Read: L1 miss → L2 → Database (if L2 also misses)
 product, _ := l1Client.Get(ctx, "product-123")
@@ -328,7 +325,6 @@ client := cachex.NewClient(
         5*time.Second,  // stale TTL
     ),
 )
-defer client.Close()
 ```
 
 ### Custom Staleness Logic
@@ -351,7 +347,6 @@ client := cachex.NewClient(
     }),
     cachex.WithServeStale[*Product](true),
 )
-defer client.Close()
 ```
 
 ### Type Transformation
@@ -407,8 +402,8 @@ user, err := userCache.Get(ctx, "user:123")
 2. **DoubleCheck** (Supplementary):
    - Handles the narrow race window where Request B checks the cache (miss) before Request A completes its write
    - Works **across all singleflight slots**, enabling fast convergence after first successful fetch
-   - Enabled by default with 10ms window, maximizing cache hit rate regardless of concurrency setting
-   - Disable with `WithDoubleCheck(nil, 0)` if not needed
+   - Auto-enabled by default when notFoundCache is configured (smart detection)
+   - Configure with `WithDoubleCheck(DoubleCheckEnabled/Disabled/Auto)` based on your scenario
 
 ### Q: What's the difference between fresh and stale TTL?
 

@@ -192,9 +192,6 @@ func TestEntryWithClient(t *testing.T) {
 			EntryWithTTL[string](100*time.Millisecond, 500*time.Millisecond), // 100ms fresh, 500ms stale
 			WithServeStale[*Entry[string]](true),
 		)
-		defer func() {
-			assert.NoError(t, client.Close())
-		}()
 
 		ctx := context.Background()
 

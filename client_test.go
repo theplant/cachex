@@ -24,9 +24,6 @@ func TestClientBasics(t *testing.T) {
 	})
 
 	cli := NewClient(backend, upstream)
-	defer func() {
-		assert.NoError(t, cli.Close())
-	}()
 
 	t.Run("fetch from upstream on miss", func(t *testing.T) {
 		value, err := cli.Get(ctx, "key1")
@@ -96,9 +93,6 @@ func TestClientStaleHandling(t *testing.T) {
 		fetchCount = 0
 
 		cli := NewClient(backend, upstream, WithStale(checkStale))
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		value, err := cli.Get(ctx, "key1")
 		require.NoError(t, err)
@@ -120,9 +114,6 @@ func TestClientStaleHandling(t *testing.T) {
 			WithStale(checkStale),
 			WithServeStale[*testValue](true),
 		)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		value, err := cli.Get(ctx, "key2")
 		require.NoError(t, err)
@@ -176,9 +167,6 @@ func TestClientNotFoundCache(t *testing.T) {
 	cli := NewClient(backend, upstream,
 		NotFoundWithTTL[string](notFoundCache, 100*time.Millisecond, 0),
 	)
-	defer func() {
-		assert.NoError(t, cli.Close())
-	}()
 
 	t.Run("cache not found", func(t *testing.T) {
 		_, err := cli.Get(ctx, "not-exist")
@@ -253,13 +241,7 @@ func TestClientLayeredCache(t *testing.T) {
 	})
 
 	l2Client := NewClient(l2, apiUpstream)
-	defer func() {
-		assert.NoError(t, l2Client.Close())
-	}()
 	l1Client := NewClient(l1, l2Client)
-	defer func() {
-		assert.NoError(t, l1Client.Close())
-	}()
 
 	t.Run("cold cache - fetch from API", func(t *testing.T) {
 		user, err := l1Client.Get(ctx, "user:123")
@@ -362,9 +344,6 @@ func TestStaleDataCleanupWhenUpstreamDeletes(t *testing.T) {
 		WithStale(checkStale),
 		WithNotFound[*timestampedValue](notFoundCache, nil),
 	)
-	defer func() {
-		assert.NoError(t, client.Close())
-	}()
 
 	// Step 1: Get key1 - fetch from upstream and cache it
 	value, err := client.Get(ctx, "key1")
@@ -424,9 +403,6 @@ func TestDelSetsNotFoundCache(t *testing.T) {
 	})
 
 	client := NewClient(backend, upstream, WithNotFound[string](notFoundCache, nil))
-	defer func() {
-		assert.NoError(t, client.Close())
-	}()
 
 	// Step 1: Get key to cache it
 	value, err := client.Get(ctx, "key1")
@@ -493,9 +469,6 @@ func TestDoFetchDoesNotTouchUpstream(t *testing.T) {
 		}
 
 		client := NewClient(backend, trackedUpstream)
-		defer func() {
-			assert.NoError(t, client.Close())
-		}()
 
 		// Fetch from upstream
 		value, err := client.Get(ctx, "key1")
@@ -571,9 +544,6 @@ func TestDoFetchDoesNotTouchUpstream(t *testing.T) {
 			WithStale(checkStale),
 			WithNotFound[*timestampedValue](notFoundCache, nil),
 		)
-		defer func() {
-			assert.NoError(t, client.Close())
-		}()
 
 		// Get should return NotFound (backend has stale data, upstream returns NotFound)
 		_, err = client.Get(ctx, "key1")
@@ -637,9 +607,6 @@ func TestNotFoundCacheStale(t *testing.T) {
 		NotFoundWithTTL[string](notFoundCache, 100*time.Millisecond, 500*time.Millisecond),
 		WithServeStale[string](true),
 	)
-	defer func() {
-		assert.NoError(t, cli.Close())
-	}()
 
 	t.Run("first fetch caches not found", func(t *testing.T) {
 		_, err := cli.Get(ctx, "not-exist")
@@ -697,9 +664,6 @@ func TestUpstreamPanicRecovery(t *testing.T) {
 		})
 
 		cli := NewClient(backend, panicUpstream)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		// Should not panic, should return error
 		_, err := cli.Get(ctx, "key1")
@@ -719,9 +683,6 @@ func TestUpstreamPanicRecovery(t *testing.T) {
 		})
 
 		cli := NewClient(backend, conditionalPanicUpstream)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		// First call should panic and recover
 		_, err := cli.Get(ctx, "key3")
@@ -765,9 +726,6 @@ func TestWithLogger(t *testing.T) {
 	cli := NewClient(failingBackend, upstream,
 		WithLogger[string](customLogger),
 	)
-	defer func() {
-		assert.NoError(t, cli.Close())
-	}()
 
 	// Trigger a fetch that will log a warning (failed to set cache entry)
 	val, err := cli.Get(ctx, "test-key")
@@ -789,9 +747,6 @@ func TestSetDelWithUpstreamCache(t *testing.T) {
 
 		// Use upstream cache as the upstream
 		cli := NewClient(backend, upstream)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		// Set value
 		err := cli.Set(ctx, "key1", "value1")
@@ -826,9 +781,6 @@ func TestSetDelWithUpstreamCache(t *testing.T) {
 		}
 
 		cli := NewClient(backend, upstream)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		// Set should fail
 		err := cli.Set(ctx, "key2", "value2")
@@ -846,9 +798,6 @@ func TestSetDelWithUpstreamCache(t *testing.T) {
 		_ = upstream.Set(ctx, "key3", "value3")
 
 		cli := NewClient(backend, upstream)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		// Delete value
 		err := cli.Del(ctx, "key3")
@@ -884,9 +833,6 @@ func TestSetDelWithUpstreamCache(t *testing.T) {
 		_ = backend.Set(ctx, "key4", "value4")
 
 		cli := NewClient(backend, upstream)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		// Del should fail
 		err := cli.Del(ctx, "key4")
@@ -904,9 +850,6 @@ func TestSetDelWithUpstreamCache(t *testing.T) {
 		})
 
 		cli := NewClient(backend, upstream)
-		defer func() {
-			assert.NoError(t, cli.Close())
-		}()
 
 		// Set should succeed (upstream is not Cache, so no propagation)
 		err := cli.Set(ctx, "key5", "value5")
