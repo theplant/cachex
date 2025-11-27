@@ -186,3 +186,39 @@ func TestGORMCacheTransactionDelete(t *testing.T) {
 	_, err = cache.Get(ctx, "del_key")
 	assert.True(t, IsErrKeyNotFound(err), "should not find key after transaction commit")
 }
+
+func TestGORMCacheWithClientTransaction(t *testing.T) {
+	type User struct {
+		ID   string
+		Name string
+	}
+
+	ctx := context.Background()
+	cache, db := newGORMCache[*User](t, "client_tx_cache")
+
+	fetchCount := 0
+	upstream := UpstreamFunc[*User](func(ctx context.Context, key string) (*User, error) {
+		fetchCount++
+		return &User{ID: key, Name: "User " + key}, nil
+	})
+
+	client := NewClient(cache, upstream)
+
+	require.NoError(t, cache.Set(ctx, "other_key", &User{ID: "other", Name: "Other User"}))
+
+	tx := db.Begin()
+	txCtx := WithGORMTx(ctx, tx)
+
+	user1 := &User{ID: "user1", Name: "User One"}
+	require.NoError(t, client.Set(txCtx, "user1", user1))
+
+	value, err := client.Get(txCtx, "user1")
+	require.NoError(t, err)
+	assert.Equal(t, "User One", value.Name, "should read value within transaction")
+
+	require.NoError(t, tx.Rollback().Error)
+
+	_, err = cache.Get(ctx, "user1")
+	assert.True(t, IsErrKeyNotFound(err), "should not find value in cache after transaction rollback")
+	assert.Equal(t, 0, fetchCount, "should not fetch from upstream during rollback test")
+}

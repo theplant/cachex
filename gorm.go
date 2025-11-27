@@ -70,10 +70,15 @@ func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 
 type ctxKeyGORMTx struct{}
 
+// WithGORMTx attaches a GORM transaction to the context.
+// All GORMCache operations using this context will execute within the transaction.
+// The transaction must be committed or rolled back by the caller.
 func WithGORMTx(ctx context.Context, tx *gorm.DB) context.Context {
 	return context.WithValue(ctx, ctxKeyGORMTx{}, tx)
 }
 
+// GetGORMTx retrieves the GORM transaction from the context.
+// Returns nil if no transaction is attached to the context.
 func GetGORMTx(ctx context.Context) *gorm.DB {
 	tx, _ := ctx.Value(ctxKeyGORMTx{}).(*gorm.DB)
 	return tx
