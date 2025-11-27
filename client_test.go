@@ -231,7 +231,7 @@ func TestClientLayeredCache(t *testing.T) {
 	}
 
 	l1 := newRistrettoCache[*User](t)
-	l2 := newGORMCache[*User](t, "user_cache")
+	l2, _ := newGORMCache[*User](t, "user_cache")
 
 	apiCallCount := 0
 	apiUpstream := UpstreamFunc[*User](func(ctx context.Context, key string) (*User, error) {
