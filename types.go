@@ -8,9 +8,9 @@ import (
 type State int8
 
 const (
-	StateFresh    State = iota // Data is fresh and valid
-	StateStale                 // Data is stale but usable
-	StateTooStale              // Data is too stale and must be refreshed
+	StateFresh  State = iota // Data is fresh and valid
+	StateStale               // Data is stale but usable
+	StateRotten              // Data is rotten and must be refreshed
 )
 
 // Upstream defines the interface for a data source that can retrieve values

@@ -22,8 +22,8 @@ func (e *ErrKeyNotFound) Error() string {
 		return "key not found (cached, fresh)"
 	case StateStale:
 		return "key not found (cached, stale)"
-	case StateTooStale:
-		return "key not found (cached, too stale)"
+	case StateRotten:
+		return "key not found (cached, rotten)"
 	default:
 		return fmt.Sprintf("key not found (cached, state=%d)", e.CacheState)
 	}

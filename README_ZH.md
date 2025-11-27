@@ -113,8 +113,8 @@ sequenceDiagram
         Upstream-->>SF: new value
         SF->>NFCache: Del(key)
         SF->>Cache: Set(key, value)
-    else Cache Hit + Stale (serveStale=false) or TooStale
-        Cache-->>Client: value (stale/too stale)
+    else Cache Hit + Stale (serveStale=false) or Rotten
+        Cache-->>Client: value (stale/rotten)
         Note over Client: Skip NotFoundCache, fetch directly<br/>(backend has data)
         Client->>SF: Fetch(key)
         SF->>Upstream: Fetch(key)
@@ -143,8 +143,8 @@ sequenceDiagram
                 SF->>NFCache: Del(key)
                 SF->>Cache: Set(key, value)
             end
-        else NotFound Hit + Stale (serveStale=false) or TooStale or Miss
-            NFCache-->>Client: stale/too stale/miss
+        else NotFound Hit + Stale (serveStale=false) or Rotten or Miss
+            NFCache-->>Client: stale/rotten/miss
             Client->>SF: Fetch(key)
             SF->>Upstream: Fetch(key)
             alt Key Exists
@@ -343,7 +343,7 @@ client := cachex.NewClient(
         if age < 5*time.Second + 25*time.Second {
             return cachex.StateStale
         }
-        return cachex.StateTooStale
+        return cachex.StateRotten
     }),
     cachex.WithServeStale[*Product](true),
 )

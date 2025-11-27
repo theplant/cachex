@@ -21,6 +21,6 @@ func EntryWithTTL[T any](freshTTL, staleTTL time.Duration) ClientOption[*Entry[T
 		if age < freshTTL+staleTTL {
 			return StateStale
 		}
-		return StateTooStale
+		return StateRotten
 	})
 }
