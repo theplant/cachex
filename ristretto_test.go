@@ -9,7 +9,7 @@ import (
 )
 
 func newRistrettoCache[T any](tb testing.TB) *RistrettoCache[T] {
-	cache, err := NewRistrettoCache[T](DefaultRistrettoCacheConfig[T]())
+	cache, err := NewRistrettoCache(DefaultRistrettoCacheConfig[T]())
 	require.NoError(tb, err)
 	tb.Cleanup(func() { _ = cache.Close() })
 	return cache

@@ -1,6 +1,7 @@
 package cachex
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"time"
@@ -60,10 +61,27 @@ func (g *GORMCache[T]) prefixedKey(key string) string {
 
 // Migrate creates or updates the cache table schema
 func (g *GORMCache[T]) Migrate(ctx context.Context) error {
-	if err := g.db.WithContext(ctx).Table(g.tableName).AutoMigrate(&cacheEntry{}); err != nil {
+	tx := cmp.Or(GetGORMTx(ctx), g.db)
+	if err := tx.WithContext(ctx).Table(g.tableName).AutoMigrate(&cacheEntry{}); err != nil {
 		return errors.Wrapf(err, "failed to migrate cache table for table: %s", g.tableName)
 	}
 	return nil
+}
+
+type ctxKeyGORMTx struct{}
+
+// WithGORMTx attaches a GORM transaction to the context.
+// All GORMCache operations using this context will execute within the transaction.
+// The transaction must be committed or rolled back by the caller.
+func WithGORMTx(ctx context.Context, tx *gorm.DB) context.Context {
+	return context.WithValue(ctx, ctxKeyGORMTx{}, tx)
+}
+
+// GetGORMTx retrieves the GORM transaction from the context.
+// Returns nil if no transaction is attached to the context.
+func GetGORMTx(ctx context.Context) *gorm.DB {
+	tx, _ := ctx.Value(ctxKeyGORMTx{}).(*gorm.DB)
+	return tx
 }
 
 // Set stores a value in the cache
@@ -78,7 +96,8 @@ func (g *GORMCache[T]) Set(ctx context.Context, key string, value T) error {
 		Value: data,
 	}
 
-	if err := g.db.WithContext(ctx).
+	tx := cmp.Or(GetGORMTx(ctx), g.db)
+	if err := tx.WithContext(ctx).
 		Table(g.tableName).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "key"}},
@@ -96,7 +115,8 @@ func (g *GORMCache[T]) Get(ctx context.Context, key string) (T, error) {
 	var zero T
 	var entry cacheEntry
 
-	if err := g.db.WithContext(ctx).
+	tx := cmp.Or(GetGORMTx(ctx), g.db)
+	if err := tx.WithContext(ctx).
 		Table(g.tableName).
 		Where("key = ?", g.prefixedKey(key)).
 		First(&entry).Error; err != nil {
@@ -116,7 +136,8 @@ func (g *GORMCache[T]) Get(ctx context.Context, key string) (T, error) {
 
 // Del removes a value from the cache
 func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
-	if err := g.db.WithContext(ctx).
+	tx := cmp.Or(GetGORMTx(ctx), g.db)
+	if err := tx.WithContext(ctx).
 		Table(g.tableName).
 		Where("key = ?", g.prefixedKey(key)).
 		Delete(nil).Error; err != nil {
