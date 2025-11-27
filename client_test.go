@@ -361,7 +361,7 @@ func TestStaleDataCleanupWhenUpstreamDeletes(t *testing.T) {
 	clock.Advance(150 * time.Millisecond)
 
 	// Verify cached data is now stale
-	assert.Equal(t, StateRotten, checkStale(cachedValue), "cached data should be stale")
+	assert.Equal(t, StateRotten, checkStale(cachedValue), "cached data should be rotten")
 
 	// Step 3: Meanwhile, data was deleted from upstream
 	realDataExists = false
