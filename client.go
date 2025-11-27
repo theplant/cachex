@@ -114,8 +114,8 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 				return value, nil
 			}
 
-		case StateTooStale:
-			// Too stale, must refresh
+		case StateRotten:
+			// Rotten, must refresh
 		}
 	} else if !IsErrKeyNotFound(err) {
 		return zero, errors.Wrapf(err, "get from backend failed for key: %s", key)
@@ -147,8 +147,8 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 					}, "key not found in cache for key: %s", key)
 				}
 
-			case StateTooStale:
-				// Too stale, must refresh
+			case StateRotten:
+				// Rotten, must refresh
 			}
 		} else if !IsErrKeyNotFound(err) {
 			return zero, errors.Wrapf(err, "get from notFoundCache failed for key: %s", key)
@@ -415,7 +415,7 @@ func NotFoundWithTTL[T any](cache Cache[time.Time], freshTTL time.Duration, stal
 		if staleTTL > 0 && age < freshTTL+staleTTL {
 			return StateStale
 		}
-		return StateTooStale
+		return StateRotten
 	})
 }
 

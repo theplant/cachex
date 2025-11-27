@@ -86,7 +86,7 @@ func TestClientStaleHandling(t *testing.T) {
 		if age < 150*time.Millisecond {
 			return StateStale
 		}
-		return StateTooStale
+		return StateRotten
 	}
 
 	t.Run("without serve stale", func(t *testing.T) {
@@ -142,7 +142,7 @@ func TestClientStaleHandling(t *testing.T) {
 
 		value, err = cli.Get(ctx, "key2")
 		require.NoError(t, err)
-		assert.Equal(t, "fetch-4", value.Data, "should refetch when too stale")
+		assert.Equal(t, "fetch-4", value.Data, "should refetch when rotten")
 		assert.Equal(t, 4, fetchCount)
 	})
 }
@@ -331,12 +331,12 @@ func TestStaleDataCleanupWhenUpstreamDeletes(t *testing.T) {
 		return nil, &ErrKeyNotFound{}
 	})
 
-	// Stale check: fresh for 100ms, then TooStale (force refetch)
+	// Stale check: fresh for 100ms, then Rotten (force refetch)
 	checkStale := func(v *timestampedValue) State {
 		if clock.Now().Before(v.ExpiresAt) {
 			return StateFresh
 		}
-		return StateTooStale
+		return StateRotten
 	}
 
 	notFoundCache := newRistrettoCache[time.Time](t)
@@ -361,7 +361,7 @@ func TestStaleDataCleanupWhenUpstreamDeletes(t *testing.T) {
 	clock.Advance(150 * time.Millisecond)
 
 	// Verify cached data is now stale
-	assert.Equal(t, StateTooStale, checkStale(cachedValue), "cached data should be stale")
+	assert.Equal(t, StateRotten, checkStale(cachedValue), "cached data should be rotten")
 
 	// Step 3: Meanwhile, data was deleted from upstream
 	realDataExists = false
@@ -537,7 +537,7 @@ func TestDoFetchDoesNotTouchUpstream(t *testing.T) {
 			if clock.Now().Before(v.ExpiresAt) {
 				return StateFresh
 			}
-			return StateTooStale
+			return StateRotten
 		}
 
 		client := NewClient(backend, trackedUpstream,
@@ -641,15 +641,15 @@ func TestNotFoundCacheStale(t *testing.T) {
 		assert.Equal(t, 2, fetchCount, "async refresh should have happened")
 	})
 
-	t.Run("too stale triggers immediate fetch", func(t *testing.T) {
+	t.Run("rotten triggers immediate fetch", func(t *testing.T) {
 		clock.Advance(600 * time.Millisecond) // Beyond stale TTL
 
 		_, err := cli.Get(ctx, "not-exist")
 		var e *ErrKeyNotFound
 		assert.True(t, errors.As(err, &e))
 		// After refetch, error comes from upstream (not cached)
-		assert.False(t, e.Cached, "too stale refetch returns fresh upstream error")
-		assert.Equal(t, 3, fetchCount, "should refetch immediately when too stale")
+		assert.False(t, e.Cached, "rotten refetch returns fresh upstream error")
+		assert.Equal(t, 3, fetchCount, "should refetch immediately when rotten")
 	})
 }
 

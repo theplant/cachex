@@ -108,14 +108,14 @@ func TestEntryWithTTL(t *testing.T) {
 		assert.Equal(t, StateStale, state)
 	})
 
-	t.Run("too stale entry", func(t *testing.T) {
+	t.Run("rotten entry", func(t *testing.T) {
 		now := time.Now()
 		oldNowFunc := NowFunc
 		NowFunc = func() time.Time { return now }
 		defer func() { NowFunc = oldNowFunc }()
 
 		entry := &Entry[string]{
-			Data:     "too stale data",
+			Data:     "rotten data",
 			CachedAt: now.Add(-20 * time.Second), // 20 seconds ago
 		}
 
@@ -124,7 +124,7 @@ func TestEntryWithTTL(t *testing.T) {
 		option(client)
 
 		state := client.checkDataStale(entry)
-		assert.Equal(t, StateTooStale, state)
+		assert.Equal(t, StateRotten, state)
 	})
 
 	t.Run("exact boundary - fresh to stale", func(t *testing.T) {
@@ -146,7 +146,7 @@ func TestEntryWithTTL(t *testing.T) {
 		assert.Equal(t, StateStale, state)
 	})
 
-	t.Run("exact boundary - stale to too stale", func(t *testing.T) {
+	t.Run("exact boundary - stale to rotten", func(t *testing.T) {
 		now := time.Now()
 		oldNowFunc := NowFunc
 		NowFunc = func() time.Time { return now }
@@ -162,7 +162,7 @@ func TestEntryWithTTL(t *testing.T) {
 		option(client)
 
 		state := client.checkDataStale(entry)
-		assert.Equal(t, StateTooStale, state)
+		assert.Equal(t, StateRotten, state)
 	})
 }
 
