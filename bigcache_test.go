@@ -21,7 +21,7 @@ func newBigCache(tb testing.TB) *BigCache {
 		},
 	})
 	require.NoError(tb, err)
-	tb.Cleanup(func() { cache.Close() })
+	tb.Cleanup(func() { _ = cache.Close() })
 	return cache
 }
 

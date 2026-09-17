@@ -201,7 +201,7 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer l1Cache.Close()
+	defer func() { _ = l1Cache.Close() }()
 
 	// Setup not-found cache
 	// Use freshTTL + staleTTL as cache expiration
@@ -211,7 +211,7 @@ func runScenario(b *testing.B, scenario BenchmarkScenario) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer notFoundCache.Close()
+	defer func() { _ = notFoundCache.Close() }()
 
 	// Upstream: DB query wrapped in Entry
 	upstream := UpstreamFunc[*Entry[*Product]](func(ctx context.Context, key string) (*Entry[*Product], error) {
