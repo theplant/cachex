@@ -25,7 +25,7 @@ func newRedisCache[T any](tb testing.TB) (*RedisCache[T], *miniredis.Miniredis) 
 	})
 
 	tb.Cleanup(func() {
-		client.Close()
+		_ = client.Close()
 	})
 
 	cache := NewRedisCache[T](&RedisCacheConfig{
@@ -119,7 +119,7 @@ func TestRedisCacheWithTTL(t *testing.T) {
 			Mode: "disabled",
 		},
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	cache := NewRedisCache[string](&RedisCacheConfig{
 		Client: client,
@@ -149,7 +149,7 @@ func TestRedisCacheConfigWithPrefix(t *testing.T) {
 			Mode: "disabled",
 		},
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	prodCache := NewRedisCache[string](&RedisCacheConfig{
 		Client:    client,

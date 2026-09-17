@@ -173,7 +173,7 @@ func TestEntryWithClient(t *testing.T) {
 		config.TTL = 1 * time.Minute
 		cache, err := NewRistrettoCache(config)
 		assert.NoError(t, err)
-		defer cache.Close()
+		defer func() { _ = cache.Close() }()
 
 		// Mock upstream data source
 		fetchCount := 0

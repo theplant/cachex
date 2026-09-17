@@ -28,7 +28,7 @@ func TestTransformCacheBasics(t *testing.T) {
 			Mode: "disabled",
 		},
 	})
-	t.Cleanup(func() { client.Close() })
+	t.Cleanup(func() { _ = client.Close() })
 
 	// Create a Cache[string]
 	stringCache := NewRedisCache[string](&RedisCacheConfig{
@@ -74,7 +74,7 @@ func TestJSONTransform(t *testing.T) {
 			Mode: "disabled",
 		},
 	})
-	t.Cleanup(func() { client.Close() })
+	t.Cleanup(func() { _ = client.Close() })
 
 	// Create a Cache[[]byte]
 	byteCache := NewRedisCache[[]byte](&RedisCacheConfig{
@@ -117,7 +117,7 @@ func TestStringJSONTransform(t *testing.T) {
 			Mode: "disabled",
 		},
 	})
-	t.Cleanup(func() { client.Close() })
+	t.Cleanup(func() { _ = client.Close() })
 
 	// Create a Cache[string]
 	stringCache := NewRedisCache[string](&RedisCacheConfig{
@@ -160,7 +160,7 @@ func TestTransformCacheErrors(t *testing.T) {
 			Mode: "disabled",
 		},
 	})
-	t.Cleanup(func() { client.Close() })
+	t.Cleanup(func() { _ = client.Close() })
 
 	stringCache := NewRedisCache[string](&RedisCacheConfig{
 		Client: client,
