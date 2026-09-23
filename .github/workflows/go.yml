@@ -10,8 +10,11 @@ on:
   pull_request:
     branches: ["main"]
 
+# `contents: read` only. The `id-token: write` that used to sit here had no
+# consumer — nothing in this workflow does OIDC to a cloud provider (no
+# aws-actions/*, no google-github-actions/*), so it was handing every step a
+# token it could mint cloud credentials with, for nothing.
 permissions:
-  id-token: write
   contents: read
 
 jobs:
@@ -19,16 +22,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        # persist-credentials: false — checkout writes a token into .git/config by
+        # default and nothing here pushes, tags or opens a PR, so the credential is
+        # only an extra thing for a step (or a dependency this workflow runs) to find.
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        # v4 runs on the node16 action runtime, which GitHub has removed —
+        # actionlint reports it as "too old to run on GitHub Actions". Same inputs
+        # on v5 (go-version-file + cache), so this is a runtime bump only.
+        uses: actions/setup-go@v5
         with:
           go-version-file: "go.mod"
           cache: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        # Pinned to a commit, not the movable `v9` tag: `v9` resolves to this exact
+        # SHA today (it is also what v9.3.0 points at), so nothing changes now, but
+        # the tag can be repointed upstream at any time. actions/* are governed by
+        # GitHub itself and are exempt; a third-party action is not.
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.13.2
           args: --timeout=5m
