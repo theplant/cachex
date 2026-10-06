@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding"
 	"encoding/json"
+	stderrors "errors"
 	"time"
 
 	"github.com/pkg/errors"
@@ -209,18 +210,23 @@ func (r *RedisCache[T]) SetMany(ctx context.Context, values map[string]T) error 
 		return nil
 	}
 
+	// A value that fails to encode is reported without holding back the others.
+	var encodeErrs []error
 	pipe := r.client.Pipeline()
 	for key, value := range values {
 		data, err := r.encode(key, value)
 		if err != nil {
-			return err
+			encodeErrs = append(encodeErrs, err)
+			continue
 		}
 		pipe.Set(ctx, r.prefixedKey(key), data, r.ttl)
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return errors.Wrap(err, "failed to set cache entries")
+	if pipe.Len() > 0 {
+		if _, err := pipe.Exec(ctx); err != nil {
+			return errors.Wrap(err, "failed to set cache entries")
+		}
 	}
-	return nil
+	return stderrors.Join(encodeErrs...)
 }
 
 // DelMany removes many keys in one round trip

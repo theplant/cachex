@@ -2,6 +2,7 @@ package cachex
 
 import (
 	"context"
+	stderrors "errors"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -273,6 +274,7 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 // what is still missing, then finish every flight.
 func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight[T]) {
 	results := make([]result[T], len(keys))
+	var pending []int // keys still to fetch after the double-check; nil until it ran
 	returned := false
 	defer func() {
 		r := recover()
@@ -290,7 +292,14 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 				"panic", r,
 				"stack", string(debug.Stack()))
 			err := errors.Errorf("panic during upstream fetch: %v", r)
-			for i := range results {
+			failed := pending
+			if failed == nil {
+				failed = make([]int, len(keys))
+				for i := range failed {
+					failed[i] = i
+				}
+			}
+			for _, i := range failed {
 				results[i] = result[T]{err: err}
 			}
 		}
@@ -302,25 +311,27 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
 	defer cancel()
 
-	pending := make([]int, 0, len(keys))
+	checked := make([]int, 0, len(keys))
 	if c.enableDoubleCheck {
-		for i, r := range c.lookupMany(fetchCtx, keys, true) {
+		// like Get, the double-check reads with the request ctx
+		for i, r := range c.lookupMany(ctx, keys, true) {
 			switch {
 			case r.fetch:
-				pending = append(pending, i)
+				checked = append(checked, i)
 			case r.err == nil:
 				results[i].value = r.value
 			case isCachedFreshNotFound(r.err):
 				results[i].err = r.err
 			default:
-				pending = append(pending, i) // like Get: a failed double-check falls through to upstream
+				checked = append(checked, i) // like Get: a failed double-check falls through to upstream
 			}
 		}
 	} else {
 		for i := range keys {
-			pending = append(pending, i)
+			checked = append(checked, i)
 		}
 	}
+	pending = checked
 	if len(pending) == 0 {
 		returned = true
 		return
@@ -465,6 +476,10 @@ func (c *Client[T]) asyncRefreshMany(ctx context.Context, keys []string) {
 				c.asyncRefreshing.Delete(sfKey)
 			}
 		}()
+		// Bound the wait: some keys may be fetched by other callers, and a fetch
+		// that never finishes (runtime.Goexit) must not pin the whole batch.
+		ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+		defer cancel()
 		for i, r := range c.fetchMany(ctx, refreshKeys, sfKeys) {
 			if r.err != nil && !IsErrKeyNotFound(r.err) {
 				c.logger.ErrorContext(ctx, "async refresh failed", "key", refreshKeys[i], "error", r.err)
@@ -496,35 +511,37 @@ func getMany[T any](ctx context.Context, from Upstream[T], keys []string) (map[s
 	return out, nil
 }
 
+// setMany writes many keys, in one call when cache implements BatchCache,
+// otherwise key by key; like Get, one key failing does not stop the others.
 func setMany[T any](ctx context.Context, cache Cache[T], values map[string]T) error {
 	if batch, ok := cache.(BatchCache[T]); ok {
 		return batch.SetMany(ctx, values)
 	}
+	var errs []error
 	for key, value := range values {
-		if err := cache.Set(ctx, key, value); err != nil {
-			return err
-		}
+		errs = append(errs, cache.Set(ctx, key, value))
 	}
-	return nil
+	return stderrors.Join(errs...)
 }
 
+// delMany is the delete counterpart of setMany.
 func delMany[T any](ctx context.Context, cache Cache[T], keys []string) error {
 	if batch, ok := cache.(BatchCache[T]); ok {
 		return batch.DelMany(ctx, keys)
 	}
+	var errs []error
 	for _, key := range keys {
-		if err := cache.Del(ctx, key); err != nil {
-			return err
-		}
+		errs = append(errs, cache.Del(ctx, key))
 	}
-	return nil
+	return stderrors.Join(errs...)
 }
 
 // errForKey returns the error a batch call reported for key: the key's own
 // entry if err is a *BatchError, otherwise err itself (the whole batch failed).
+// Only an unwrapped *BatchError is partial: a wrapped or joined one may sit
+// next to an error that failed the whole batch.
 func errForKey(err error, key string) error {
-	var batchErr *BatchError
-	if errors.As(err, &batchErr) {
+	if batchErr, ok := err.(*BatchError); ok { //nolint:errorlint // see above
 		return batchErr.Errors[key]
 	}
 	return err

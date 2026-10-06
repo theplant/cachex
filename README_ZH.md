@@ -353,7 +353,7 @@ products, err := client.GetMany(ctx, []string{"p1", "p2", "p3"})
 ```go
 type BatchUpstream[T any] interface {
     // map 里没有的 key 视为不存在（相当于 Get 的 ErrKeyNotFound）。
-    // 返回非 nil error 表示整批失败；如果是 *cachex.BatchError，只有它列出的 key 失败。
+    // 返回非 nil error 表示整批失败；如果是原样返回（没有再包一层）的 *cachex.BatchError，只有它列出的 key 失败。
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }
 

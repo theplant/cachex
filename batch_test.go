@@ -2,6 +2,7 @@ package cachex
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"maps"
 	"runtime"
@@ -696,4 +697,110 @@ func TestGORMCacheBatchLargerThanBindLimit(t *testing.T) {
 	got, err = cache.GetMany(ctx, keys)
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+// missFirstBatch is a SyncMap whose first GetMany misses everything, as if
+// the values were written right after it.
+type missFirstBatch struct {
+	*SyncMap[string]
+	calls atomic.Int64
+}
+
+func (m *missFirstBatch) GetMany(ctx context.Context, keys []string) (map[string]string, error) {
+	if m.calls.Add(1) == 1 {
+		return map[string]string{}, nil
+	}
+	return m.SyncMap.GetMany(ctx, keys)
+}
+
+// hookedCache is a plain Cache (no batch methods) whose Set/Del can be intercepted.
+type hookedCache struct {
+	m         *SyncMap[string]
+	beforeSet func(key, value string) error
+	beforeDel func(key string) error
+}
+
+func newHookedCache() *hookedCache { return &hookedCache{m: NewSyncMap[string]()} }
+
+func (h *hookedCache) Get(ctx context.Context, key string) (string, error) { return h.m.Get(ctx, key) }
+
+func (h *hookedCache) Set(ctx context.Context, key, value string) error {
+	if h.beforeSet != nil {
+		if err := h.beforeSet(key, value); err != nil {
+			return err
+		}
+	}
+	return h.m.Set(ctx, key, value)
+}
+
+func (h *hookedCache) Del(ctx context.Context, key string) error {
+	if h.beforeDel != nil {
+		if err := h.beforeDel(key); err != nil {
+			return err
+		}
+	}
+	return h.m.Del(ctx, key)
+}
+
+func TestClientGetManyReviewFixes(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a whole-batch error that merely contains a BatchError fails every key", func(t *testing.T) {
+		notFound := NewSyncMap[time.Time]()
+		conn := errors.New("conn reset")
+		up := batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
+			return nil, stderrors.Join(conn, &BatchError{Errors: map[string]error{"a": errors.New("x")}})
+		})
+		cli := NewClient(NewSyncMap[string](), up, NotFoundWithTTL[string](notFound, time.Hour, 0))
+
+		got, err := cli.GetMany(ctx, []string{"a", "b"})
+		assert.Empty(t, got)
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.Len(t, be.Errors, 2, "b is a failure, not a not-found")
+		_, err = notFound.Get(ctx, "b")
+		assert.True(t, IsErrKeyNotFound(err), "no not-found is cached for a key the upstream never answered")
+	})
+
+	t.Run("a panic in the batch upstream keeps the keys the double-check found", func(t *testing.T) {
+		backend := &missFirstBatch{SyncMap: NewSyncMap[string]()}
+		require.NoError(t, backend.Set(ctx, "a", "1"))
+		up := batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
+			panic("kaboom")
+		})
+		cli := NewClient[string](backend, up, WithDoubleCheck[string](DoubleCheckEnabled))
+
+		got, err := cli.GetMany(ctx, []string{"a", "b"})
+		assert.Equal(t, map[string]string{"a": "1"}, got, "the double-check found a before the upstream panicked")
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.Equal(t, []string{"b"}, slices.Collect(maps.Keys(be.Errors)))
+	})
+
+	t.Run("a per-key backend write failure does not skip the other keys", func(t *testing.T) {
+		backend := newHookedCache()
+		backend.beforeSet = func(key, _ string) error {
+			if key == "bad" {
+				return errors.New("too large")
+			}
+			return nil
+		}
+		up := &batchUpstream{data: map[string]string{"a": "1", "bad": "2", "c": "3"}}
+		cli := NewClient[string](backend, up)
+		got, err := cli.GetMany(ctx, []string{"a", "bad", "c"})
+		require.NoError(t, err)
+		assert.Len(t, got, 3)
+		for _, k := range []string{"a", "c"} {
+			_, err := backend.Get(ctx, k)
+			assert.NoError(t, err, "%s is cached", k)
+		}
+	})
+}
+
+func TestRedisCacheSetManyEncodeErrorKeepsOthers(t *testing.T) {
+	ctx := context.Background()
+	cache, mr := newRedisCache[any](t)
+	err := cache.SetMany(ctx, map[string]any{"ok": 1, "bad": make(chan int)})
+	require.Error(t, err)
+	assert.True(t, mr.Exists("ok"), "the encodable value is still written")
 }

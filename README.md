@@ -353,8 +353,8 @@ To let the upstream answer a batch in one call, implement `BatchUpstream[T]` on 
 ```go
 type BatchUpstream[T any] interface {
     // Keys absent from the map do not exist (like ErrKeyNotFound for Get).
-    // A non-nil error fails the whole batch, unless it is a *cachex.BatchError,
-    // which fails only the keys it lists.
+    // A non-nil error fails the whole batch, unless it is a *cachex.BatchError
+    // returned as is (not wrapped), which fails only the keys it lists.
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }
 
