@@ -12,7 +12,7 @@ type SyncMap[T any] struct {
 	sync.Map
 }
 
-var _ Cache[any] = &SyncMap[any]{}
+var _ BatchCache[any] = &SyncMap[any]{}
 
 func NewSyncMap[T any]() *SyncMap[T] {
 	return &SyncMap[T]{}
@@ -34,5 +34,29 @@ func (s *SyncMap[T]) Get(_ context.Context, key string) (T, error) {
 
 func (s *SyncMap[T]) Del(_ context.Context, key string) error {
 	s.Delete(key)
+	return nil
+}
+
+func (s *SyncMap[T]) GetMany(_ context.Context, keys []string) (map[string]T, error) {
+	out := make(map[string]T, len(keys))
+	for _, key := range keys {
+		if v, ok := s.Load(key); ok {
+			out[key] = v.(T)
+		}
+	}
+	return out, nil
+}
+
+func (s *SyncMap[T]) SetMany(_ context.Context, values map[string]T) error {
+	for key, value := range values {
+		s.Store(key, value)
+	}
+	return nil
+}
+
+func (s *SyncMap[T]) DelMany(_ context.Context, keys []string) error {
+	for _, key := range keys {
+		s.Delete(key)
+	}
 	return nil
 }

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -33,7 +32,7 @@ type Client[T any] struct {
 	fetchConcurrency int
 	logger           *slog.Logger
 
-	sfg             singleflight.Group
+	flights         flightGroup[T]
 	asyncRefreshing sync.Map
 
 	// Double-check optimization
@@ -265,61 +264,74 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 		c.testHooks.beforeSingleflightStart(ctx, key)
 	}
 
-	resChan := c.sfg.DoChan(sfKey, func() (result any, resultErr error) {
-		if c.testHooks != nil && c.testHooks.afterSingleflightStart != nil {
-			c.testHooks.afterSingleflightStart(ctx, key)
-		}
-
-		defer func() {
-			if r := recover(); r != nil {
-				c.logger.ErrorContext(ctx, "panic during upstream fetch",
-					"key", key,
-					"panic", r,
-					"stack", string(debug.Stack()))
-				var zero T
-				result = zero
-				resultErr = errors.Errorf("panic during upstream fetch: %v", r)
-			}
+	f, leader := c.flights.claim(sfKey)
+	if leader {
+		go func() {
+			value, err := c.fetchClaimed(ctx, key)
+			c.flights.finish(sfKey, f, value, err)
 		}()
-
-		// Double-check optimization: check cache again before fetching from upstream
-		// This handles the narrow window after a write completes but before singleflight releases
-		//
-		// Note: We use the original key (not sfKey) because:
-		// 1. fetchConcurrency allows multiple slots to fetch concurrently (exploration phase)
-		// 2. Once ANY slot completes, ALL slots should converge to reuse that result (convergence phase)
-		// 3. Using key ensures cross-slot visibility, maximizing result reuse after first completion
-		if c.enableDoubleCheck {
-			cachedValue, err := c.get(ctx, key, true)
-
-			if err == nil {
-				return cachedValue, nil
-			}
-			var e *ErrKeyNotFound
-			if errors.As(err, &e) && e.Cached && e.CacheState == StateFresh {
-				var zero T
-				return zero, err
-			}
-			// otherwise, fetch from upstream
-		}
-
-		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
-		defer cancel()
-		return c.doFetch(fetchCtx, key)
-	})
+	}
 
 	select {
 	case <-ctx.Done():
 		return zero, errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", key)
-	case res := <-resChan:
+	case <-f.done:
 		if c.testHooks != nil && c.testHooks.afterSingleflightEnd != nil {
 			c.testHooks.afterSingleflightEnd(ctx, key)
 		}
-		if res.Err != nil {
-			return zero, res.Err
+		if f.err != nil {
+			return zero, f.err
 		}
-		return res.Val.(T), nil
+		return f.value, nil
 	}
+}
+
+// fetchClaimed fetches a key this request has claimed in the flight group.
+func (c *Client[T]) fetchClaimed(ctx context.Context, key string) (result T, resultErr error) {
+	if c.testHooks != nil && c.testHooks.afterSingleflightStart != nil {
+		c.testHooks.afterSingleflightStart(ctx, key)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.ErrorContext(ctx, "panic during upstream fetch",
+				"key", key,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			var zero T
+			result = zero
+			resultErr = errors.Errorf("panic during upstream fetch: %v", r)
+		}
+	}()
+
+	// Double-check optimization: check cache again before fetching from upstream
+	// This handles the narrow window after a write completes but before singleflight releases
+	//
+	// Note: We use the original key (not sfKey) because:
+	// 1. fetchConcurrency allows multiple slots to fetch concurrently (exploration phase)
+	// 2. Once ANY slot completes, ALL slots should converge to reuse that result (convergence phase)
+	// 3. Using key ensures cross-slot visibility, maximizing result reuse after first completion
+	if c.enableDoubleCheck {
+		cachedValue, err := c.get(ctx, key, true)
+
+		if err == nil {
+			return cachedValue, nil
+		}
+		if isCachedFreshNotFound(err) {
+			var zero T
+			return zero, err
+		}
+		// otherwise, fetch from upstream
+	}
+
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
+	defer cancel()
+	return c.doFetch(fetchCtx, key)
+}
+
+func isCachedFreshNotFound(err error) bool {
+	var e *ErrKeyNotFound
+	return errors.As(err, &e) && e.Cached && e.CacheState == StateFresh
 }
 
 func (c *Client[T]) makeSFKey(key string) string {

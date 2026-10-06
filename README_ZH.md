@@ -14,6 +14,7 @@
 - **🚫 防御缓存穿透** - Not-Found 缓存机制，缓存不存在的 key，避免恶意查询打垮数据库
 - **🔄 Serve-Stale** - 提供陈旧数据的同时异步刷新，确保高可用性和低延迟
 - **🎪 分层缓存** - 灵活组合多级缓存（L1 内存 + L2 Redis），Client 可作为下层 Upstream
+- **📦 批量读取** - `GetMany` 一次读多个 key，未命中的合成一次上游调用，singleflight、DoubleCheck、Not-Found 缓存、serve-stale 照样生效
 - **🚀 高性能** - 亚微秒级延迟，79x~1729x 吞吐量放大，零错误率
 - **🎯 类型安全** - Go 泛型提供编译时类型安全，避免运行时类型错误
 - **⏱️ 灵活 TTL** - 独立的新鲜和陈旧 TTL 配置，精确控制数据生命周期
@@ -225,6 +226,17 @@ type Cache[T any] interface {
 
 **重要**：当 key 不存在时，`Get` 方法必须返回 `cachex.ErrKeyNotFound` 错误，以便 Client 能够正确区分缓存未命中和其他错误情况。
 
+还可以选择实现 `BatchCache[T]`，这样 `Client.GetMany` 读写这个后端时一批只调一次，而不是逐个 key 调（见[批量读取](#批量读取)）：
+
+```go
+type BatchCache[T any] interface {
+    Cache[T]
+    GetMany(ctx context.Context, keys []string) (map[string]T, error) // 不存在的 key 不出现在结果里
+    SetMany(ctx context.Context, values map[string]T) error
+    DelMany(ctx context.Context, keys []string) error
+}
+```
+
 ## 高级特性
 
 ### 分层缓存
@@ -326,6 +338,70 @@ client := cachex.NewClient(
     ),
 )
 ```
+
+### 批量读取
+
+`Client.GetMany` 一次读多个 key，语义和逐个 `Get` 一致，只是批量做：
+
+```go
+products, err := client.GetMany(ctx, []string{"p1", "p2", "p3"})
+// products 只包含存在的 key；不存在的 key 不出现
+```
+
+要让上游一次答一批，给它实现 `BatchUpstream[T]`（它仍然要实现 `Upstream[T]` 供 `Get` 用）：
+
+```go
+type BatchUpstream[T any] interface {
+    // map 里没有的 key 视为不存在（相当于 Get 的 ErrKeyNotFound）。
+    // 返回非 nil error 表示整批失败；如果是 *cachex.BatchError，只有它列出的 key 失败。
+    GetMany(ctx context.Context, keys []string) (map[string]T, error)
+}
+
+type productSource struct{ db *gorm.DB }
+
+func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*Product, error) {
+    var rows []*Product
+    if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
+        return nil, err
+    }
+    out := make(map[string]*Product, len(rows))
+    for _, p := range rows {
+        out[p.ID] = p
+    }
+    return out, nil
+}
+```
+
+`GetMany` 的流程：
+
+1. **后端**：一次批量读（实现了 `BatchCache[T]` 就批量，否则逐个）。每个值按新鲜度分类：新鲜的直接返回；陈旧的先返回，再在后台合成一批刷新（开了 `WithServeStale` 时）；腐烂的和未命中的往下走。
+2. **Not-Found 缓存**：未命中的先查它，和 `Get` 一样。
+3. **Singleflight**：每个要回源的 key 都在和 `Get` **同一个** singleflight 里认领。已经有 `Get` 或别的 `GetMany` 在取的 key，等那次的结果，不再取一遍；所以 `Get` 和 `GetMany`（或两个有交集的 `GetMany`）同时要同一个 key，只回源一次。`WithFetchConcurrency` 照旧按 key 生效。
+4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存。
+5. **上游**：剩下的 key，上游实现了 `BatchUpstream[T]` 就调**一次** `GetMany`，否则并发逐个 `Get`。
+6. **回填**：取到的值写回后端（支持就用 `SetMany`），不存在的 key 写进 Not-Found 缓存。和 `Get` 一样只写本层，不写上游。
+
+`Client` 自己也实现了 `BatchUpstream[T]`，所以多层缓存时一批 key 每层只走一次调用：`l1Client.GetMany` → L1 批量读 → `l2Client.GetMany` → L2 批量读 → 一次数据库查询。
+
+**错误**：返回的 map 总是包含所有成功的 key。有 key 失败（后端、上游或 context 出错）时，error 是 `*cachex.BatchError`，它的 `Errors` 按 key 列出各自的错误；`errors.Is`/`errors.As` 能穿透到每个 key 的错误。
+
+```go
+products, err := client.GetMany(ctx, ids)
+var batchErr *cachex.BatchError
+if errors.As(err, &batchErr) {
+    for id, err := range batchErr.Errors { /* id 失败了 */ }
+}
+// 不管有没有 err，products 都能用
+```
+
+内置后端都实现了 `BatchCache[T]`：`RistrettoCache`、`SyncMap`、`RedisCache`（一个 `GET`/`SET`/`DEL` 的 pipeline，Redis Cluster 下也能用）和 `GORMCache`（`WHERE key IN (...)` 和一条多行 upsert）。
+
+上游每次调用耗时 1ms，取 100 个全未命中的 key（`BenchmarkGetManyVsGet`）：
+
+| | 上游调用次数 | 耗时 |
+|---|---|---|
+| `GetMany` | 1 | ~1.2ms |
+| 循环 `Get` | 100 | ~115ms |
 
 ### 自定义陈旧逻辑
 

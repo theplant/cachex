@@ -14,6 +14,7 @@
 - **🚫 Cache Penetration Defense** - Not-Found caching mechanism prevents malicious queries from overwhelming the database
 - **🔄 Serve-Stale** - Serves stale data while asynchronously refreshing, ensuring high availability and low latency
 - **🎪 Layered Caching** - Flexible multi-level caching (L1 Memory + L2 Redis), Client can also be used as upstream
+- **📦 Batch Reads** - `GetMany` reads many keys at once and fetches all misses with one upstream call, keeping singleflight, DoubleCheck, Not-Found caching and serve-stale
 - **🚀 High Performance** - Sub-microsecond latency, 79x~1729x throughput amplification, zero error rate
 - **🎯 Type-Safe** - Go generics provide compile-time type safety, avoiding runtime type errors
 - **⏱️ Flexible TTL** - Independent fresh and stale TTL configuration for precise data lifecycle control
@@ -225,6 +226,17 @@ type Cache[T any] interface {
 
 **Important**: When a key does not exist, the `Get` method must return `cachex.ErrKeyNotFound` error, so the Client can correctly distinguish between cache misses and other error conditions.
 
+Optionally implement `BatchCache[T]` as well, so `Client.GetMany` reads and writes your backend in one call per batch instead of key by key (see [Batch Reads](#batch-reads)):
+
+```go
+type BatchCache[T any] interface {
+    Cache[T]
+    GetMany(ctx context.Context, keys []string) (map[string]T, error) // missing keys are absent
+    SetMany(ctx context.Context, values map[string]T) error
+    DelMany(ctx context.Context, keys []string) error
+}
+```
+
 ## Advanced Features
 
 ### Layered Caching
@@ -326,6 +338,71 @@ client := cachex.NewClient(
     ),
 )
 ```
+
+### Batch Reads
+
+`Client.GetMany` reads many keys at once with the same semantics as calling `Get` for each key, but in batches:
+
+```go
+products, err := client.GetMany(ctx, []string{"p1", "p2", "p3"})
+// products holds only the keys that exist; missing keys are absent
+```
+
+To let the upstream answer a batch in one call, implement `BatchUpstream[T]` on it (it should still implement `Upstream[T]` for `Get`):
+
+```go
+type BatchUpstream[T any] interface {
+    // Keys absent from the map do not exist (like ErrKeyNotFound for Get).
+    // A non-nil error fails the whole batch, unless it is a *cachex.BatchError,
+    // which fails only the keys it lists.
+    GetMany(ctx context.Context, keys []string) (map[string]T, error)
+}
+
+type productSource struct{ db *gorm.DB }
+
+func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*Product, error) {
+    var rows []*Product
+    if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
+        return nil, err
+    }
+    out := make(map[string]*Product, len(rows))
+    for _, p := range rows {
+        out[p.ID] = p
+    }
+    return out, nil
+}
+```
+
+How `GetMany` works:
+
+1. **Backend**: one batch read (`BatchCache[T]`, otherwise key by key). Each value is classified by staleness: fresh values are returned, stale values are returned and refreshed in the background together (with `WithServeStale`), rotten values and misses go on.
+2. **Not-Found cache**: misses are checked against it, exactly like `Get`.
+3. **Singleflight**: every key that needs the upstream is claimed in the **same** singleflight `Get` uses. Keys already being fetched by a `Get` or another `GetMany` are waited for, not fetched again; so a `Get` and a `GetMany` (or two overlapping `GetMany`s) fetch a shared key only once. `WithFetchConcurrency` applies per key as usual.
+4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get`.
+5. **Upstream**: the remaining keys are fetched with **one** `GetMany` call if the upstream implements `BatchUpstream[T]`, otherwise with concurrent `Get` calls.
+6. **Write back**: found values go to the backend (`SetMany` when supported), missing keys to the Not-Found cache. Like `Get`, this only touches this layer, never the upstream.
+
+`Client` implements `BatchUpstream[T]` itself, so in a layered setup a batch travels down as one call per layer: `l1Client.GetMany` → L1 batch read → `l2Client.GetMany` → L2 batch read → one database query.
+
+**Errors**: the returned map always holds every key that succeeded. If some keys failed (backend, upstream or context errors), the error is a `*cachex.BatchError` whose `Errors` map lists them by key; `errors.Is`/`errors.As` see through it to the per-key errors.
+
+```go
+products, err := client.GetMany(ctx, ids)
+var batchErr *cachex.BatchError
+if errors.As(err, &batchErr) {
+    for id, err := range batchErr.Errors { /* id failed */ }
+}
+// products is usable either way
+```
+
+Built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (one pipeline of `GET`/`SET`/`DEL`, which also works on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and one multi-row upsert).
+
+Fetching 100 missing keys through an upstream that costs 1ms per call (`BenchmarkGetManyVsGet`):
+
+| | upstream calls | time |
+|---|---|---|
+| `GetMany` | 1 | ~1.2ms |
+| loop of `Get` | 100 | ~115ms |
 
 ### Custom Staleness Logic
 

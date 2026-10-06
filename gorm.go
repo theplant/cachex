@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -19,7 +20,7 @@ type GORMCache[T any] struct {
 	keyPrefix string
 }
 
-var _ Cache[any] = &GORMCache[any]{}
+var _ BatchCache[any] = &GORMCache[any]{}
 
 type cacheEntry struct {
 	Key       string         `gorm:"not null;primaryKey;size:255"`
@@ -142,6 +143,100 @@ func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
 		Where("key = ?", g.prefixedKey(key)).
 		Delete(nil).Error; err != nil {
 		return errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
+	}
+	return nil
+}
+
+// GetMany retrieves many values with one `WHERE key IN (...)` query.
+// Missing keys are absent from the result; a value that fails to unmarshal is
+// reported in a *BatchError without hiding the others.
+//
+// ponytail: no chunking; very large batches can exceed the database's bound
+// parameter limit (e.g. 32766 on SQLite, 65535 on PostgreSQL).
+func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, error) {
+	out := make(map[string]T, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+
+	prefixed := make([]string, len(keys))
+	for i, key := range keys {
+		prefixed[i] = g.prefixedKey(key)
+	}
+
+	var entries []cacheEntry
+	tx := cmp.Or(GetGORMTx(ctx), g.db)
+	if err := tx.WithContext(ctx).
+		Table(g.tableName).
+		Where("key IN ?", prefixed).
+		Find(&entries).Error; err != nil {
+		return nil, errors.Wrap(err, "failed to get cache entries")
+	}
+
+	var keyErrs map[string]error
+	for _, entry := range entries {
+		key := strings.TrimPrefix(entry.Key, g.keyPrefix)
+		var value T
+		if err := json.Unmarshal(entry.Value, &value); err != nil {
+			if keyErrs == nil {
+				keyErrs = map[string]error{}
+			}
+			keyErrs[key] = errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
+			continue
+		}
+		out[key] = value
+	}
+	if keyErrs != nil {
+		return out, &BatchError{Errors: keyErrs}
+	}
+	return out, nil
+}
+
+// SetMany stores many values with one multi-row upsert (same bound parameter limit as GetMany)
+func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
+	if len(values) == 0 {
+		return nil
+	}
+
+	entries := make([]cacheEntry, 0, len(values))
+	for key, value := range values {
+		data, err := json.Marshal(value)
+		if err != nil {
+			return errors.Wrapf(err, "failed to marshal value for key: %s", key)
+		}
+		entries = append(entries, cacheEntry{Key: g.prefixedKey(key), Value: data})
+	}
+
+	tx := cmp.Or(GetGORMTx(ctx), g.db)
+	if err := tx.WithContext(ctx).
+		Table(g.tableName).
+		Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "key"}},
+			UpdateAll: true,
+		}).
+		Create(&entries).Error; err != nil {
+		return errors.Wrap(err, "failed to set cache entries")
+	}
+	return nil
+}
+
+// DelMany removes many keys with one `WHERE key IN (...)` delete
+func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	prefixed := make([]string, len(keys))
+	for i, key := range keys {
+		prefixed[i] = g.prefixedKey(key)
+	}
+
+	tx := cmp.Or(GetGORMTx(ctx), g.db)
+	if err := tx.WithContext(ctx).
+		Table(g.tableName).
+		Where("key IN ?", prefixed).
+		Delete(nil).Error; err != nil {
+		return errors.Wrap(err, "failed to delete cache entries")
 	}
 	return nil
 }

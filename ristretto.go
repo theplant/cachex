@@ -14,7 +14,7 @@ type RistrettoCache[T any] struct {
 	ttl   time.Duration
 }
 
-var _ Cache[any] = &RistrettoCache[any]{}
+var _ BatchCache[any] = &RistrettoCache[any]{}
 
 // RistrettoCacheConfig holds configuration for RistrettoCache
 type RistrettoCacheConfig[T any] struct {
@@ -104,5 +104,34 @@ func (r *RistrettoCache[T]) Del(_ context.Context, key string) error {
 // Close closes the cache and stops all background goroutines
 func (r *RistrettoCache[T]) Close() error {
 	r.cache.Close()
+	return nil
+}
+
+// GetMany retrieves the values that are present; missing keys are absent from the result
+func (r *RistrettoCache[T]) GetMany(_ context.Context, keys []string) (map[string]T, error) {
+	out := make(map[string]T, len(keys))
+	for _, key := range keys {
+		if value, found := r.cache.Get(key); found {
+			out[key] = value
+		}
+	}
+	return out, nil
+}
+
+// SetMany stores the values, waiting once for all buffered writes (see Set)
+func (r *RistrettoCache[T]) SetMany(_ context.Context, values map[string]T) error {
+	for key, value := range values {
+		r.cache.SetWithTTL(key, value, 1, r.ttl)
+	}
+	r.cache.Wait()
+	return nil
+}
+
+// DelMany removes the keys, waiting once for all buffered deletions (see Del)
+func (r *RistrettoCache[T]) DelMany(_ context.Context, keys []string) error {
+	for _, key := range keys {
+		r.cache.Del(key)
+	}
+	r.cache.Wait()
 	return nil
 }
