@@ -395,7 +395,7 @@ if errors.As(err, &batchErr) {
 // products is usable either way
 ```
 
-Built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (one pipeline of `GET`/`SET`/`DEL`, which also works on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and one multi-row upsert).
+Built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (one pipeline of `GET`/`SET`/`DEL`, which also works on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and multi-row upserts, 1000 keys per statement to stay under the bound parameter limits).
 
 Fetching 100 missing keys through an upstream that costs 1ms per call (`BenchmarkGetManyVsGet`):
 

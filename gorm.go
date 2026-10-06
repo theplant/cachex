@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
 
@@ -147,12 +148,15 @@ func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
 	return nil
 }
 
-// GetMany retrieves many values with one `WHERE key IN (...)` query.
+// gormBatchSize bounds the keys per statement, keeping every batch statement
+// well under the databases' bound parameter limits (32766 on SQLite, 65535 on
+// PostgreSQL, 65535 on MySQL).
+const gormBatchSize = 1000
+
+// GetMany retrieves many values with `WHERE key IN (...)` queries of up to
+// gormBatchSize keys each.
 // Missing keys are absent from the result; a value that fails to unmarshal is
 // reported in a *BatchError without hiding the others.
-//
-// ponytail: no chunking; very large batches can exceed the database's bound
-// parameter limit (e.g. 32766 on SQLite, 65535 on PostgreSQL).
 func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, error) {
 	out := make(map[string]T, len(keys))
 	if len(keys) == 0 {
@@ -166,11 +170,15 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 
 	var entries []cacheEntry
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
-	if err := tx.WithContext(ctx).
-		Table(g.tableName).
-		Where("key IN ?", prefixed).
-		Find(&entries).Error; err != nil {
-		return nil, errors.Wrap(err, "failed to get cache entries")
+	for chunk := range slices.Chunk(prefixed, gormBatchSize) {
+		var found []cacheEntry
+		if err := tx.WithContext(ctx).
+			Table(g.tableName).
+			Where("key IN ?", chunk).
+			Find(&found).Error; err != nil {
+			return nil, errors.Wrap(err, "failed to get cache entries")
+		}
+		entries = append(entries, found...)
 	}
 
 	var keyErrs map[string]error
@@ -192,7 +200,7 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 	return out, nil
 }
 
-// SetMany stores many values with one multi-row upsert (same bound parameter limit as GetMany)
+// SetMany stores many values with multi-row upserts of up to gormBatchSize rows each
 func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 	if len(values) == 0 {
 		return nil
@@ -214,13 +222,13 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 			Columns:   []clause.Column{{Name: "key"}},
 			UpdateAll: true,
 		}).
-		Create(&entries).Error; err != nil {
+		CreateInBatches(&entries, gormBatchSize).Error; err != nil {
 		return errors.Wrap(err, "failed to set cache entries")
 	}
 	return nil
 }
 
-// DelMany removes many keys with one `WHERE key IN (...)` delete
+// DelMany removes many keys with `WHERE key IN (...)` deletes of up to gormBatchSize keys each
 func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil
@@ -232,11 +240,13 @@ func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
 	}
 
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
-	if err := tx.WithContext(ctx).
-		Table(g.tableName).
-		Where("key IN ?", prefixed).
-		Delete(nil).Error; err != nil {
-		return errors.Wrap(err, "failed to delete cache entries")
+	for chunk := range slices.Chunk(prefixed, gormBatchSize) {
+		if err := tx.WithContext(ctx).
+			Table(g.tableName).
+			Where("key IN ?", chunk).
+			Delete(nil).Error; err != nil {
+			return errors.Wrap(err, "failed to delete cache entries")
+		}
 	}
 	return nil
 }

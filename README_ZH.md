@@ -394,7 +394,7 @@ if errors.As(err, &batchErr) {
 // 不管有没有 err，products 都能用
 ```
 
-内置后端都实现了 `BatchCache[T]`：`RistrettoCache`、`SyncMap`、`RedisCache`（一个 `GET`/`SET`/`DEL` 的 pipeline，Redis Cluster 下也能用）和 `GORMCache`（`WHERE key IN (...)` 和一条多行 upsert）。
+内置后端都实现了 `BatchCache[T]`：`RistrettoCache`、`SyncMap`、`RedisCache`（一个 `GET`/`SET`/`DEL` 的 pipeline，Redis Cluster 下也能用）和 `GORMCache`（`WHERE key IN (...)` 和多行 upsert，每条语句 1000 个 key，不会超出数据库的绑定参数上限）。
 
 上游每次调用耗时 1ms，取 100 个全未命中的 key（`BenchmarkGetManyVsGet`）：
 

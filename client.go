@@ -267,7 +267,16 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 	f, leader := c.flights.claim(sfKey)
 	if leader {
 		go func() {
+			returned := false
+			defer func() {
+				if !returned {
+					// runtime.Goexit in the upstream: release the key without
+					// publishing, like x/sync/singleflight; waiters wait for their ctx.
+					c.flights.forget(sfKey, f)
+				}
+			}()
 			value, err := c.fetchClaimed(ctx, key)
+			returned = true
 			c.flights.finish(sfKey, f, value, err)
 		}()
 	}

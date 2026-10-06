@@ -172,9 +172,9 @@ func (r *RedisCache[T]) GetMany(ctx context.Context, keys []string) (map[string]
 	for i, key := range keys {
 		cmds[i] = pipe.Get(ctx, r.prefixedKey(key))
 	}
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-		return nil, errors.Wrap(err, "failed to get cache entries")
-	}
+	// Exec reports only the first failed command; every command carries its own
+	// error (a connection failure is set on all of them), so read them per key.
+	_, _ = pipe.Exec(ctx)
 
 	var keyErrs map[string]error
 	for i, key := range keys {
@@ -185,6 +185,8 @@ func (r *RedisCache[T]) GetMany(ctx context.Context, keys []string) (map[string]
 		var value T
 		if err == nil {
 			value, err = r.decode(key, data)
+		} else {
+			err = r.handleRedisError(err, key)
 		}
 		if err != nil {
 			if keyErrs == nil {

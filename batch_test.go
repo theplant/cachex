@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -603,4 +604,96 @@ func BenchmarkGetManyVsGet(b *testing.B) {
 		}
 		b.ReportMetric(float64(calls.Load())/float64(b.N), "upstream-calls/op")
 	})
+}
+
+func TestClientGetManyUpstreamGoexit(t *testing.T) {
+	t.Run("batch upstream: the claims are released like Get", func(t *testing.T) {
+		var calls atomic.Int64
+		up := batchUpstreamFunc[string](func(_ context.Context, keys []string) (map[string]string, error) {
+			if calls.Add(1) == 1 {
+				runtime.Goexit()
+			}
+			return map[string]string{"a": "1"}, nil
+		})
+		cli := NewClient(NewSyncMap[string](), up)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := cli.GetMany(ctx, []string{"a"})
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+		ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
+		defer cancel2()
+		got, err := cli.GetMany(ctx2, []string{"a"})
+		require.NoError(t, err, "the next call starts a new fetch")
+		assert.Equal(t, map[string]string{"a": "1"}, got)
+	})
+
+	t.Run("per-key upstream: the key fails instead of yielding a zero value", func(t *testing.T) {
+		backend := NewSyncMap[string]()
+		cli := NewClient(backend, UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+			if key == "bad" {
+				runtime.Goexit()
+			}
+			return "v-" + key, nil
+		}))
+
+		got, err := cli.GetMany(context.Background(), []string{"a", "bad"})
+		assert.Equal(t, map[string]string{"a": "v-a"}, got)
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.Contains(t, be.Errors, "bad")
+		_, err = backend.Get(context.Background(), "bad")
+		assert.True(t, IsErrKeyNotFound(err), "nothing is written for the key")
+	})
+}
+
+// notFoundBatchBackend answers a whole GetMany with ErrKeyNotFound.
+type notFoundBatchBackend struct{ *SyncMap[string] }
+
+func (notFoundBatchBackend) GetMany(context.Context, []string) (map[string]string, error) {
+	return nil, &ErrKeyNotFound{}
+}
+
+func TestClientGetManyBackendBatchNotFoundIsAMiss(t *testing.T) {
+	cli := NewClient[string](notFoundBatchBackend{NewSyncMap[string]()}, &batchUpstream{data: map[string]string{"a": "1"}})
+	got, err := cli.GetMany(context.Background(), []string{"a"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"a": "1"}, got, "a backend that says not-found for the batch is a miss, so the key is fetched")
+}
+
+func TestRedisCacheGetManyPerKeyErrors(t *testing.T) {
+	ctx := context.Background()
+	cache, mr := newRedisCache[string](t)
+	_, err := mr.Lpush("a-list", "x") // GET on a list fails with WRONGTYPE
+	require.NoError(t, err)
+	require.NoError(t, mr.Set("b", "2"))
+
+	got, err := cache.GetMany(ctx, []string{"a-list", "b", "missing"})
+	assert.Equal(t, map[string]string{"b": "2"}, got, "one failing command does not fail the batch")
+	var be *BatchError
+	require.ErrorAs(t, err, &be)
+	assert.Equal(t, []string{"a-list"}, slices.Collect(maps.Keys(be.Errors)))
+}
+
+func TestGORMCacheBatchLargerThanBindLimit(t *testing.T) {
+	ctx := context.Background()
+	cache, _ := newGORMCache[string](t, "batch_large")
+	const n = 40000 // above SQLite's 32766 bound parameters per statement
+	values := make(map[string]string, n)
+	keys := make([]string, 0, n)
+	for i := range n {
+		k := fmt.Sprintf("k%d", i)
+		values[k] = "v"
+		keys = append(keys, k)
+	}
+
+	require.NoError(t, cache.SetMany(ctx, values))
+	got, err := cache.GetMany(ctx, keys)
+	require.NoError(t, err)
+	assert.Len(t, got, n)
+	require.NoError(t, cache.DelMany(ctx, keys))
+	got, err = cache.GetMany(ctx, keys)
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }

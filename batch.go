@@ -47,11 +47,18 @@ func (g *flightGroup[T]) claim(sfKey string) (*flight[T], bool) {
 // sees the result and comes back starts a new flight (where double-check
 // finds the value this flight wrote) instead of joining a finished one.
 func (g *flightGroup[T]) finish(sfKey string, f *flight[T], value T, err error) {
-	g.mu.Lock()
-	delete(g.flights, sfKey)
-	g.mu.Unlock()
+	g.forget(sfKey, f)
 	f.value, f.err = value, err
 	close(f.done)
+}
+
+// forget releases the claim without publishing a result.
+func (g *flightGroup[T]) forget(sfKey string, f *flight[T]) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.flights[sfKey] == f {
+		delete(g.flights, sfKey)
+	}
 }
 
 type result[T any] struct {
@@ -81,6 +88,9 @@ type result[T any] struct {
 // simply absent. If some keys failed (backend, upstream, or ctx errors), the
 // map still holds every key that succeeded and the error is a *BatchError
 // listing the failed keys.
+//
+// As with Get, an upstream must not call back into the same Client for a key
+// it is being asked for: that key is claimed by the caller and waits for itself.
 //
 // Client implements BatchUpstream through GetMany, so in a layered setup
 // (memory -> Redis/DB -> source) a batch reaches the bottom upstream as one call.
@@ -152,7 +162,7 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 	values, err := getMany(ctx, c.backend, keys)
 	var missing []int
 	for i, key := range keys {
-		if kerr := errForKey(err, key); kerr != nil {
+		if kerr := errForKey(err, key); kerr != nil && !IsErrKeyNotFound(kerr) {
 			res[i].err = errors.Wrapf(kerr, "get from backend failed for key: %s", key)
 			continue
 		}
@@ -198,7 +208,7 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 	cachedAts, err := getMany(ctx, c.notFoundCache, missingKeys)
 	for _, i := range missing {
 		key := keys[i]
-		if kerr := errForKey(err, key); kerr != nil {
+		if kerr := errForKey(err, key); kerr != nil && !IsErrKeyNotFound(kerr) {
 			res[i].err = errors.Wrapf(kerr, "get from notFoundCache failed for key: %s", key)
 			continue
 		}
@@ -263,8 +273,18 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 // what is still missing, then finish every flight.
 func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight[T]) {
 	results := make([]result[T], len(keys))
+	returned := false
 	defer func() {
-		if r := recover(); r != nil {
+		r := recover()
+		if r == nil && !returned {
+			// runtime.Goexit in the upstream: release the keys without
+			// publishing, like Get; waiters wait for their ctx.
+			for i, f := range flights {
+				c.flights.forget(sfKeys[i], f)
+			}
+			return
+		}
+		if r != nil {
 			c.logger.ErrorContext(ctx, "panic during upstream fetch",
 				"keys", keys,
 				"panic", r,
@@ -302,6 +322,7 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 		}
 	}
 	if len(pending) == 0 {
+		returned = true
 		return
 	}
 
@@ -312,6 +333,7 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 	for j, r := range c.doFetchMany(fetchCtx, pendingKeys) {
 		results[pending[j]] = r
 	}
+	returned = true
 }
 
 // doFetchMany is the batch form of doFetch: fetch from upstream, then write
@@ -335,6 +357,8 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 		// upstreams without batch support get hammered by large batches.
 		var wg sync.WaitGroup
 		for i, key := range keys {
+			// overwritten on return; stays if the upstream calls runtime.Goexit
+			results[i].err = errors.Errorf("upstream fetch exited without returning for key: %s", key)
 			wg.Go(func() {
 				results[i] = c.getFromUpstream(ctx, key)
 			})
