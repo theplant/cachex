@@ -4,10 +4,12 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"hash/maphash"
 	"log/slog"
 	"math/rand/v2"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -40,6 +42,10 @@ type Client[T any] struct {
 	flights         flightGroup[T]
 	asyncRefreshing sync.Map
 
+	// Write ordering, see Set and backfill
+	writeSeed maphash.Seed
+	writes    [writeStripeCount]writeStripe
+
 	// Double-check optimization
 	doubleCheckMode   DoubleCheckMode // User configuration (immutable)
 	enableDoubleCheck bool            // Resolved execution decision
@@ -71,6 +77,7 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		getManyConc:      DefaultGetManyConcurrency,
 		logger:           slog.Default(),
 		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
+		writeSeed:        maphash.MakeSeed(),
 	}
 
 	// Apply user options
@@ -187,18 +194,20 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 //
 // This supports both write-through and cache-aside patterns, as the chain
 // naturally terminates when upstream is not a Cache[T] implementation.
+//
+// Order: the upstream is deleted first, then this layer. If the upstream
+// delete fails, this layer's entry is still dropped but no not-found is
+// cached, since the upstream may still hold the key.
 func (c *Client[T]) Del(ctx context.Context, key string) error {
-	if err := c.delWithoutUpstream(ctx, key); err != nil {
-		return err
-	}
-
-	if upstreamCache, ok := c.upstream.(Cache[T]); ok {
-		if err := upstreamCache.Del(ctx, key); err != nil {
-			return errors.Wrapf(err, "delete from upstream failed for key: %s", key)
-		}
-	}
-
-	return nil
+	return c.write(ctx, key,
+		func(upstream Cache[T]) error {
+			if err := upstream.Del(ctx, key); err != nil {
+				return errors.Wrapf(err, "delete from upstream failed for key: %s", key)
+			}
+			return nil
+		},
+		func() error { return c.delWithoutUpstream(ctx, key) },
+	)
 }
 
 // delWithoutUpstream records a not-found and deletes the backend entry; a
@@ -235,18 +244,95 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 //
 // The type-based propagation automatically handles both write-through (multi-level caches)
 // and cache-aside (with data source) patterns correctly.
+//
+// Order: the upstream is written first, then this layer, so this layer never
+// holds a value the layer below does not. If the upstream write fails, its
+// state is unknown (it may have been applied and only the reply lost), so this
+// layer's entry is dropped and the next read goes down. Concurrent writes to
+// one key through the same Client are applied one at a time, in the same order
+// on every layer.
 func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
-	if err := c.setWithoutUpstream(ctx, key, value); err != nil {
-		return err
-	}
+	return c.write(ctx, key,
+		func(upstream Cache[T]) error {
+			if err := upstream.Set(ctx, key, value); err != nil {
+				return errors.Wrapf(err, "set in upstream failed for key: %s", key)
+			}
+			return nil
+		},
+		func() error { return c.setWithoutUpstream(ctx, key, value) },
+	)
+}
+
+// writeStripeCount is the number of write stripes per Client.
+//
+// ponytail: keys share stripes by hash, so two keys in one stripe serialize
+// their writes and a write to one can skip the other's backfill (a spare
+// cache miss, never a stale value); raise it if that shows up.
+const writeStripeCount = 1024
+
+// writeStripe orders writes and backfills of the keys that hash to it.
+type writeStripe struct {
+	mu  sync.Mutex    // serializes Set/Del, so all layers apply them in one order
+	gen atomic.Uint64 // bumped by every Set/Del, checked by backfills
+}
+
+func (c *Client[T]) stripe(key string) *writeStripe {
+	return &c.writes[maphash.String(c.writeSeed, key)%writeStripeCount]
+}
+
+// write runs a Set or Del: the upstream first (if it is a Cache), then this
+// layer. Any failure leaves this layer without an entry for the key.
+func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache[T]) error, toLayer func() error) error {
+	s := c.stripe(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if upstreamCache, ok := c.upstream.(Cache[T]); ok {
-		if err := upstreamCache.Set(ctx, key, value); err != nil {
-			return errors.Wrapf(err, "set in upstream failed for key: %s", key)
+		if err := toUpstream(upstreamCache); err != nil {
+			s.gen.Add(1)
+			c.invalidate(ctx, key)
+			return err
 		}
 	}
 
+	// Bumped after the upstream write and before this layer's: a backfill that
+	// read the upstream before the write either lands before this layer's
+	// write (and is overwritten) or sees the bump (and is skipped or undone).
+	s.gen.Add(1)
+	if err := toLayer(); err != nil {
+		c.invalidate(ctx, key)
+		return err
+	}
 	return nil
+}
+
+// invalidate drops this layer's entry and cached not-found for key, best effort.
+func (c *Client[T]) invalidate(ctx context.Context, key string) {
+	if c.notFoundCache != nil {
+		if err := c.notFoundCache.Del(ctx, key); err != nil {
+			c.logger.WarnContext(ctx, "failed to invalidate notFoundCache entry", "key", key, "error", err)
+		}
+	}
+	if err := c.backend.Del(ctx, key); err != nil {
+		c.logger.WarnContext(ctx, "failed to invalidate cache entry", "key", key, "error", err)
+	}
+}
+
+// backfill writes what a fetch read into this layer, unless a Set or Del of
+// the key happened since gen was taken (before reading the upstream). A
+// write that slips in between the check and the backfill is caught right
+// after, and the backfill is undone, leaving a miss rather than a stale value.
+func (c *Client[T]) backfill(ctx context.Context, key string, gen uint64, fill func() error, failMsg string) {
+	s := c.stripe(key)
+	if s.gen.Load() != gen {
+		return
+	}
+	if err := fill(); err != nil {
+		c.logger.WarnContext(ctx, failMsg, "key", key, "error", err)
+	}
+	if s.gen.Load() != gen {
+		c.invalidate(ctx, key)
+	}
 }
 
 // setWithoutUpstream clears a cached not-found and writes the backend; a failed
@@ -382,20 +468,17 @@ func (c *Client[T]) asyncRefresh(ctx context.Context, key string) {
 }
 
 func (c *Client[T]) doFetch(ctx context.Context, key string) (T, error) {
+	gen := c.stripe(key).gen.Load()
 	value, err := c.upstream.Get(ctx, key)
 	if err != nil {
 		if IsErrKeyNotFound(err) {
-			if delErr := c.delWithoutUpstream(ctx, key); delErr != nil {
-				c.logger.WarnContext(ctx, "failed to delete cache entry", "key", key, "error", delErr)
-			}
+			c.backfill(ctx, key, gen, func() error { return c.delWithoutUpstream(ctx, key) }, "failed to delete cache entry")
 		}
 		var zero T
 		return zero, errors.Wrapf(err, "get from upstream failed for key: %s", key)
 	}
 
-	if setErr := c.setWithoutUpstream(ctx, key, value); setErr != nil {
-		c.logger.WarnContext(ctx, "failed to set cache entry", "key", key, "error", setErr)
-	}
+	c.backfill(ctx, key, gen, func() error { return c.setWithoutUpstream(ctx, key, value) }, "failed to set cache entry")
 
 	return value, nil
 }

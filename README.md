@@ -317,7 +317,7 @@ This design naturally supports both caching patterns:
 
   ```go
   // All cache layers stay in sync
-  l1Client.Set(ctx, key, value)  // → L1 → L2 → ... → (stops at data source)
+  l1Client.Set(ctx, key, value)  // writes ... → L2 → L1, bottom layer first (stops at data source)
   ```
 
 - **Cache-Aside Pattern (Cache + Database):**
@@ -328,6 +328,14 @@ This design naturally supports both caching patterns:
   ```
 
 The key insight: **cache writes propagate through `Cache[T]` chains but stop when upstream doesn't implement `Cache[T]`**, making it safe and correct for both patterns.
+
+**Write order and consistency:**
+
+- `Set`/`Del` write the **upstream first**, then this layer, so an upper layer never holds a value the layer below does not. A `Set` becomes visible in this layer only after the write below has succeeded.
+- If the upstream write fails, its state is unknown (it may have been applied with only the reply lost), so this layer **drops** its entry for the key (and any cached Not-Found) and returns the error; the next read goes down. A failed `Del` likewise drops this layer's entry but caches no Not-Found.
+- Concurrent `Set`/`Del` of one key through the same `Client` are applied one at a time, in the same order on every layer.
+- A read that fetched a value **before** a concurrent `Set`/`Del` still returns what it fetched, but does not write it back over the newer value (each `Client` keeps a per-key write generation; `Get`, `GetMany` and the serve-stale refresh all check it before backfilling). The cost is at most an extra cache miss.
+- These guarantees hold within one process; separate processes sharing a lower layer (e.g. Redis) can still briefly disagree in their memory layers.
 
 ### Not-Found Caching
 
