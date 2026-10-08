@@ -554,7 +554,10 @@ func TestWriteWaitingForTheStripeRespectsCtx(t *testing.T) {
 	assert.Equal(t, "first", v, "the cancelled Set wrote nothing")
 
 	s := cli.stripe("k")
-	require.Eventually(t, func() bool { // the given-up Set hands the lock back once it gets it
+	// the given-up Set's lock is taken in the background once the first Set
+	// releases it; it bumps the generation (the first Set did too) and unlocks
+	require.Eventually(t, func() bool { return s.gen.Load() == 2 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool {
 		if !s.mu.TryLock() {
 			return false
 		}
