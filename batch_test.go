@@ -1150,6 +1150,21 @@ func TestClientGetManyBatchRefreshThatTimesOutIsLogged(t *testing.T) {
 		2*time.Second, 5*time.Millisecond, "a refresh that never finishes in time is not silent")
 }
 
+func TestClientGetManyOverAClientIsNotBoundedAsOneFetch(t *testing.T) {
+	// L2 fetches its source key by key, each well within its own timeout; L1
+	// hands L2 the whole batch, which takes longer than one fetch timeout
+	src := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+		time.Sleep(30 * time.Millisecond)
+		return "v-" + key, nil
+	})
+	l2 := NewClient[string](NewSyncMap[string](), src, WithGetManyConcurrency[string](1))
+	l1 := NewClient[string](NewSyncMap[string](), l2, WithFetchTimeout[string](100*time.Millisecond))
+	keys := []string{"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"}
+	got, err := l1.GetMany(context.Background(), keys)
+	require.NoError(t, err, "no key fails just because the batch as a whole outlasted one fetch timeout")
+	assert.Len(t, got, len(keys))
+}
+
 func TestRedisCacheGetManyPerKeyErrors(t *testing.T) {
 	ctx := context.Background()
 	cache, mr := newRedisCache[string](t)

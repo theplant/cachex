@@ -2,6 +2,7 @@ package cachex
 
 import (
 	"context"
+	"math"
 	"regexp"
 	"strings"
 	"testing"
@@ -295,4 +296,16 @@ func TestGORMCacheQuotesTheKeyColumn(t *testing.T) {
 	for _, sql := range sqls {
 		assert.NotRegexp(t, bare, sql, "the key column must be quoted")
 	}
+}
+
+func TestGORMCacheSetManyKeepsTheValuesThatEncode(t *testing.T) {
+	type num struct{ V float64 }
+	cache, _ := newGORMCache[num](t, "encode")
+	ctx := context.Background()
+	err := cache.SetMany(ctx, map[string]num{"ok": {1}, "bad": {math.NaN()}})
+	require.Error(t, err, "the value that cannot be encoded is reported")
+	assert.Contains(t, err.Error(), "bad")
+	v, err := cache.Get(ctx, "ok")
+	require.NoError(t, err, "like RedisCache, the others are still written")
+	assert.Equal(t, num{1}, v)
 }

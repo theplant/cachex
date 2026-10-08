@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"slices"
 	"time"
 
@@ -48,8 +49,8 @@ type cacheEntry struct {
 }
 
 // GORMCacheConfig holds configuration for GORMCache. Keys are case-sensitive:
-// the key column should compare byte-exactly (Migrate creates MySQL tables with
-// utf8mb4_bin). Otherwise keys that the column considers equal share one row,
+// the key column should compare them exactly (Migrate creates MySQL tables with
+// utf8mb4_bin, which still ignores trailing spaces). Otherwise keys that the column considers equal share one row,
 // served only to the key that wrote it last.
 type GORMCacheConfig struct {
 	// DB is the GORM database connection
@@ -244,12 +245,17 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 	}
 
 	entries := make([]cacheEntry, 0, len(values))
+	var encodeErrs []error // like RedisCache, a value that cannot be encoded does not stop the others
 	for key, value := range values {
 		data, err := json.Marshal(value)
 		if err != nil {
-			return errors.Wrapf(err, "failed to marshal value for key: %s", key)
+			encodeErrs = append(encodeErrs, errors.Wrapf(err, "failed to marshal value for key: %s", key))
+			continue
 		}
 		entries = append(entries, cacheEntry{Key: g.prefixedKey(key), Value: data})
+	}
+	if len(entries) == 0 {
+		return stderrors.Join(encodeErrs...)
 	}
 
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
@@ -259,7 +265,7 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 		CreateInBatches(&entries, gormBatchSize).Error; err != nil {
 		return errors.Wrap(err, "failed to set cache entries")
 	}
-	return nil
+	return stderrors.Join(encodeErrs...)
 }
 
 // DelMany removes many keys with `WHERE key IN (...)` deletes of up to gormBatchSize keys each

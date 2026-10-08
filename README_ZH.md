@@ -215,7 +215,7 @@ if err := cache.Migrate(ctx); err != nil {
 }
 ```
 
-缓存 key 区分大小写，所以 `key` 列应当逐字节比较。PostgreSQL 和 SQLite 默认如此；MySQL 上 `Migrate` 建表时会用 `utf8mb4_bin`。在这之前建的表（或手工建的表）保留原来的排序规则，通常不区分大小写和重音（`*_ci`），可以用 `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` 转换。即使不转换也不会读到错的值：`GORMCache` 只返回 key 完全相等的那一行，只差大小写的几个 key 只会互相挤占这一行（多几次未命中）。
+缓存 key 区分大小写，所以 `key` 列应当精确比较。PostgreSQL 和 SQLite 默认如此；MySQL 上 `Migrate` 建表时会用 `utf8mb4_bin`（区分大小写；和所有 PAD SPACE 排序规则一样会忽略末尾空格，`"a"` 和 `"a "` 共用一行。如果这类 key 有影响，MySQL 8.0.17 以上可改用 `utf8mb4_0900_bin`）。在这之前建的表（或手工建的表）保留原来的排序规则，通常不区分大小写和重音（`*_ci`），可以用 `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` 转换。即使不转换也不会读到错的值：`GORMCache` 只返回 key 完全相等的那一行，只差大小写的几个 key 只会互相挤占这一行（多几次未命中）。
 
 ### 自定义缓存
 
@@ -335,7 +335,7 @@ L1 缓存 → L2 缓存 → L3 缓存 → 数据库
 - upstream 写失败时，它的状态不明（可能已经写进去了，只是回复丢了），所以本层会**删掉**这个 key 的条目（连同缓存的 Not-Found），并返回错误；下次读会回源到下层。`Del` 失败时同样删掉本层条目，但不记 Not-Found。
 - upstream 写成功、本层自己的写入失败时，`Set`/`Del` 仍返回错误，但下层的改动**保留**（不回滚）：返回错误不代表什么都没写进去。本层会删掉这个 key 的条目和缓存的 Not-Found，下次读会回源到下层，读到改动后的结果。
 - 通过同一个 `Client` 并发 `Set`/`Del` 同一个 key 时，逐个执行，各层的写入顺序一致。需要等待的 `Set`/`Del`（等同一分片的其他写入，或者等正在回填本层的读），在 ctx 结束时放弃并返回 ctx 错误：它不写 upstream，并且和其他失败的写入一样，等分片空出来就删掉本层这个 key 的条目。不需要等待的照常执行，即使 ctx 已经结束。所以请求取消后再调 `Del` 做失效，本层总会被清掉，最多是在它返回后稍晚一点。写入一旦开始，失败后的清理（删掉本层条目）即使 ctx 已结束也会执行，最长 `WithFetchTimeout`。
-- 回源读到值**之后**、写回本层**之前**如果发生了 `Set`/`Del`，这次读仍然返回它读到的值，但绝不会用它覆盖更新的值：每个 `Client` 把 key 按哈希分到 1,024 个分片，每个分片有一把写锁和一个写入代数，`Get`、`GetMany` 和 serve-stale 的后台刷新在持有 key 所在分片的读锁时核对分片的写入代数，所以回填要么在 `Set`/`Del` 之前落下（随后被覆盖），要么被跳过。分片正在写入时回填也直接跳过，所以读永远不等写。落在同一分片的 key 共用这份状态：它们的写入逐个执行，写一个 key 可能让另一个 key 的回填被跳过。代价最多是多一次缓存未命中，或者一次写入要等另一个不相干 key 的写入。
+- 回源读到值**之后**、写回本层**之前**如果发生了 `Set`/`Del`，这次读仍然返回它读到的值，但绝不会用它覆盖更新的值：每个 `Client` 把 key 按哈希分到 1,024 个分片，每个分片有一把写锁和一个写入代数，`Get`、`GetMany` 和 serve-stale 的后台刷新在持有 key 所在分片的读锁时核对分片的写入代数，所以回填要么在 `Set`/`Del` 之前落下（随后被覆盖），要么被跳过。分片正在写入时回填也直接跳过，所以读永远不等写。落在同一分片的 key 共用这份状态：它们的写入逐个执行，写一个 key 可能让另一个 key 的回填被跳过。代价最多是多一次缓存未命中，或者一次写入要等另一个不相干 key 的写入、或等正在回填本层的读：一次大的 `GetMany` 在后端写回期间会占着它所有 key 的分片（1,000 个 key 约占六成），这些分片上任何 key 的 `Set`/`Del` 都要等这么久，ctx 先结束就放弃。
 - 这些保证在单个进程内成立；多个进程共用同一个下层（例如 Redis）时，各自的内存层仍可能短暂不一致。
 
 ### Not-Found 缓存
@@ -416,7 +416,7 @@ client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick
 2. **Not-Found 缓存**：未命中的先查它，和 `Get` 一样。
 3. **Singleflight**：每个要回源的 key 都在和 `Get` **同一个** singleflight 里认领。已经有 `Get` 或别的 `GetMany` 在取的 key，等那次的结果，不再取一遍；所以 `Get` 和 `GetMany`（或两个有交集的 `GetMany`）同时要同一个 key，只回源一次。`WithFetchConcurrency` 照旧按 key 生效。
 4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存。
-5. **上游**：上游实现了 `BatchUpstream[T]`，剩下的 key 就调**一次** `GetMany`（整次调用共用一个 `WithFetchTimeout`）。否则每个 key 都和 `Get` 完全一样地拉取（各自 double check、各自超时、各自回填，拉到就交给等它的调用方），同时最多 `WithGetManyConcurrency` 个（默认 16）；每个 key 轮到时才认领，所以并发的 `Get` 碰上还在这里排队的 key 不用等整个队列，`GetMany` 被取消后也不再开始新的 key。
+5. **上游**：上游实现了 `BatchUpstream[T]`，剩下的 key 就调**一次** `GetMany`（整次调用共用一个 `WithFetchTimeout`；下层是 `Client` 时不加这个总超时，由下层给自己的每次拉取各自限时）。同一次调用里的 key 一起返回：并发 `Get` 其中某个 key 会加入这次调用，等它整个结束。否则每个 key 都和 `Get` 完全一样地拉取（各自 double check、各自超时、各自回填，拉到就交给等它的调用方），同时最多 `WithGetManyConcurrency` 个（默认 16）；每个 key 轮到时才认领，所以并发的 `Get` 碰上还在这里排队的 key 不用等整个队列，`GetMany` 被取消后也不再开始新的 key。
 6. **回填**：取到的值写回后端，不存在的 key 写进 Not-Found 缓存。上游实现了 `BatchUpstream` 时，一批只调一次 `SetMany`/`DelMany`（后端支持的话）；否则每个 key 各自回填，和 `Get` 一样。两种情况都只写本层，不写上游。
 
 `Client` 自己也实现了 `BatchUpstream[T]`，所以多层缓存时一批 key 每层只走一次调用：`l1Client.GetMany` → L1 批量读 → `l2Client.GetMany` → L2 批量读 → 一次数据库查询。

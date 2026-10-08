@@ -380,8 +380,13 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 	for j, i := range pending {
 		pendingKeys[j] = keys[i]
 	}
-	// like Get, the fetch timeout starts after the double-check
-	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
+	// like Get, the fetch timeout starts after the double-check. A Client below
+	// bounds each of its own fetches, so its batch is not bounded as one fetch:
+	// keys still queued there would fail with this deadline, not their own.
+	fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	if _, layered := c.upstream.(*Client[T]); !layered {
+		fetchCtx, cancel = context.WithTimeout(fetchCtx, c.fetchTimeout)
+	}
 	defer cancel()
 	for j, r := range c.doFetchMany(fetchCtx, pendingKeys) {
 		results[pending[j]] = r
