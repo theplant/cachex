@@ -372,17 +372,32 @@ type BatchUpstream[T any] interface {
 
 type productSource struct{ db *gorm.DB }
 
-func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*Product, error) {
+func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*cachex.Entry[*Product], error) {
     var rows []*Product
     if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
         return nil, err
     }
-    out := make(map[string]*Product, len(rows))
+    now := time.Now()
+    out := make(map[string]*cachex.Entry[*Product], len(rows))
     for _, p := range rows {
-        out[p.ID] = p
+        out[p.ID] = &cachex.Entry[*Product]{Data: p, CachedAt: now}
     }
-    return out, nil
+    return out, nil // ids not found are simply absent
 }
+
+// Get is still required (Upstream[T]); it can reuse GetMany.
+func (s productSource) Get(ctx context.Context, id string) (*cachex.Entry[*Product], error) {
+    entries, err := s.GetMany(ctx, []string{id})
+    if err != nil {
+        return nil, err
+    }
+    if e, ok := entries[id]; ok {
+        return e, nil
+    }
+    return nil, &cachex.ErrKeyNotFound{}
+}
+
+client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick Start */)
 ```
 
 How `GetMany` works:
@@ -391,7 +406,7 @@ How `GetMany` works:
 2. **Not-Found cache**: misses are checked against it, exactly like `Get`.
 3. **Singleflight**: every key that needs the upstream is claimed in the **same** singleflight `Get` uses. Keys already being fetched by a `Get` or another `GetMany` are waited for, not fetched again; so a `Get` and a `GetMany` (or two overlapping `GetMany`s) fetch a shared key only once. `WithFetchConcurrency` applies per key as usual.
 4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get`.
-5. **Upstream**: the remaining keys are fetched with **one** `GetMany` call if the upstream implements `BatchUpstream[T]`, otherwise with concurrent `Get` calls, at most `WithGetManyConcurrency` (default 16) at a time.
+5. **Upstream**: if the upstream implements `BatchUpstream[T]`, the remaining keys are fetched with **one** `GetMany` call (one `WithFetchTimeout` for the whole call). Otherwise each key is fetched exactly as `Get` would (its own double-check, fetch timeout and write-back, and handed to its waiters as soon as it arrives), at most `WithGetManyConcurrency` (default 16) at a time.
 6. **Write back**: found values go to the backend (`SetMany` when supported), missing keys to the Not-Found cache. Like `Get`, this only touches this layer, never the upstream.
 
 `Client` implements `BatchUpstream[T]` itself, so in a layered setup a batch travels down as one call per layer: `l1Client.GetMany` → L1 batch read → `l2Client.GetMany` → L2 batch read → one database query.
@@ -407,7 +422,7 @@ if errors.As(err, &batchErr) {
 // products is usable either way
 ```
 
-Built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (one pipeline of `GET`/`SET`/`DEL`, which also works on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and multi-row upserts, 1000 keys per statement to stay under the bound parameter limits).
+These built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (one pipeline of `GET`/`SET`/`DEL`, which also works on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and multi-row upserts, 1000 keys per statement to stay under the bound parameter limits). `BigCache` and the `Transform` wrappers do not, so `GetMany` reads and writes them key by key (wrapping a `RedisCache` in `Transform` means one round trip per key).
 
 Fetching 100 missing keys through an upstream that costs 1ms per call (`BenchmarkGetManyVsGet`):
 

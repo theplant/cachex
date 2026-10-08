@@ -274,19 +274,7 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 
 	f, leader := c.flights.claim(sfKey)
 	if leader {
-		go func() {
-			returned := false
-			defer func() {
-				if !returned {
-					// runtime.Goexit in the upstream: release the key without
-					// publishing, like x/sync/singleflight; waiters wait for their ctx.
-					c.flights.forget(sfKey, f)
-				}
-			}()
-			value, err := c.fetchClaimed(ctx, key)
-			returned = true
-			c.flights.finish(sfKey, f, value, err)
-		}()
+		go c.runClaimed(ctx, key, sfKey, f)
 	}
 
 	select {
@@ -301,6 +289,21 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 		}
 		return f.value, nil
 	}
+}
+
+// runClaimed fetches a key this request has claimed and publishes the result.
+func (c *Client[T]) runClaimed(ctx context.Context, key, sfKey string, f *flight[T]) {
+	returned := false
+	defer func() {
+		if !returned {
+			// runtime.Goexit in the upstream: release the key without
+			// publishing, like x/sync/singleflight; waiters wait for their ctx.
+			c.flights.forget(sfKey, f)
+		}
+	}()
+	value, err := c.fetchClaimed(ctx, key)
+	returned = true
+	c.flights.finish(sfKey, f, value, err)
 }
 
 // fetchClaimed fetches a key this request has claimed in the flight group.
@@ -479,10 +482,10 @@ func WithFetchConcurrency[T any](concurrency int) ClientOption[T] {
 	}
 }
 
-// WithGetManyConcurrency sets the maximum number of concurrent upstream.Get
-// calls one GetMany makes for its missing keys when the upstream does not
-// implement BatchUpstream (default DefaultGetManyConcurrency). It does not
-// apply to a BatchUpstream, which gets one GetMany call.
+// WithGetManyConcurrency sets the maximum number of keys one GetMany fetches
+// at a time when the upstream does not implement BatchUpstream (default
+// DefaultGetManyConcurrency); each is fetched as Get would, with its own fetch
+// timeout. It does not apply to a BatchUpstream, which gets one GetMany call.
 func WithGetManyConcurrency[T any](concurrency int) ClientOption[T] {
 	return func(c *Client[T]) {
 		c.getManyConc = concurrency

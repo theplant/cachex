@@ -77,10 +77,11 @@ type result[T any] struct {
 //   - Misses are checked against the not-found cache first, exactly like Get.
 //   - Keys that need the upstream are claimed one by one in the same
 //     singleflight Get uses: a key already being fetched by a Get or another
-//     GetMany is waited for, not fetched again. The keys this call claims are
-//     double-checked (WithDoubleCheck) and then fetched together: one
-//     upstream.GetMany if the upstream implements BatchUpstream, otherwise
-//     concurrent upstream.Get calls (at most WithGetManyConcurrency at a time).
+//     GetMany is waited for, not fetched again. If the upstream implements
+//     BatchUpstream, the keys this call claims are double-checked
+//     (WithDoubleCheck) and fetched together with one upstream.GetMany under
+//     one fetch timeout. Otherwise each claimed key is fetched exactly as Get
+//     would, at most WithGetManyConcurrency at a time.
 //   - Fetched values are written to the backend (SetMany if supported) and
 //     not-found keys to the not-found cache, without touching the upstream,
 //     exactly like Get.
@@ -251,7 +252,11 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 		}
 	}
 	if len(ownKeys) > 0 {
-		go c.fetchClaimedMany(ctx, ownKeys, ownSFKeys, ownFlights)
+		if _, ok := c.upstream.(BatchUpstream[T]); ok {
+			go c.fetchClaimedMany(ctx, ownKeys, ownSFKeys, ownFlights)
+		} else {
+			go c.runClaimedEach(ctx, ownKeys, ownSFKeys, ownFlights)
+		}
 	}
 
 	results := make([]result[T], len(keys))
@@ -270,8 +275,22 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 	return results
 }
 
-// fetchClaimedMany is the batch form of fetchClaimed: double-check, then fetch
-// what is still missing, then finish every flight.
+// runClaimedEach fetches claimed keys from an upstream without batch support:
+// each key exactly as Get would (own double-check, fetch timeout, write-back,
+// published as soon as it is done), at most getManyConc at a time.
+func (c *Client[T]) runClaimedEach(ctx context.Context, keys, sfKeys []string, flights []*flight[T]) {
+	sem := make(chan struct{}, c.getManyConc)
+	for i, key := range keys {
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem }()
+			c.runClaimed(ctx, key, sfKeys[i], flights[i])
+		}()
+	}
+}
+
+// fetchClaimedMany is the batch form of fetchClaimed for a BatchUpstream:
+// double-check, then fetch what is still missing, then finish every flight.
 func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight[T]) {
 	results := make([]result[T], len(keys))
 	var pending []int // keys still to fetch after the double-check; nil until it ran
@@ -347,41 +366,19 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 	returned = true
 }
 
-// doFetchMany is the batch form of doFetch: fetch from upstream, then write
-// the results to this layer only.
+// doFetchMany is the batch form of doFetch: fetch from the batch upstream,
+// then write the results to this layer only.
 func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] {
 	results := make([]result[T], len(keys))
-
-	if batch, ok := c.upstream.(BatchUpstream[T]); ok {
-		values, err := batch.GetMany(ctx, keys)
-		_, partial := err.(*BatchError) //nolint:errorlint // see errForKey
-		for i, key := range keys {
-			if kerr := errForKey(err, key); kerr != nil {
-				if !partial && IsErrKeyNotFound(kerr) {
-					// A whole-batch failure is not a not-found for every key, even if
-					// a not-found sits somewhere in its chain: keep only its message.
-					kerr = errors.New(kerr.Error())
-				}
-				results[i].err = errors.Wrapf(kerr, "get from upstream failed for key: %s", key)
-			} else if value, ok := values[key]; ok {
-				results[i].value = value
-			} else {
-				results[i].err = errors.Wrapf(&ErrKeyNotFound{}, "get from upstream failed for key: %s", key)
-			}
+	values, err := c.upstream.(BatchUpstream[T]).GetMany(ctx, keys)
+	for i, key := range keys {
+		if kerr := errForKey(err, key); kerr != nil {
+			results[i].err = errors.Wrapf(kerr, "get from upstream failed for key: %s", key)
+		} else if value, ok := values[key]; ok {
+			results[i].value = value
+		} else {
+			results[i].err = errors.Wrapf(&ErrKeyNotFound{}, "get from upstream failed for key: %s", key)
 		}
-	} else {
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, c.getManyConc)
-		for i, key := range keys {
-			// overwritten on return; stays if the upstream calls runtime.Goexit
-			results[i].err = errors.Errorf("upstream fetch exited without returning for key: %s", key)
-			sem <- struct{}{}
-			wg.Go(func() {
-				defer func() { <-sem }()
-				results[i] = c.getFromUpstream(ctx, key)
-			})
-		}
-		wg.Wait()
 	}
 
 	found := map[string]T{}
@@ -404,41 +401,27 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 	return results
 }
 
-func (c *Client[T]) getFromUpstream(ctx context.Context, key string) (res result[T]) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.logger.ErrorContext(ctx, "panic during upstream fetch",
-				"key", key,
-				"panic", r,
-				"stack", string(debug.Stack()))
-			res = result[T]{err: errors.Errorf("panic during upstream fetch: %v", r)}
-		}
-	}()
-	value, err := c.upstream.Get(ctx, key)
-	if err != nil {
-		return result[T]{err: errors.Wrapf(err, "get from upstream failed for key: %s", key)}
-	}
-	return result[T]{value: value}
-}
-
-// setManyWithoutUpstream is the batch form of setWithoutUpstream.
+// setManyWithoutUpstream is the batch form of setWithoutUpstream. A failed
+// not-found cleanup does not stop the backend write: reads check the backend
+// first, so caching the value is right either way.
 func (c *Client[T]) setManyWithoutUpstream(ctx context.Context, values map[string]T) error {
 	if len(values) == 0 {
 		return nil
 	}
+	var errs []error
 	if c.notFoundCache != nil {
 		keys := make([]string, 0, len(values))
 		for key := range values {
 			keys = append(keys, key)
 		}
 		if err := delMany(ctx, c.notFoundCache, keys); err != nil {
-			return errors.Wrap(err, "delete from notFoundCache failed")
+			errs = append(errs, errors.Wrap(err, "delete from notFoundCache failed"))
 		}
 	}
 	if err := setMany(ctx, c.backend, values); err != nil {
-		return errors.Wrap(err, "set in backend failed")
+		errs = append(errs, errors.Wrap(err, "set in backend failed"))
 	}
-	return nil
+	return stderrors.Join(errs...)
 }
 
 // delManyWithoutUpstream is the batch form of delWithoutUpstream.
@@ -446,6 +429,7 @@ func (c *Client[T]) delManyWithoutUpstream(ctx context.Context, keys []string) e
 	if len(keys) == 0 {
 		return nil
 	}
+	var errs []error
 	if c.notFoundCache != nil {
 		now := NowFunc()
 		cachedAts := make(map[string]time.Time, len(keys))
@@ -453,13 +437,14 @@ func (c *Client[T]) delManyWithoutUpstream(ctx context.Context, keys []string) e
 			cachedAts[key] = now
 		}
 		if err := setMany(ctx, c.notFoundCache, cachedAts); err != nil {
-			return errors.Wrap(err, "failed to set notFoundCache")
+			errs = append(errs, errors.Wrap(err, "failed to set notFoundCache"))
 		}
 	}
+	// the key is gone upstream, so its old value goes even if no not-found was recorded
 	if err := delMany(ctx, c.backend, keys); err != nil {
-		return errors.Wrap(err, "delete from backend failed")
+		errs = append(errs, errors.Wrap(err, "delete from backend failed"))
 	}
-	return nil
+	return stderrors.Join(errs...)
 }
 
 // asyncRefreshMany is the batch form of asyncRefresh: the stale keys of one

@@ -371,17 +371,32 @@ type BatchUpstream[T any] interface {
 
 type productSource struct{ db *gorm.DB }
 
-func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*Product, error) {
+func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*cachex.Entry[*Product], error) {
     var rows []*Product
     if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
         return nil, err
     }
-    out := make(map[string]*Product, len(rows))
+    now := time.Now()
+    out := make(map[string]*cachex.Entry[*Product], len(rows))
     for _, p := range rows {
-        out[p.ID] = p
+        out[p.ID] = &cachex.Entry[*Product]{Data: p, CachedAt: now}
     }
-    return out, nil
+    return out, nil // 查不到的 id 不放进 map 即可
 }
+
+// Get 仍然必须实现（Upstream[T]），可以复用 GetMany。
+func (s productSource) Get(ctx context.Context, id string) (*cachex.Entry[*Product], error) {
+    entries, err := s.GetMany(ctx, []string{id})
+    if err != nil {
+        return nil, err
+    }
+    if e, ok := entries[id]; ok {
+        return e, nil
+    }
+    return nil, &cachex.ErrKeyNotFound{}
+}
+
+client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick Start */)
 ```
 
 `GetMany` 的流程：
@@ -390,7 +405,7 @@ func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*P
 2. **Not-Found 缓存**：未命中的先查它，和 `Get` 一样。
 3. **Singleflight**：每个要回源的 key 都在和 `Get` **同一个** singleflight 里认领。已经有 `Get` 或别的 `GetMany` 在取的 key，等那次的结果，不再取一遍；所以 `Get` 和 `GetMany`（或两个有交集的 `GetMany`）同时要同一个 key，只回源一次。`WithFetchConcurrency` 照旧按 key 生效。
 4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存。
-5. **上游**：剩下的 key，上游实现了 `BatchUpstream[T]` 就调**一次** `GetMany`，否则并发逐个 `Get`，同时最多 `WithGetManyConcurrency` 个（默认 16）。
+5. **上游**：上游实现了 `BatchUpstream[T]`，剩下的 key 就调**一次** `GetMany`（整次调用共用一个 `WithFetchTimeout`）。否则每个 key 都和 `Get` 完全一样地拉取（各自 double check、各自超时、各自回填，拉到就交给等它的调用方），同时最多 `WithGetManyConcurrency` 个（默认 16）。
 6. **回填**：取到的值写回后端（支持就用 `SetMany`），不存在的 key 写进 Not-Found 缓存。和 `Get` 一样只写本层，不写上游。
 
 `Client` 自己也实现了 `BatchUpstream[T]`，所以多层缓存时一批 key 每层只走一次调用：`l1Client.GetMany` → L1 批量读 → `l2Client.GetMany` → L2 批量读 → 一次数据库查询。
@@ -406,7 +421,7 @@ if errors.As(err, &batchErr) {
 // 不管有没有 err，products 都能用
 ```
 
-内置后端都实现了 `BatchCache[T]`：`RistrettoCache`、`SyncMap`、`RedisCache`（一个 `GET`/`SET`/`DEL` 的 pipeline，Redis Cluster 下也能用）和 `GORMCache`（`WHERE key IN (...)` 和多行 upsert，每条语句 1000 个 key，不会超出数据库的绑定参数上限）。
+以下内置后端实现了 `BatchCache[T]`：`RistrettoCache`、`SyncMap`、`RedisCache`（一个 `GET`/`SET`/`DEL` 的 pipeline，Redis Cluster 下也能用）和 `GORMCache`（`WHERE key IN (...)` 和多行 upsert，每条语句 1000 个 key，不会超出数据库的绑定参数上限）。`BigCache` 和 `Transform` 包装没有实现，`GetMany` 对它们逐个 key 读写（用 `Transform` 包一层 `RedisCache`，就是每个 key 一次往返）。
 
 上游每次调用耗时 1ms，取 100 个全未命中的 key（`BenchmarkGetManyVsGet`）：
 

@@ -630,7 +630,7 @@ func TestClientGetManyUpstreamGoexit(t *testing.T) {
 		assert.Equal(t, map[string]string{"a": "1"}, got)
 	})
 
-	t.Run("per-key upstream: the key fails instead of yielding a zero value", func(t *testing.T) {
+	t.Run("per-key upstream: the key is released like Get, the others are served", func(t *testing.T) {
 		backend := NewSyncMap[string]()
 		cli := NewClient(backend, UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
 			if key == "bad" {
@@ -639,11 +639,13 @@ func TestClientGetManyUpstreamGoexit(t *testing.T) {
 			return "v-" + key, nil
 		}))
 
-		got, err := cli.GetMany(context.Background(), []string{"a", "bad"})
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		got, err := cli.GetMany(ctx, []string{"a", "bad"})
 		assert.Equal(t, map[string]string{"a": "v-a"}, got)
 		var be *BatchError
 		require.ErrorAs(t, err, &be)
-		assert.Contains(t, be.Errors, "bad")
+		assert.ErrorIs(t, be.Errors["bad"], context.DeadlineExceeded, "waiters wait for their ctx, like Get")
 		_, err = backend.Get(context.Background(), "bad")
 		assert.True(t, IsErrKeyNotFound(err), "nothing is written for the key")
 	})
@@ -793,6 +795,199 @@ func TestClientGetManyWholeBatchErrorInterplay(t *testing.T) {
 		assert.False(t, IsErrKeyNotFound(getErr))
 		_, err := notFound.Get(ctx, "a")
 		assert.True(t, IsErrKeyNotFound(err), "no not-found is cached")
+	})
+}
+
+// keyFailingCache is a Cache (not a BatchCache) whose Set and Del fail for bad.
+type keyFailingCache[T any] struct {
+	m   *SyncMap[T]
+	bad string
+}
+
+func (c keyFailingCache[T]) Get(ctx context.Context, key string) (T, error) { return c.m.Get(ctx, key) }
+
+func (c keyFailingCache[T]) Set(ctx context.Context, key string, value T) error {
+	if key == c.bad {
+		return errors.New("boom")
+	}
+	return c.m.Set(ctx, key, value)
+}
+
+func (c keyFailingCache[T]) Del(ctx context.Context, key string) error {
+	if key == c.bad {
+		return errors.New("boom")
+	}
+	return c.m.Del(ctx, key)
+}
+
+func TestClientGetManyPerKeyFallbackIsPerKey(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("every key gets its own fetch timeout", func(t *testing.T) {
+		up := UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
+			select {
+			case <-time.After(30 * time.Millisecond):
+				return key, nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		})
+		cli := NewClient[string](NewSyncMap[string](), up,
+			WithFetchTimeout[string](100*time.Millisecond), WithGetManyConcurrency[string](1))
+		keys := make([]string, 10)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("k%d", i)
+		}
+		got, err := cli.GetMany(ctx, keys)
+		require.NoError(t, err, "10 fetches of 30ms each run one at a time; none exceeds 100ms on its own")
+		assert.Len(t, got, 10)
+	})
+
+	t.Run("a key is published as soon as it is fetched, not when the whole batch is", func(t *testing.T) {
+		slowEntered, releaseSlow := make(chan struct{}), make(chan struct{})
+		up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+			if key == "slow" {
+				close(slowEntered)
+				<-releaseSlow
+			}
+			return "v-" + key, nil
+		})
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](2))
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = cli.GetMany(ctx, []string{"fast", "slow"})
+		}()
+		waitFor(t, slowEntered)
+		getCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		v, err := cli.Get(getCtx, "fast")
+		close(releaseSlow)
+		<-done
+		require.NoError(t, err, "a Get of fast does not wait for slow")
+		assert.Equal(t, "v-fast", v)
+	})
+}
+
+func TestClientGetManyNotFoundCacheFailureKeepsBackendWrites(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("found values are still cached", func(t *testing.T) {
+		backend := NewSyncMap[string]()
+		notFound := keyFailingCache[time.Time]{m: NewSyncMap[time.Time](), bad: "bad"}
+		up := &batchUpstream{data: map[string]string{"a": "1", "bad": "2"}}
+		cli := NewClient(backend, up, NotFoundWithTTL[string](notFound, time.Hour, 0))
+
+		got, err := cli.GetMany(ctx, []string{"a", "bad"})
+		require.NoError(t, err, "a failed cache write is logged, like Get")
+		assert.Equal(t, map[string]string{"a": "1", "bad": "2"}, got)
+		v, err := backend.Get(ctx, "a")
+		require.NoError(t, err, "one key's not-found cleanup failing does not stop the others being cached")
+		assert.Equal(t, "1", v)
+	})
+
+	t.Run("keys gone upstream are still deleted from the backend", func(t *testing.T) {
+		backend := NewSyncMap[string]()
+		require.NoError(t, backend.Set(ctx, "a", "old"))
+		require.NoError(t, backend.Set(ctx, "bad", "old"))
+		notFound := keyFailingCache[time.Time]{m: NewSyncMap[time.Time](), bad: "bad"}
+		up := &batchUpstream{data: map[string]string{}}
+		cli := NewClient(backend, up, NotFoundWithTTL[string](notFound, time.Hour, 0),
+			WithStale[string](func(string) State { return StateRotten }))
+
+		got, err := cli.GetMany(ctx, []string{"a", "bad"})
+		require.NoError(t, err)
+		assert.Empty(t, got)
+		_, err = backend.Get(ctx, "a")
+		assert.True(t, IsErrKeyNotFound(err), "one key's not-found write failing does not keep the others' old values")
+		_, err = backend.Get(ctx, "bad")
+		assert.True(t, IsErrKeyNotFound(err), "nor its own")
+	})
+}
+
+func TestClientGetManyCoverageGaps(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("WithFetchConcurrency bounds the fetches of one key across GetMany calls", func(t *testing.T) {
+		var calls atomic.Int32
+		release := make(chan struct{})
+		up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+			calls.Add(1)
+			<-release
+			return "v-" + key, nil
+		})
+		// DoubleCheck makes a caller that claims after a slot finished reuse its value
+		cli := NewClient[string](NewSyncMap[string](), up, WithFetchConcurrency[string](3),
+			WithDoubleCheck[string](DoubleCheckEnabled))
+
+		var wg sync.WaitGroup
+		for range 30 {
+			wg.Go(func() {
+				got, err := cli.GetMany(ctx, []string{"k"})
+				assert.NoError(t, err)
+				assert.Equal(t, map[string]string{"k": "v-k"}, got)
+			})
+		}
+		require.Eventually(t, func() bool { return calls.Load() >= 1 }, time.Second, time.Millisecond)
+		close(release)
+		wg.Wait()
+		assert.LessOrEqual(t, calls.Load(), int32(3), "at most one fetch per slot")
+	})
+
+	t.Run("a stale not-found is served as absent and refreshed in the background", func(t *testing.T) {
+		clock := NewMockClock(time.Now())
+		defer clock.Install()()
+		notFound := NewSyncMap[time.Time]()
+		require.NoError(t, notFound.Set(ctx, "k", NowFunc()))
+		clock.Advance(time.Minute) // past fresh, within stale
+		backend := NewSyncMap[string]()
+		up := &batchUpstream{data: map[string]string{"k": "now-exists"}}
+		cli := NewClient(backend, up,
+			NotFoundWithTTL[string](notFound, time.Second, time.Hour),
+			WithServeStale[string](true))
+
+		got, err := cli.GetMany(ctx, []string{"k"})
+		require.NoError(t, err)
+		assert.Empty(t, got, "the stale not-found is served")
+		require.Eventually(t, func() bool {
+			v, err := backend.Get(ctx, "k")
+			return err == nil && v == "now-exists"
+		}, time.Second, time.Millisecond, "and refreshed in the background")
+	})
+
+	t.Run("Get and GetMany share the background refresh of a stale key", func(t *testing.T) {
+		clock := NewMockClock(time.Now())
+		defer clock.Install()()
+		var calls atomic.Int32
+		entered, release := make(chan struct{}), make(chan struct{})
+		up := UpstreamFunc[*Entry[string]](func(context.Context, string) (*Entry[string], error) {
+			if calls.Add(1) == 1 {
+				close(entered)
+				<-release
+			}
+			return &Entry[string]{Data: "new", CachedAt: NowFunc()}, nil
+		})
+		backend := NewSyncMap[*Entry[string]]()
+		require.NoError(t, backend.Set(ctx, "k", &Entry[string]{Data: "old", CachedAt: NowFunc()}))
+		clock.Advance(2 * time.Minute) // stale
+		cli := NewClient(backend, up,
+			EntryWithTTL[string](time.Minute, time.Hour),
+			WithServeStale[*Entry[string]](true))
+
+		v, err := cli.Get(ctx, "k")
+		require.NoError(t, err)
+		assert.Equal(t, "old", v.Data)
+		waitFor(t, entered) // Get's refresh is in flight
+		got, err := cli.GetMany(ctx, []string{"k"})
+		require.NoError(t, err)
+		assert.Equal(t, "old", got["k"].Data)
+		close(release)
+		require.Eventually(t, func() bool {
+			e, err := backend.Get(ctx, "k")
+			return err == nil && e.Data == "new"
+		}, time.Second, time.Millisecond)
+		assert.Equal(t, int32(1), calls.Load(), "GetMany does not start a second refresh")
 	})
 }
 
