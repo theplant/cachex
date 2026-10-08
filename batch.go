@@ -53,6 +53,14 @@ func (g *flightGroup[T]) finish(sfKey string, f *flight[T], value T, err error) 
 	close(f.done)
 }
 
+// drop releases whatever flight holds sfKey without publishing a result: its
+// waiters still get its result, and the next claim starts a new flight.
+func (g *flightGroup[T]) drop(sfKey string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.flights, sfKey)
+}
+
 // forget releases the claim without publishing a result.
 func (g *flightGroup[T]) forget(sfKey string, f *flight[T]) {
 	g.mu.Lock()

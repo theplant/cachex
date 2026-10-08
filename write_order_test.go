@@ -406,12 +406,14 @@ func (c ctxCache) Del(ctx context.Context, key string) error {
 func TestFailedWriteInvalidatesWithACanceledCtx(t *testing.T) {
 	backend := ctxCache{NewSyncMap[string]()}
 	require.NoError(t, backend.Set(context.Background(), "k", "old"))
+	ctx, cancel := context.WithCancel(context.Background())
 	up := newHookedCache()
-	up.beforeSet = func(string, string) error { return context.Canceled }
+	up.beforeSet = func(string, string) error {
+		cancel() // the caller gives up while the upstream is being written
+		return context.Canceled
+	}
 	cli := NewClient[string](backend, up)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
 	require.ErrorIs(t, cli.Set(ctx, "k", "new"), context.Canceled)
 	assertMissing(t, backend, "k", "the cleanup does not reuse the canceled ctx")
 }
@@ -457,4 +459,120 @@ func TestInterleavedSetsKeepLayersConsistent(t *testing.T) {
 			assert.True(t, IsErrKeyNotFound(err), "round %d", round)
 		}
 	}
+}
+
+func TestReadAfterWriteDoesNotJoinAnOlderFetch(t *testing.T) {
+	ctx := context.Background()
+	src := &slowSource{data: map[string]string{"k": "old"}}
+	cli := NewClient[string](NewSyncMap[string](), src) // no not-found cache: Del leaves this layer empty
+
+	src.holdReads()
+	go func() { _, _ = cli.Get(ctx, "k") }()
+	waitFor(t, src.entered) // A has read "old" and is held
+
+	src.mu.Lock()
+	delete(src.data, "k")
+	src.mu.Unlock()
+	require.NoError(t, cli.Del(ctx, "k"))
+
+	type res struct {
+		v   string
+		err error
+	}
+	got := make(chan res, 1)
+	go func() {
+		v, err := cli.Get(ctx, "k")
+		got <- res{v, err}
+	}()
+	waitFor(t, src.entered) // B started its own read instead of joining A's
+	src.releaseReads()
+	r := <-got
+	assert.True(t, IsErrKeyNotFound(r.err), "a Get that starts after Del returned sees the delete (got %q, %v)", r.v, r.err)
+}
+
+func TestWriteWaitingForTheStripeRespectsCtx(t *testing.T) {
+	ctx := context.Background()
+	up := newHookedCache()
+	entered, release := make(chan struct{}), make(chan struct{})
+	up.beforeSet = func(_, value string) error {
+		if value == "first" {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	cli := NewClient[string](NewSyncMap[string](), up)
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		assert.NoError(t, cli.Set(ctx, "k", "first"))
+	}()
+	waitFor(t, entered)
+
+	secondErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		secondErr <- cli.Set(ctx, "k", "second")
+	}()
+	select {
+	case err := <-secondErr:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, "context cancelled while waiting for a write in progress for key: k: context deadline exceeded", err.Error())
+	case <-time.After(5 * time.Second):
+		t.Fatal("Set kept waiting past its ctx")
+	}
+	close(release)
+	<-firstDone
+	v, _ := up.Get(ctx, "k")
+	assert.Equal(t, "first", v, "the cancelled Set wrote nothing")
+
+	done, cancel := context.WithCancel(ctx)
+	cancel()
+	err := cli.Set(done, "k", "third")
+	require.ErrorIs(t, err, context.Canceled, "a done ctx writes nothing even when the stripe is free")
+	v, _ = up.Get(ctx, "k")
+	assert.Equal(t, "first", v)
+}
+
+// holdGetCache is a hookedCache whose Get can be held after reading.
+type holdGetCache struct {
+	*hookedCache
+	onGet func(key string)
+}
+
+func (h *holdGetCache) Get(ctx context.Context, key string) (string, error) {
+	v, err := h.hookedCache.Get(ctx, key)
+	if h.onGet != nil {
+		h.onGet(key)
+	}
+	return v, err
+}
+
+func TestWriteThroughBackfillDuringUpstreamWrite(t *testing.T) {
+	ctx := context.Background()
+	l2 := &holdGetCache{hookedCache: newHookedCache()}
+	require.NoError(t, l2.Set(ctx, "k", "old"))
+	l1Backend := NewSyncMap[string]()
+	l1 := NewClient[string](l1Backend, l2)
+
+	read, release, getDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	l2.beforeSet = func(string, string) error {
+		// while L1's Set holds the stripe and before L2 is written, an L1 Get reads L2's old value
+		l2.onGet = func(string) { close(read); <-release }
+		go func() {
+			defer close(getDone)
+			_, _ = l1.Get(ctx, "k")
+		}()
+		<-read
+		return nil
+	}
+	require.NoError(t, l1.Set(ctx, "k", "new"))
+	l2.beforeSet = nil
+	close(release)
+	<-getDone
+
+	v, err := l1Backend.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "new", v, "the Get that read L2 before the write does not backfill the old value")
 }

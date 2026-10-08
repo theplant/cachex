@@ -79,6 +79,9 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
 		writeSeed:        maphash.MakeSeed(),
 	}
+	for i := range c.writes {
+		c.writes[i].writer = make(chan struct{}, 1)
+	}
 
 	// Apply user options
 	for _, opt := range opts {
@@ -201,6 +204,7 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 // cached, since the upstream may still hold the key. If the upstream delete
 // succeeds but this layer's fails, the error is returned and the upstream
 // stays deleted.
+// Reads after it and waiting for other writes behave as for Set.
 func (c *Client[T]) Del(ctx context.Context, key string) error {
 	return c.write(ctx, key,
 		func(upstream Cache[T]) error {
@@ -254,9 +258,11 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 // state is unknown (it may have been applied and only the reply lost), so this
 // layer's entry is dropped and the next read goes down. If the upstream write
 // succeeds but this layer's fails, the error is returned too (the upstream
-// keeps the new value) and this layer's entry is dropped. Concurrent writes to
+// keeps the new value) and this layer's entry is dropped. A read that starts
+// after Set returned never gets a value fetched before it. Concurrent writes to
 // one key through the same Client are applied one at a time, in the same order
-// on every layer.
+// on every layer; waiting for another write respects ctx, but once started, a
+// failed write's cleanup outlives ctx, for at most the fetch timeout.
 func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
 	return c.write(ctx, key,
 		func(upstream Cache[T]) error {
@@ -278,8 +284,9 @@ const writeStripeCount = 1024
 
 // writeStripe orders writes and backfills of the keys that hash to it.
 type writeStripe struct {
-	mu  sync.RWMutex  // Set/Del hold it, so all layers apply them in one order; backfills hold it for reading
-	gen atomic.Uint64 // bumped by every Set/Del, checked by backfills
+	writer chan struct{} // capacity 1, held by the Set/Del in progress; waiting for it respects ctx
+	mu     sync.RWMutex  // that Set/Del holds it too, so all layers apply writes in one order; backfills hold it for reading
+	gen    atomic.Uint64 // bumped by every Set/Del, checked by backfills
 }
 
 func (c *Client[T]) stripe(key string) *writeStripe {
@@ -290,25 +297,53 @@ func (c *Client[T]) stripe(key string) *writeStripe {
 // layer. Any failure leaves this layer without an entry for the key.
 func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache[T]) error, toLayer func() error) error {
 	s := c.stripe(key)
-	s.mu.Lock()
+	if err := ctx.Err(); err != nil { // a done ctx writes nothing, even if no write is in progress
+		return errors.Wrapf(err, "context cancelled while waiting for a write in progress for key: %s", key)
+	}
+	select {
+	case s.writer <- struct{}{}:
+	case <-ctx.Done():
+		return errors.Wrapf(ctx.Err(), "context cancelled while waiting for a write in progress for key: %s", key)
+	}
+	defer func() { <-s.writer }()
+	s.mu.Lock() // only waits for backfills already writing this layer
 	defer s.mu.Unlock()
+
+	// Called once the upstream is written: a backfill that read the upstream
+	// before took an older gen, so it is skipped once this lock is released, and
+	// a read that starts from now on fetches anew instead of joining a fetch
+	// that may have read the upstream before the write.
+	written := func() {
+		s.gen.Add(1)
+		c.dropFlights(key)
+	}
 
 	if upstreamCache, ok := c.upstream.(Cache[T]); ok {
 		if err := toUpstream(upstreamCache); err != nil {
-			s.gen.Add(1)
+			written()
 			c.invalidate(ctx, key)
 			return err
 		}
 	}
 
-	// Bumped after the upstream write: a backfill that read the upstream before
-	// it took a gen older than this, so it is skipped once this lock is released.
-	s.gen.Add(1)
+	written()
 	if err := toLayer(); err != nil {
 		c.invalidate(ctx, key)
 		return err
 	}
 	return nil
+}
+
+// dropFlights releases the in-flight fetches of key (every fetch slot) without
+// interrupting them: callers already waiting still get their result.
+func (c *Client[T]) dropFlights(key string) {
+	if c.fetchConcurrency <= 1 {
+		c.flights.drop(key)
+		return
+	}
+	for i := range c.fetchConcurrency {
+		c.flights.drop(fmt.Sprintf("%d:%s", i, key))
+	}
 }
 
 // invalidate drops this layer's entry and cached not-found for key, best
