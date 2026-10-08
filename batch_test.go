@@ -9,6 +9,7 @@ import (
 	"maps"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1092,6 +1093,61 @@ func TestClientGetManyRefreshOfManyKeysLogsNoFalseFailures(t *testing.T) {
 		return true
 	}, 2*time.Second, 5*time.Millisecond, "every key is refreshed, each within its own fetch timeout")
 	assert.NotContains(t, logBuf.String(), "async refresh failed")
+}
+
+func TestClientGetNotFoundCacheFailureKeepsBackendWrites(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a found value is still cached", func(t *testing.T) {
+		backend := NewSyncMap[string]()
+		notFound := keyFailingCache[time.Time]{m: NewSyncMap[time.Time](), bad: "k"}
+		cli := NewClient(backend, UpstreamFunc[string](func(context.Context, string) (string, error) { return "v", nil }),
+			NotFoundWithTTL[string](notFound, time.Hour, 0))
+		v, err := cli.Get(ctx, "k")
+		require.NoError(t, err)
+		assert.Equal(t, "v", v)
+		v, err = backend.Get(ctx, "k")
+		require.NoError(t, err, "like GetMany, a failed not-found cleanup does not stop the backend write")
+		assert.Equal(t, "v", v)
+	})
+
+	t.Run("a key gone upstream is still deleted from the backend", func(t *testing.T) {
+		backend := NewSyncMap[string]()
+		require.NoError(t, backend.Set(ctx, "k", "old"))
+		notFound := keyFailingCache[time.Time]{m: NewSyncMap[time.Time](), bad: "k"}
+		cli := NewClient(backend, UpstreamFunc[string](func(context.Context, string) (string, error) { return "", &ErrKeyNotFound{} }),
+			NotFoundWithTTL[string](notFound, time.Hour, 0),
+			WithStale[string](func(string) State { return StateRotten }))
+		_, err := cli.Get(ctx, "k")
+		require.True(t, IsErrKeyNotFound(err))
+		_, err = backend.Get(ctx, "k")
+		assert.True(t, IsErrKeyNotFound(err), "like GetMany, the old value goes even if no not-found was recorded")
+	})
+}
+
+func TestClientGetManyBatchRefreshThatTimesOutIsLogged(t *testing.T) {
+	ctx := context.Background()
+	clock := NewMockClock(time.Now())
+	defer clock.Install()()
+	backend := NewSyncMap[*Entry[string]]()
+	require.NoError(t, backend.Set(ctx, "k", &Entry[string]{Data: "old", CachedAt: NowFunc()}))
+	clock.Advance(2 * time.Minute) // stale
+	var logBuf syncBuffer
+	up := batchUpstreamFunc[*Entry[string]](func(ctx context.Context, _ []string) (map[string]*Entry[string], error) {
+		<-ctx.Done() // hangs until its fetch timeout
+		return nil, ctx.Err()
+	})
+	cli := NewClient(backend, up,
+		EntryWithTTL[string](time.Minute, time.Hour),
+		WithServeStale[*Entry[string]](true),
+		WithFetchTimeout[*Entry[string]](50*time.Millisecond),
+		WithLogger[*Entry[string]](slog.New(slog.NewTextHandler(&logBuf, nil))))
+
+	got, err := cli.GetMany(ctx, []string{"k"})
+	require.NoError(t, err)
+	assert.Equal(t, "old", got["k"].Data)
+	require.Eventually(t, func() bool { return strings.Contains(logBuf.String(), "async refresh") },
+		2*time.Second, 5*time.Millisecond, "a refresh that never finishes in time is not silent")
 }
 
 func TestRedisCacheGetManyPerKeyErrors(t *testing.T) {

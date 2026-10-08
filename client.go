@@ -2,6 +2,7 @@ package cachex
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -200,18 +201,19 @@ func (c *Client[T]) Del(ctx context.Context, key string) error {
 	return nil
 }
 
+// delWithoutUpstream records a not-found and deletes the backend entry; a
+// failed not-found write does not keep the old value.
 func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
+	var errs []error
 	if c.notFoundCache != nil {
 		if err := c.notFoundCache.Set(ctx, key, NowFunc()); err != nil {
-			return errors.Wrapf(err, "failed to set notFoundCache for key: %s", key)
+			errs = append(errs, errors.Wrapf(err, "failed to set notFoundCache for key: %s", key))
 		}
 	}
-
 	if err := c.backend.Del(ctx, key); err != nil {
-		return errors.Wrapf(err, "delete from backend failed for key: %s", key)
+		errs = append(errs, errors.Wrapf(err, "delete from backend failed for key: %s", key))
 	}
-
-	return nil
+	return stderrors.Join(errs...)
 }
 
 // Set stores a value in the cache and propagates through cache layers.
@@ -247,18 +249,19 @@ func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
 	return nil
 }
 
+// setWithoutUpstream clears a cached not-found and writes the backend; a failed
+// not-found cleanup does not stop the write, since reads check the backend first.
 func (c *Client[T]) setWithoutUpstream(ctx context.Context, key string, value T) error {
+	var errs []error
 	if c.notFoundCache != nil {
 		if err := c.notFoundCache.Del(ctx, key); err != nil {
-			return errors.Wrapf(err, "delete from notFoundCache failed for key: %s", key)
+			errs = append(errs, errors.Wrapf(err, "delete from notFoundCache failed for key: %s", key))
 		}
 	}
-
 	if err := c.backend.Set(ctx, key, value); err != nil {
-		return errors.Wrapf(err, "set in backend failed for key: %s", key)
+		errs = append(errs, errors.Wrapf(err, "set in backend failed for key: %s", key))
 	}
-
-	return nil
+	return stderrors.Join(errs...)
 }
 
 func (c *Client[T]) fetchFromUpstream(ctx context.Context, key string) (T, error) {

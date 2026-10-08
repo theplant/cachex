@@ -83,9 +83,10 @@ type result[T any] struct {
 //     one fetch timeout. Otherwise each key is fetched exactly as Get would
 //     (claimed only when its turn comes), at most WithGetManyConcurrency at a
 //     time, and a canceled GetMany starts no more keys.
-//   - Fetched values are written to the backend (SetMany if supported) and
-//     not-found keys to the not-found cache, without touching the upstream,
-//     exactly like Get.
+//   - Fetched values are written to the backend and not-found keys to the
+//     not-found cache, without touching the upstream, exactly like Get: in
+//     one SetMany/DelMany per batch with a BatchUpstream (if the backend is a
+//     BatchCache), key by key otherwise.
 //
 // The returned map holds only the keys that exist; keys that do not exist are
 // simply absent. If some keys failed (backend, upstream, or ctx errors), the
@@ -492,10 +493,14 @@ func (c *Client[T]) asyncRefreshMany(ctx context.Context, keys []string) {
 			defer cancel()
 		}
 		for i, r := range c.fetchMany(ctx, refreshKeys, sfKeys) {
-			if r.err == nil || IsErrKeyNotFound(r.err) || ctx.Err() != nil && stderrors.Is(r.err, ctx.Err()) {
-				continue // a key no longer waited for is still being fetched, not failed
+			switch {
+			case r.err == nil || IsErrKeyNotFound(r.err):
+			case ctx.Err() != nil && stderrors.Is(r.err, ctx.Err()):
+				// no longer waited for; it may still finish (or fail) on its own
+				c.logger.WarnContext(ctx, "async refresh not finished within the fetch timeout", "key", refreshKeys[i])
+			default:
+				c.logger.ErrorContext(ctx, "async refresh failed", "key", refreshKeys[i], "error", r.err)
 			}
-			c.logger.ErrorContext(ctx, "async refresh failed", "key", refreshKeys[i], "error", r.err)
 		}
 	}()
 }
