@@ -373,7 +373,7 @@ type BatchUpstream[T any] interface {
 type productSource struct{ db *gorm.DB }
 
 func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*cachex.Entry[*Product], error) {
-    var rows []*Product
+    var rows []*Product // for very large batches, query in chunks to stay under the bound-parameter limit
     if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
         return nil, err
     }
@@ -406,7 +406,7 @@ How `GetMany` works:
 2. **Not-Found cache**: misses are checked against it, exactly like `Get`.
 3. **Singleflight**: every key that needs the upstream is claimed in the **same** singleflight `Get` uses. Keys already being fetched by a `Get` or another `GetMany` are waited for, not fetched again; so a `Get` and a `GetMany` (or two overlapping `GetMany`s) fetch a shared key only once. `WithFetchConcurrency` applies per key as usual.
 4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get`.
-5. **Upstream**: if the upstream implements `BatchUpstream[T]`, the remaining keys are fetched with **one** `GetMany` call (one `WithFetchTimeout` for the whole call). Otherwise each key is fetched exactly as `Get` would (its own double-check, fetch timeout and write-back, and handed to its waiters as soon as it arrives), at most `WithGetManyConcurrency` (default 16) at a time.
+5. **Upstream**: if the upstream implements `BatchUpstream[T]`, the remaining keys are fetched with **one** `GetMany` call (one `WithFetchTimeout` for the whole call). Otherwise each key is fetched exactly as `Get` would (its own double-check, fetch timeout and write-back, and handed to its waiters as soon as it arrives), at most `WithGetManyConcurrency` (default 16) at a time; a key is claimed only when its turn comes, so a concurrent `Get` of a key still queued here does not wait for the queue, and a canceled `GetMany` starts no more keys.
 6. **Write back**: found values go to the backend (`SetMany` when supported), missing keys to the Not-Found cache. Like `Get`, this only touches this layer, never the upstream.
 
 `Client` implements `BatchUpstream[T]` itself, so in a layered setup a batch travels down as one call per layer: `l1Client.GetMany` → L1 batch read → `l2Client.GetMany` → L2 batch read → one database query.
@@ -417,7 +417,9 @@ How `GetMany` works:
 products, err := client.GetMany(ctx, ids)
 var batchErr *cachex.BatchError
 if errors.As(err, &batchErr) {
-    for id, err := range batchErr.Errors { /* id failed */ }
+    for id, err := range batchErr.Errors {
+        log.Printf("product %s failed: %v", id, err)
+    }
 }
 // products is usable either way
 ```

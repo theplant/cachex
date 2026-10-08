@@ -1,9 +1,11 @@
 package cachex
 
 import (
+	"bytes"
 	"context"
 	stderrors "errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"runtime"
 	"slices"
@@ -991,6 +993,107 @@ func TestClientGetManyCoverageGaps(t *testing.T) {
 	})
 }
 
+func TestClientGetManyPerKeyFallbackDoesNotQueueOthers(t *testing.T) {
+	keys := make([]string, 20)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k%02d", i)
+	}
+
+	t.Run("a Get of a key still queued in a GetMany does not wait for the queue", func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var calls atomic.Int32
+		up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+			if key == "k00" {
+				close(entered)
+				<-release
+			}
+			calls.Add(1)
+			return "v-" + key, nil
+		})
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](1))
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = cli.GetMany(context.Background(), keys)
+		}()
+		waitFor(t, entered) // the GetMany's only slot is busy with k00
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		v, err := cli.Get(ctx, "k19")
+		close(release)
+		<-done
+		require.NoError(t, err, "k19 is not claimed until the GetMany gets to it")
+		assert.Equal(t, "v-k19", v)
+	})
+
+	t.Run("a canceled GetMany starts no more fetches", func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var calls atomic.Int32
+		up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+			if calls.Add(1) == 1 {
+				close(entered)
+				<-release
+			}
+			return "v-" + key, nil
+		})
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](1))
+		ctx, cancel := context.WithCancel(context.Background())
+		errc := make(chan error, 1)
+		go func() {
+			_, err := cli.GetMany(ctx, keys)
+			errc <- err
+		}()
+		waitFor(t, entered)
+		cancel()
+		err := <-errc
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.Len(t, be.Errors, 20, "every key reports the cancellation")
+		close(release)
+		assert.Never(t, func() bool { return calls.Load() > 1 }, 100*time.Millisecond, 5*time.Millisecond,
+			"only the fetch already started runs on")
+	})
+}
+
+func TestClientGetManyRefreshOfManyKeysLogsNoFalseFailures(t *testing.T) {
+	ctx := context.Background()
+	keys := []string{"k0", "k1", "k2", "k3", "k4", "k5"}
+	backend := NewSyncMap[string]()
+	for _, k := range keys {
+		require.NoError(t, backend.Set(ctx, k, "old"))
+	}
+	var logBuf syncBuffer
+	up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+		time.Sleep(40 * time.Millisecond)
+		return "v-" + key, nil
+	})
+	cli := NewClient[string](backend, up,
+		WithStale[string](func(v string) State {
+			if v == "old" {
+				return StateStale
+			}
+			return StateFresh
+		}),
+		WithServeStale[string](true),
+		WithFetchTimeout[string](100*time.Millisecond), // each key fits, the six together do not
+		WithGetManyConcurrency[string](1),
+		WithLogger[string](slog.New(slog.NewTextHandler(&logBuf, nil))))
+
+	_, err := cli.GetMany(ctx, keys)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		got, _ := backend.GetMany(ctx, keys)
+		for _, k := range keys {
+			if got[k] != "v-"+k {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 5*time.Millisecond, "every key is refreshed, each within its own fetch timeout")
+	assert.NotContains(t, logBuf.String(), "async refresh failed")
+}
+
 func TestRedisCacheGetManyPerKeyErrors(t *testing.T) {
 	ctx := context.Background()
 	cache, mr := newRedisCache[string](t)
@@ -1211,4 +1314,22 @@ func TestClientGetManyReviewFixes2(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{"a": "1"}, got)
 	})
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger and a test to share.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

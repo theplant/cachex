@@ -372,7 +372,7 @@ type BatchUpstream[T any] interface {
 type productSource struct{ db *gorm.DB }
 
 func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*cachex.Entry[*Product], error) {
-    var rows []*Product
+    var rows []*Product // 批量很大时分块查询，免得超出数据库的绑定参数上限
     if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
         return nil, err
     }
@@ -405,7 +405,7 @@ client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick
 2. **Not-Found 缓存**：未命中的先查它，和 `Get` 一样。
 3. **Singleflight**：每个要回源的 key 都在和 `Get` **同一个** singleflight 里认领。已经有 `Get` 或别的 `GetMany` 在取的 key，等那次的结果，不再取一遍；所以 `Get` 和 `GetMany`（或两个有交集的 `GetMany`）同时要同一个 key，只回源一次。`WithFetchConcurrency` 照旧按 key 生效。
 4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存。
-5. **上游**：上游实现了 `BatchUpstream[T]`，剩下的 key 就调**一次** `GetMany`（整次调用共用一个 `WithFetchTimeout`）。否则每个 key 都和 `Get` 完全一样地拉取（各自 double check、各自超时、各自回填，拉到就交给等它的调用方），同时最多 `WithGetManyConcurrency` 个（默认 16）。
+5. **上游**：上游实现了 `BatchUpstream[T]`，剩下的 key 就调**一次** `GetMany`（整次调用共用一个 `WithFetchTimeout`）。否则每个 key 都和 `Get` 完全一样地拉取（各自 double check、各自超时、各自回填，拉到就交给等它的调用方），同时最多 `WithGetManyConcurrency` 个（默认 16）；每个 key 轮到时才认领，所以并发的 `Get` 碰上还在这里排队的 key 不用等整个队列，`GetMany` 被取消后也不再开始新的 key。
 6. **回填**：取到的值写回后端（支持就用 `SetMany`），不存在的 key 写进 Not-Found 缓存。和 `Get` 一样只写本层，不写上游。
 
 `Client` 自己也实现了 `BatchUpstream[T]`，所以多层缓存时一批 key 每层只走一次调用：`l1Client.GetMany` → L1 批量读 → `l2Client.GetMany` → L2 批量读 → 一次数据库查询。
@@ -416,7 +416,9 @@ client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick
 products, err := client.GetMany(ctx, ids)
 var batchErr *cachex.BatchError
 if errors.As(err, &batchErr) {
-    for id, err := range batchErr.Errors { /* id 失败了 */ }
+    for id, err := range batchErr.Errors {
+        log.Printf("product %s failed: %v", id, err)
+    }
 }
 // 不管有没有 err，products 都能用
 ```

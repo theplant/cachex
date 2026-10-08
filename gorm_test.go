@@ -222,3 +222,30 @@ func TestGORMCacheWithClientTransaction(t *testing.T) {
 	assert.True(t, IsErrKeyNotFound(err), "should not find value in cache after transaction rollback")
 	assert.Equal(t, 0, fetchCount, "should not fetch from upstream during rollback test")
 }
+
+func TestGORMCacheGetManyCaseInsensitiveKeyColumn(t *testing.T) {
+	// SQLite's NOCASE stands in for MySQL's default _ci collations
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TABLE ci (key TEXT COLLATE NOCASE PRIMARY KEY, value JSON NOT NULL, updated_at DATETIME)`).Error)
+	c := NewGORMCache[string](&GORMCacheConfig{DB: db, TableName: "ci", KeyPrefix: "p:"})
+	ctx := context.Background()
+	require.NoError(t, c.Set(ctx, "ABC", "v"))
+
+	v, err := c.Get(ctx, "abc")
+	require.NoError(t, err)
+	require.Equal(t, "v", v, "precondition: Get matches case-insensitively here")
+	got, err := c.GetMany(ctx, []string{"abc", "missing"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"abc": "v"}, got, "GetMany answers under the requested key, like Get")
+}
+
+func TestGORMCacheGetManyCaseSensitiveKeyColumn(t *testing.T) {
+	c, _ := newGORMCache[string](t, "cs")
+	ctx := context.Background()
+	require.NoError(t, c.Set(ctx, "abc", "lower"))
+	require.NoError(t, c.Set(ctx, "ABC", "upper"))
+	got, err := c.GetMany(ctx, []string{"abc", "ABC", "Abc"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"abc": "lower", "ABC": "upper"}, got, "distinct keys stay distinct")
+}

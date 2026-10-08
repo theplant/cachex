@@ -181,9 +181,37 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 		entries = append(entries, found...)
 	}
 
-	var keyErrs map[string]error
+	stored := make(map[string]cacheEntry, len(entries))
 	for _, entry := range entries {
-		key := strings.TrimPrefix(entry.Key, g.keyPrefix)
+		stored[entry.Key] = entry
+	}
+	var folded map[string]cacheEntry
+	var keyErrs map[string]error
+	for i, key := range keys {
+		entry, ok := stored[prefixed[i]]
+		if !ok && len(entries) > 0 {
+			// A case-insensitive key column (e.g. MySQL's default _ci collations)
+			// returns the row under its stored key; answer under the requested
+			// one, as Get does.
+			// Only rows no requested key matched exactly can be such rows; a
+			// case-sensitive column never returns them.
+			if folded == nil {
+				requested := make(map[string]bool, len(prefixed))
+				for _, p := range prefixed {
+					requested[p] = true
+				}
+				folded = map[string]cacheEntry{}
+				for _, e := range entries {
+					if !requested[e.Key] {
+						folded[strings.ToLower(e.Key)] = e
+					}
+				}
+			}
+			entry, ok = folded[strings.ToLower(prefixed[i])]
+		}
+		if !ok {
+			continue
+		}
 		var value T
 		if err := json.Unmarshal(entry.Value, &value); err != nil {
 			if keyErrs == nil {

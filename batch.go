@@ -80,8 +80,9 @@ type result[T any] struct {
 //     GetMany is waited for, not fetched again. If the upstream implements
 //     BatchUpstream, the keys this call claims are double-checked
 //     (WithDoubleCheck) and fetched together with one upstream.GetMany under
-//     one fetch timeout. Otherwise each claimed key is fetched exactly as Get
-//     would, at most WithGetManyConcurrency at a time.
+//     one fetch timeout. Otherwise each key is fetched exactly as Get would
+//     (claimed only when its turn comes), at most WithGetManyConcurrency at a
+//     time, and a canceled GetMany starts no more keys.
 //   - Fetched values are written to the backend (SetMany if supported) and
 //     not-found keys to the not-found cache, without touching the upstream,
 //     exactly like Get.
@@ -236,9 +237,13 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 	return res
 }
 
-// fetchMany claims every key in the flight group, fetches the claimed ones as
-// one batch, and waits for all of them (including those claimed by others).
+// fetchMany fetches keys through the flight group. For a BatchUpstream it
+// claims every key, fetches the claimed ones as one batch, and waits for all
+// of them (including those claimed by others); otherwise see fetchEach.
 func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []result[T] {
+	if _, ok := c.upstream.(BatchUpstream[T]); !ok {
+		return c.fetchEach(ctx, keys, sfKeys)
+	}
 	flights := make([]*flight[T], len(keys))
 	var ownKeys, ownSFKeys []string
 	var ownFlights []*flight[T]
@@ -252,11 +257,7 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 		}
 	}
 	if len(ownKeys) > 0 {
-		if _, ok := c.upstream.(BatchUpstream[T]); ok {
-			go c.fetchClaimedMany(ctx, ownKeys, ownSFKeys, ownFlights)
-		} else {
-			go c.runClaimedEach(ctx, ownKeys, ownSFKeys, ownFlights)
-		}
+		go c.fetchClaimedMany(ctx, ownKeys, ownSFKeys, ownFlights)
 	}
 
 	results := make([]result[T], len(keys))
@@ -275,18 +276,31 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 	return results
 }
 
-// runClaimedEach fetches claimed keys from an upstream without batch support:
-// each key exactly as Get would (own double-check, fetch timeout, write-back,
-// published as soon as it is done), at most getManyConc at a time.
-func (c *Client[T]) runClaimedEach(ctx context.Context, keys, sfKeys []string, flights []*flight[T]) {
+// fetchEach fetches keys from an upstream without batch support, each exactly
+// as Get would, at most getManyConc at a time. A key is claimed only when its
+// turn comes, so a Get of a key still queued here does not wait for the queue,
+// and once ctx is done no more keys are started.
+func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string) []result[T] {
+	results := make([]result[T], len(keys))
 	sem := make(chan struct{}, c.getManyConc)
+	var wg sync.WaitGroup
 	for i, key := range keys {
-		sem <- struct{}{}
-		go func() {
-			defer func() { <-sem }()
-			c.runClaimed(ctx, key, sfKeys[i], flights[i])
-		}()
+		if ctx.Err() == nil {
+			select {
+			case sem <- struct{}{}:
+				wg.Go(func() {
+					defer func() { <-sem }()
+					value, err := c.fetchFromUpstreamWithSFKey(ctx, key, sfKeys[i])
+					results[i] = result[T]{value: value, err: err}
+				})
+				continue
+			case <-ctx.Done():
+			}
+		}
+		results[i].err = errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", key)
 	}
+	wg.Wait()
+	return results
 }
 
 // fetchClaimedMany is the batch form of fetchClaimed for a BatchUpstream:
@@ -468,14 +482,20 @@ func (c *Client[T]) asyncRefreshMany(ctx context.Context, keys []string) {
 				c.asyncRefreshing.Delete(sfKey)
 			}
 		}()
-		// Bound the wait: some keys may be fetched by other callers, and a fetch
-		// that never finishes (runtime.Goexit) must not pin the whole batch.
-		ctx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
-		defer cancel()
+		if _, ok := c.upstream.(BatchUpstream[T]); ok {
+			// Bound the wait: some keys may be fetched by other callers, and a
+			// fetch that never finishes (runtime.Goexit) must not pin the whole
+			// batch. Keys key by key need no bound: each has its own fetch
+			// timeout, as in Get's refresh.
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, c.fetchTimeout)
+			defer cancel()
+		}
 		for i, r := range c.fetchMany(ctx, refreshKeys, sfKeys) {
-			if r.err != nil && !IsErrKeyNotFound(r.err) {
-				c.logger.ErrorContext(ctx, "async refresh failed", "key", refreshKeys[i], "error", r.err)
+			if r.err == nil || IsErrKeyNotFound(r.err) || ctx.Err() != nil && stderrors.Is(r.err, ctx.Err()) {
+				continue // a key no longer waited for is still being fetched, not failed
 			}
+			c.logger.ErrorContext(ctx, "async refresh failed", "key", refreshKeys[i], "error", r.err)
 		}
 	}()
 }
