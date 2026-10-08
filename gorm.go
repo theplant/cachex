@@ -50,7 +50,7 @@ type cacheEntry struct {
 
 // GORMCacheConfig holds configuration for GORMCache. Keys are case-sensitive:
 // the key column should compare them exactly (Migrate creates MySQL tables with
-// utf8mb4_bin, which still ignores trailing spaces). Otherwise keys that the column considers equal share one row,
+// utf8mb4_0900_bin, so MySQL 8.0.17 or later is required). Otherwise keys that the column considers equal share one row,
 // served only to the key that wrote it last.
 type GORMCacheConfig struct {
 	// DB is the GORM database connection
@@ -87,9 +87,9 @@ func (g *GORMCache[T]) prefixedKey(key string) string {
 func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 	tx := cmp.Or(GetGORMTx(ctx), g.db).WithContext(ctx).Table(g.tableName)
 	if tx.Name() == "mysql" {
-		// keys are case-sensitive, MySQL's default collations are not; applies
+		// keys compare exactly (case, trailing spaces), MySQL's defaults do not; applies
 		// only when the table is created, an existing one is left as it is
-		tx = tx.Set("gorm:table_options", "CHARSET=utf8mb4 COLLATE=utf8mb4_bin")
+		tx = tx.Set("gorm:table_options", "CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin") // MySQL 8.0.17+
 	}
 	if err := tx.AutoMigrate(&cacheEntry{}); err != nil {
 		return errors.Wrapf(err, "failed to migrate cache table for table: %s", g.tableName)

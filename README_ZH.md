@@ -215,7 +215,7 @@ if err := cache.Migrate(ctx); err != nil {
 }
 ```
 
-缓存 key 区分大小写，所以 `key` 列应当精确比较。PostgreSQL 和 SQLite 默认如此；MySQL 上 `Migrate` 建表时会用 `utf8mb4_bin`（区分大小写；和所有 PAD SPACE 排序规则一样会忽略末尾空格，`"a"` 和 `"a "` 共用一行。如果这类 key 有影响，MySQL 8.0.17 以上可改用 `utf8mb4_0900_bin`）。在这之前建的表（或手工建的表）保留原来的排序规则，通常不区分大小写和重音（`*_ci`），可以用 `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` 转换。即使不转换也不会读到错的值：`GORMCache` 只返回 key 完全相等的那一行，只差大小写的几个 key 只会互相挤占这一行（多几次未命中）。
+缓存 key 区分大小写，所以 `key` 列应当精确比较。PostgreSQL 和 SQLite 默认如此；MySQL（需 8.0.17 及以上）上 `Migrate` 建表时会用 `utf8mb4_0900_bin`，大小写和末尾空格都精确比较。在这之前建的表（或手工建的表）保留原来的排序规则，通常不区分大小写和重音（`*_ci`），可以用 `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin` 转换。即使不转换也不会读到错的值：`GORMCache` 只返回 key 完全相等的那一行，只差大小写的几个 key 只会互相挤占这一行（多几次未命中）。
 
 ### 自定义缓存
 

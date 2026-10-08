@@ -82,6 +82,15 @@ func TestGORMCacheOnRealDatabases(t *testing.T) {
 				assert.Equal(t, "upper", v)
 			})
 
+			t.Run("keys differing only in trailing spaces are distinct", func(t *testing.T) {
+				c := newCache(t)
+				require.NoError(t, c.Set(ctx, "a", "plain"))
+				require.NoError(t, c.Set(ctx, "a ", "space"))
+				got, err := c.GetMany(ctx, []string{"a", "a "})
+				require.NoError(t, err)
+				assert.Equal(t, map[string]string{"a": "plain", "a ": "space"}, got)
+			})
+
 			if name == "mysql" {
 				t.Run("an existing case-insensitive table never serves another key's value", func(t *testing.T) {
 					table := "cache_legacy_ci"

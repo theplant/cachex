@@ -215,7 +215,7 @@ if err := cache.Migrate(ctx); err != nil {
 }
 ```
 
-Cache keys are case-sensitive, so the `key` column should compare them exactly. PostgreSQL and SQLite do by default, and on MySQL `Migrate` creates the table with `utf8mb4_bin` (case-sensitive; like any PAD SPACE collation it ignores trailing spaces, so `"a"` and `"a "` share a row — use `utf8mb4_0900_bin` on MySQL 8.0.17+ if such keys matter). A table created before that (or by hand) keeps its collation, usually case- and accent-insensitive (`*_ci`); convert it with `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`. Even without it nothing wrong is ever served: `GORMCache` only returns the row stored under exactly the requested key, so keys differing only in case just take the row over from each other (extra misses).
+Cache keys are case-sensitive, so the `key` column should compare them exactly. PostgreSQL and SQLite do by default, and on MySQL (8.0.17 or later) `Migrate` creates the table with `utf8mb4_0900_bin`, which compares case and trailing spaces exactly. A table created before that (or by hand) keeps its collation, usually case- and accent-insensitive (`*_ci`); convert it with `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`. Even without it nothing wrong is ever served: `GORMCache` only returns the row stored under exactly the requested key, so keys differing only in case just take the row over from each other (extra misses).
 
 ### Custom Cache
 
