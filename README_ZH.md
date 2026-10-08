@@ -354,6 +354,7 @@ products, err := client.GetMany(ctx, []string{"p1", "p2", "p3"})
 type BatchUpstream[T any] interface {
     // map 里没有的 key 视为不存在（相当于 Get 的 ErrKeyNotFound）。
     // 返回非 nil error 表示整批失败；如果是原样返回（没有再包一层）的 *cachex.BatchError，只有它列出的 key 失败。
+    // 整批失败的 error 即使包着 ErrKeyNotFound，也算所有 key 失败，不算不存在。
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }
 
@@ -378,7 +379,7 @@ func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*P
 2. **Not-Found 缓存**：未命中的先查它，和 `Get` 一样。
 3. **Singleflight**：每个要回源的 key 都在和 `Get` **同一个** singleflight 里认领。已经有 `Get` 或别的 `GetMany` 在取的 key，等那次的结果，不再取一遍；所以 `Get` 和 `GetMany`（或两个有交集的 `GetMany`）同时要同一个 key，只回源一次。`WithFetchConcurrency` 照旧按 key 生效。
 4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存。
-5. **上游**：剩下的 key，上游实现了 `BatchUpstream[T]` 就调**一次** `GetMany`，否则并发逐个 `Get`。
+5. **上游**：剩下的 key，上游实现了 `BatchUpstream[T]` 就调**一次** `GetMany`，否则并发逐个 `Get`，同时最多 `WithGetManyConcurrency` 个（默认 16）。
 6. **回填**：取到的值写回后端（支持就用 `SetMany`），不存在的 key 写进 Not-Found 缓存。和 `Get` 一样只写本层，不写上游。
 
 `Client` 自己也实现了 `BatchUpstream[T]`，所以多层缓存时一批 key 每层只走一次调用：`l1Client.GetMany` → L1 批量读 → `l2Client.GetMany` → L2 批量读 → 一次数据库查询。

@@ -80,7 +80,7 @@ type result[T any] struct {
 //     GetMany is waited for, not fetched again. The keys this call claims are
 //     double-checked (WithDoubleCheck) and then fetched together: one
 //     upstream.GetMany if the upstream implements BatchUpstream, otherwise
-//     concurrent upstream.Get calls.
+//     concurrent upstream.Get calls (at most WithGetManyConcurrency at a time).
 //   - Fetched values are written to the backend (SetMany if supported) and
 //     not-found keys to the not-found cache, without touching the upstream,
 //     exactly like Get.
@@ -308,9 +308,6 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 		}
 	}()
 
-	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
-	defer cancel()
-
 	checked := make([]int, 0, len(keys))
 	if c.enableDoubleCheck {
 		// like Get, the double-check reads with the request ctx
@@ -341,6 +338,9 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 	for j, i := range pending {
 		pendingKeys[j] = keys[i]
 	}
+	// like Get, the fetch timeout starts after the double-check
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
+	defer cancel()
 	for j, r := range c.doFetchMany(fetchCtx, pendingKeys) {
 		results[pending[j]] = r
 	}
@@ -354,8 +354,14 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 
 	if batch, ok := c.upstream.(BatchUpstream[T]); ok {
 		values, err := batch.GetMany(ctx, keys)
+		_, partial := err.(*BatchError) //nolint:errorlint // see errForKey
 		for i, key := range keys {
 			if kerr := errForKey(err, key); kerr != nil {
+				if !partial && IsErrKeyNotFound(kerr) {
+					// A whole-batch failure is not a not-found for every key, even if
+					// a not-found sits somewhere in its chain: keep only its message.
+					kerr = errors.New(kerr.Error())
+				}
 				results[i].err = errors.Wrapf(kerr, "get from upstream failed for key: %s", key)
 			} else if value, ok := values[key]; ok {
 				results[i].value = value
@@ -364,13 +370,14 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 			}
 		}
 	} else {
-		// ponytail: one goroutine per key, unbounded within a batch; add a limit if
-		// upstreams without batch support get hammered by large batches.
 		var wg sync.WaitGroup
+		sem := make(chan struct{}, c.getManyConc)
 		for i, key := range keys {
 			// overwritten on return; stays if the upstream calls runtime.Goexit
 			results[i].err = errors.Errorf("upstream fetch exited without returning for key: %s", key)
+			sem <- struct{}{}
 			wg.Go(func() {
+				defer func() { <-sem }()
 				results[i] = c.getFromUpstream(ctx, key)
 			})
 		}

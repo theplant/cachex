@@ -804,3 +804,83 @@ func TestRedisCacheSetManyEncodeErrorKeepsOthers(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, mr.Exists("ok"), "the encodable value is still written")
 }
+
+// slowSecondBatch is a SyncMap whose GetMany sleeps from the second call on
+// (the double-check), as if the backend were slow to answer it.
+type slowSecondBatch struct {
+	*SyncMap[string]
+	calls atomic.Int64
+	delay time.Duration
+}
+
+func (m *slowSecondBatch) GetMany(ctx context.Context, keys []string) (map[string]string, error) {
+	if m.calls.Add(1) > 1 {
+		time.Sleep(m.delay)
+	}
+	return m.SyncMap.GetMany(ctx, keys)
+}
+
+func TestClientGetManyReviewFixes2(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("the per-key fallback fetches at most WithGetManyConcurrency keys at once", func(t *testing.T) {
+		var cur, peak atomic.Int64
+		up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+			n := cur.Add(1)
+			for {
+				p := peak.Load()
+				if n <= p || peak.CompareAndSwap(p, n) {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+			cur.Add(-1)
+			return key, nil
+		})
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](4))
+		keys := make([]string, 50)
+		for i := range keys {
+			keys[i] = fmt.Sprintf("k%d", i)
+		}
+		got, err := cli.GetMany(ctx, keys)
+		require.NoError(t, err)
+		assert.Len(t, got, 50)
+		assert.LessOrEqual(t, peak.Load(), int64(4))
+		assert.Greater(t, peak.Load(), int64(1), "still concurrent")
+	})
+
+	t.Run("a whole-batch error that contains a not-found is a failure, not a not-found", func(t *testing.T) {
+		notFound := NewSyncMap[time.Time]()
+		up := batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
+			return nil, stderrors.Join(errors.New("conn reset"), &ErrKeyNotFound{})
+		})
+		cli := NewClient(NewSyncMap[string](), up, NotFoundWithTTL[string](notFound, time.Hour, 0))
+
+		got, err := cli.GetMany(ctx, []string{"a", "b"})
+		assert.Empty(t, got)
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.Len(t, be.Errors, 2)
+		for _, kerr := range be.Errors {
+			assert.False(t, IsErrKeyNotFound(kerr), "a whole-batch failure must not read as not-found")
+		}
+		_, err = notFound.Get(ctx, "a")
+		assert.True(t, IsErrKeyNotFound(err), "no not-found is cached for a key the upstream never answered")
+	})
+
+	t.Run("the fetch timeout starts after the double-check, like Get", func(t *testing.T) {
+		backend := &slowSecondBatch{SyncMap: NewSyncMap[string](), delay: 100 * time.Millisecond}
+		up := batchUpstreamFunc[string](func(ctx context.Context, keys []string) (map[string]string, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return map[string]string{"a": "1"}, nil
+		})
+		cli := NewClient[string](backend, up,
+			WithDoubleCheck[string](DoubleCheckEnabled),
+			WithFetchTimeout[string](50*time.Millisecond))
+		got, err := cli.GetMany(ctx, []string{"a"})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"a": "1"}, got)
+	})
+}

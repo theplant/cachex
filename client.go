@@ -15,7 +15,10 @@ import (
 var (
 	DefaultFetchTimeout     = 60 * time.Second
 	DefaultFetchConcurrency = 1
-	NowFunc                 = time.Now
+	// DefaultGetManyConcurrency bounds the concurrent upstream.Get calls of one
+	// GetMany when the upstream does not implement BatchUpstream.
+	DefaultGetManyConcurrency = 16
+	NowFunc                   = time.Now
 )
 
 // Client manages cache operations with automatic upstream fetching
@@ -30,6 +33,7 @@ type Client[T any] struct {
 	serveStale       bool
 	fetchTimeout     time.Duration
 	fetchConcurrency int
+	getManyConc      int
 	logger           *slog.Logger
 
 	flights         flightGroup[T]
@@ -63,6 +67,7 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		upstream:         upstream,
 		fetchTimeout:     DefaultFetchTimeout,
 		fetchConcurrency: DefaultFetchConcurrency,
+		getManyConc:      DefaultGetManyConcurrency,
 		logger:           slog.Default(),
 		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
 	}
@@ -80,6 +85,9 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 	}
 	if c.fetchConcurrency <= 0 {
 		panic("fetchConcurrency must be positive")
+	}
+	if c.getManyConc <= 0 {
+		panic("getManyConcurrency must be positive")
 	}
 
 	return c
@@ -468,6 +476,16 @@ func WithFetchTimeout[T any](timeout time.Duration) ClientOption[T] {
 func WithFetchConcurrency[T any](concurrency int) ClientOption[T] {
 	return func(c *Client[T]) {
 		c.fetchConcurrency = concurrency
+	}
+}
+
+// WithGetManyConcurrency sets the maximum number of concurrent upstream.Get
+// calls one GetMany makes for its missing keys when the upstream does not
+// implement BatchUpstream (default DefaultGetManyConcurrency). It does not
+// apply to a BatchUpstream, which gets one GetMany call.
+func WithGetManyConcurrency[T any](concurrency int) ClientOption[T] {
+	return func(c *Client[T]) {
+		c.getManyConc = concurrency
 	}
 }
 

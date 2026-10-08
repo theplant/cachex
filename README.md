@@ -355,6 +355,7 @@ type BatchUpstream[T any] interface {
     // Keys absent from the map do not exist (like ErrKeyNotFound for Get).
     // A non-nil error fails the whole batch, unless it is a *cachex.BatchError
     // returned as is (not wrapped), which fails only the keys it lists.
+    // A whole-batch error fails every key, even if it wraps an ErrKeyNotFound.
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }
 
@@ -379,7 +380,7 @@ How `GetMany` works:
 2. **Not-Found cache**: misses are checked against it, exactly like `Get`.
 3. **Singleflight**: every key that needs the upstream is claimed in the **same** singleflight `Get` uses. Keys already being fetched by a `Get` or another `GetMany` are waited for, not fetched again; so a `Get` and a `GetMany` (or two overlapping `GetMany`s) fetch a shared key only once. `WithFetchConcurrency` applies per key as usual.
 4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get`.
-5. **Upstream**: the remaining keys are fetched with **one** `GetMany` call if the upstream implements `BatchUpstream[T]`, otherwise with concurrent `Get` calls.
+5. **Upstream**: the remaining keys are fetched with **one** `GetMany` call if the upstream implements `BatchUpstream[T]`, otherwise with concurrent `Get` calls, at most `WithGetManyConcurrency` (default 16) at a time.
 6. **Write back**: found values go to the backend (`SetMany` when supported), missing keys to the Not-Found cache. Like `Get`, this only touches this layer, never the upstream.
 
 `Client` implements `BatchUpstream[T]` itself, so in a layered setup a batch travels down as one call per layer: `l1Client.GetMany` → L1 batch read → `l2Client.GetMany` → L2 batch read → one database query.
