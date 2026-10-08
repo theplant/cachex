@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -13,6 +12,13 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// upsertEntry also rewrites the key column, so on a key column that is not
+// byte-exact the row belongs to the key written last, never to another one.
+var upsertEntry = clause.OnConflict{
+	Columns:   []clause.Column{{Name: "key"}},
+	DoUpdates: clause.AssignmentColumns([]string{"key", "value", "updated_at"}),
+}
 
 // GORMCache is a cache implementation using GORM
 type GORMCache[T any] struct {
@@ -29,7 +35,10 @@ type cacheEntry struct {
 	UpdatedAt time.Time      `gorm:"not null;index"`
 }
 
-// GORMCacheConfig holds configuration for GORMCache
+// GORMCacheConfig holds configuration for GORMCache. Keys are case-sensitive:
+// give the key column a byte-exact collation (MySQL: *_bin). Otherwise keys
+// that the column considers equal share one row, served only to the key that
+// wrote it last.
 type GORMCacheConfig struct {
 	// DB is the GORM database connection
 	DB *gorm.DB
@@ -101,10 +110,7 @@ func (g *GORMCache[T]) Set(ctx context.Context, key string, value T) error {
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
 	if err := tx.WithContext(ctx).
 		Table(g.tableName).
-		Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "key"}},
-			UpdateAll: true,
-		}).
+		Clauses(upsertEntry).
 		Create(&entry).Error; err != nil {
 		return errors.Wrapf(err, "failed to set cache entry for key: %s", key)
 	}
@@ -126,6 +132,11 @@ func (g *GORMCache[T]) Get(ctx context.Context, key string) (T, error) {
 			return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in gorm cache for key: %s", key)
 		}
 		return zero, errors.Wrapf(err, "failed to get cache entry for key: %s", key)
+	}
+	if entry.Key != g.prefixedKey(key) {
+		// a key column that is not byte-exact (e.g. MySQL's _ci collations)
+		// matched another key's row
+		return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in gorm cache for key: %s", key)
 	}
 
 	var value T
@@ -185,30 +196,11 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 	for _, entry := range entries {
 		stored[entry.Key] = entry
 	}
-	var folded map[string]cacheEntry
 	var keyErrs map[string]error
 	for i, key := range keys {
+		// exact lookup: a key column that is not byte-exact (e.g. MySQL's _ci
+		// collations) can return another key's row, which is not this key's value
 		entry, ok := stored[prefixed[i]]
-		if !ok && len(entries) > 0 {
-			// A case-insensitive key column (e.g. MySQL's default _ci collations)
-			// returns the row under its stored key; answer under the requested
-			// one, as Get does.
-			// Only rows no requested key matched exactly can be such rows; a
-			// case-sensitive column never returns them.
-			if folded == nil {
-				requested := make(map[string]bool, len(prefixed))
-				for _, p := range prefixed {
-					requested[p] = true
-				}
-				folded = map[string]cacheEntry{}
-				for _, e := range entries {
-					if !requested[e.Key] {
-						folded[strings.ToLower(e.Key)] = e
-					}
-				}
-			}
-			entry, ok = folded[strings.ToLower(prefixed[i])]
-		}
 		if !ok {
 			continue
 		}
@@ -246,10 +238,7 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
 	if err := tx.WithContext(ctx).
 		Table(g.tableName).
-		Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "key"}},
-			UpdateAll: true,
-		}).
+		Clauses(upsertEntry).
 		CreateInBatches(&entries, gormBatchSize).Error; err != nil {
 		return errors.Wrap(err, "failed to set cache entries")
 	}

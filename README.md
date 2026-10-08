@@ -215,6 +215,8 @@ if err := cache.Migrate(ctx); err != nil {
 }
 ```
 
+Cache keys are case-sensitive, so the `key` column should compare byte for byte. PostgreSQL and SQLite do by default; on MySQL, `Migrate` creates a `varchar(255)` with the table's collation, usually case- and accent-insensitive (`*_ci`), so give the table or the column a `*_bin` collation (e.g. `utf8mb4_bin`). Without it nothing wrong is ever served: `GORMCache` only returns the row stored under exactly the requested key, so keys differing only in case just take the row over from each other (extra misses).
+
 ### Custom Cache
 
 Implement the `Cache[T]` interface:

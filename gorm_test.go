@@ -223,21 +223,43 @@ func TestGORMCacheWithClientTransaction(t *testing.T) {
 	assert.Equal(t, 0, fetchCount, "should not fetch from upstream during rollback test")
 }
 
-func TestGORMCacheGetManyCaseInsensitiveKeyColumn(t *testing.T) {
-	// SQLite's NOCASE stands in for MySQL's default _ci collations
+func TestGORMCacheNeverServesAnotherKeysValue(t *testing.T) {
+	// SQLite's NOCASE stands in for MySQL's default _ci collations, where "abc" and "ABC" are one row
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.Exec(`CREATE TABLE ci (key TEXT COLLATE NOCASE PRIMARY KEY, value JSON NOT NULL, updated_at DATETIME)`).Error)
 	c := NewGORMCache[string](&GORMCacheConfig{DB: db, TableName: "ci", KeyPrefix: "p:"})
 	ctx := context.Background()
-	require.NoError(t, c.Set(ctx, "ABC", "v"))
 
-	v, err := c.Get(ctx, "abc")
-	require.NoError(t, err)
-	require.Equal(t, "v", v, "precondition: Get matches case-insensitively here")
-	got, err := c.GetMany(ctx, []string{"abc", "missing"})
-	require.NoError(t, err)
-	assert.Equal(t, map[string]string{"abc": "v"}, got, "GetMany answers under the requested key, like Get")
+	requireMiss := func(key string) {
+		t.Helper()
+		_, err := c.Get(ctx, key)
+		assert.True(t, IsErrKeyNotFound(err), "Get(%q) must not see another key's row: %v", key, err)
+		got, err := c.GetMany(ctx, []string{key})
+		require.NoError(t, err)
+		assert.Empty(t, got, "GetMany(%q) must not see another key's row", key)
+	}
+	requireHit := func(key, want string) {
+		t.Helper()
+		v, err := c.Get(ctx, key)
+		require.NoError(t, err)
+		assert.Equal(t, want, v)
+		got, err := c.GetMany(ctx, []string{key})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{key: want}, got)
+	}
+
+	require.NoError(t, c.Set(ctx, "ABC", "upper"))
+	requireHit("ABC", "upper")
+	requireMiss("abc")
+
+	require.NoError(t, c.Set(ctx, "abc", "lower")) // takes the shared row over
+	requireHit("abc", "lower")
+	requireMiss("ABC")
+
+	require.NoError(t, c.SetMany(ctx, map[string]string{"ABC": "upper2"}))
+	requireHit("ABC", "upper2")
+	requireMiss("abc")
 }
 
 func TestGORMCacheGetManyCaseSensitiveKeyColumn(t *testing.T) {

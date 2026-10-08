@@ -215,6 +215,8 @@ if err := cache.Migrate(ctx); err != nil {
 }
 ```
 
+缓存 key 区分大小写，所以 `key` 列应当逐字节比较。PostgreSQL 和 SQLite 默认如此；MySQL 上 `Migrate` 建的是沿用表排序规则的 `varchar(255)`，通常不区分大小写和重音（`*_ci`），请给表或这一列设 `*_bin` 排序规则（例如 `utf8mb4_bin`）。不设也不会读到错的值：`GORMCache` 只返回 key 完全相等的那一行，只差大小写的几个 key 只会互相挤占这一行（多几次未命中）。
+
 ### 自定义缓存
 
 实现 `Cache[T]` 接口：
