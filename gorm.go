@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	stderrors "errors"
+	"math/rand/v2"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -13,6 +15,45 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+// gormDeadlockRetries is how many times a write chosen as a deadlock victim is
+// run in all. Writes take row locks in one order (sorted keys), but MySQL's gap
+// locks can still deadlock now and then, and InnoDB expects a retry.
+const gormDeadlockRetries = 5
+
+// write runs a write to the cache table, retrying it if the database aborts
+// it as a deadlock victim, unless it runs in the caller's transaction, which
+// the deadlock has already rolled back as a whole.
+func (g *GORMCache[T]) write(ctx context.Context, f func(tx *gorm.DB) error) error {
+	if tx := GetGORMTx(ctx); tx != nil {
+		return f(tx.WithContext(ctx))
+	}
+	for attempt := 1; ; attempt++ {
+		err := f(g.db.WithContext(ctx))
+		if !isDeadlock(err) || attempt == gormDeadlockRetries {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(1+rand.IntN(5*attempt)) * time.Millisecond):
+		}
+	}
+}
+
+// isDeadlock reports whether err aborted a statement as a deadlock victim:
+// SQLSTATE 40P01/40001 from PostgreSQL drivers (pgx, lib/pq), or MySQL error
+// 1213, matched by text since go-sql-driver's error has no SQLState method.
+func isDeadlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pg interface{ SQLState() string }
+	if stderrors.As(err, &pg) {
+		return pg.SQLState() == "40P01" || pg.SQLState() == "40001"
+	}
+	return strings.Contains(err.Error(), "Error 1213 (40001)")
+}
 
 // keyColumn is the key column as a clause, so GORM quotes it: "key" is a
 // reserved word in MySQL.
@@ -125,11 +166,9 @@ func (g *GORMCache[T]) Set(ctx context.Context, key string, value T) error {
 		Value: data,
 	}
 
-	tx := cmp.Or(GetGORMTx(ctx), g.db)
-	if err := tx.WithContext(ctx).
-		Table(g.tableName).
-		Clauses(upsertEntry).
-		Create(&entry).Error; err != nil {
+	if err := g.write(ctx, func(tx *gorm.DB) error {
+		return tx.Table(g.tableName).Clauses(upsertEntry).Create(&entry).Error
+	}); err != nil {
 		return errors.Wrapf(err, "failed to set cache entry for key: %s", key)
 	}
 
@@ -167,11 +206,9 @@ func (g *GORMCache[T]) Get(ctx context.Context, key string) (T, error) {
 
 // Del removes a value from the cache
 func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
-	tx := cmp.Or(GetGORMTx(ctx), g.db)
-	if err := tx.WithContext(ctx).
-		Table(g.tableName).
-		Where(clause.Eq{Column: keyColumn, Value: g.prefixedKey(key)}).
-		Delete(nil).Error; err != nil {
+	if err := g.write(ctx, func(tx *gorm.DB) error {
+		return tx.Table(g.tableName).Where(clause.Eq{Column: keyColumn, Value: g.prefixedKey(key)}).Delete(nil).Error
+	}); err != nil {
 		return errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
 	}
 	return nil
@@ -261,11 +298,9 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 	// opposite orders and deadlock (MySQL, PostgreSQL)
 	slices.SortFunc(entries, func(a, b cacheEntry) int { return cmp.Compare(a.Key, b.Key) })
 
-	tx := cmp.Or(GetGORMTx(ctx), g.db)
-	if err := tx.WithContext(ctx).
-		Table(g.tableName).
-		Clauses(upsertEntry).
-		CreateInBatches(&entries, gormBatchSize).Error; err != nil {
+	if err := g.write(ctx, func(tx *gorm.DB) error {
+		return tx.Table(g.tableName).Clauses(upsertEntry).CreateInBatches(&entries, gormBatchSize).Error
+	}); err != nil {
 		return errors.Wrap(err, "failed to set cache entries")
 	}
 	return stderrors.Join(encodeErrs...)
@@ -282,12 +317,21 @@ func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
 		prefixed[i] = g.prefixedKey(key)
 	}
 
-	tx := cmp.Or(GetGORMTx(ctx), g.db)
 	for chunk := range slices.Chunk(prefixed, gormBatchSize) {
-		if err := tx.WithContext(ctx).
-			Table(g.tableName).
-			Where(clause.IN{Column: keyColumn, Values: anys(chunk)}).
-			Delete(nil).Error; err != nil {
+		if err := g.write(ctx, func(tx *gorm.DB) error {
+			in := clause.IN{Column: keyColumn, Values: anys(chunk)}
+			if tx.Name() != "postgres" {
+				return tx.Table(g.tableName).Where(in).Delete(nil).Error
+			}
+			// DELETE locks rows in scan order, which follows the column's
+			// collation (often en_US), not SetMany's byte order: lock them in
+			// byte order first, or the two deadlock each other
+			locked := tx.Session(&gorm.Session{NewDB: true}).Table(g.tableName).
+				Select("?", keyColumn).Where(in).
+				Order(clause.OrderBy{Expression: clause.Expr{SQL: `? COLLATE "C"`, Vars: []any{keyColumn}, WithoutParentheses: true}}).
+				Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate})
+			return tx.Table(g.tableName).Where("? IN (?)", keyColumn, locked).Delete(nil).Error
+		}); err != nil {
 			return errors.Wrap(err, "failed to delete cache entries")
 		}
 	}

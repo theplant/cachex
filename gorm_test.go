@@ -5,8 +5,10 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -308,4 +310,43 @@ func TestGORMCacheSetManyKeepsTheValuesThatEncode(t *testing.T) {
 	v, err := cache.Get(ctx, "ok")
 	require.NoError(t, err, "like RedisCache, the others are still written")
 	assert.Equal(t, num{1}, v)
+}
+
+// sqlStateError mimics a pgx/lib/pq error.
+type sqlStateError string
+
+func (e sqlStateError) Error() string    { return "ERROR: (SQLSTATE " + string(e) + ")" }
+func (e sqlStateError) SQLState() string { return string(e) }
+
+func TestIsDeadlock(t *testing.T) {
+	assert.True(t, isDeadlock(errors.Wrap(sqlStateError("40P01"), "x")), "PostgreSQL deadlock")
+	assert.True(t, isDeadlock(sqlStateError("40001")), "serialization failure")
+	assert.True(t, isDeadlock(errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")), "MySQL deadlock")
+	assert.False(t, isDeadlock(sqlStateError("23505")))
+	assert.False(t, isDeadlock(errors.New("Error 1205 (HY000): Lock wait timeout exceeded")))
+	assert.False(t, isDeadlock(nil))
+}
+
+func TestGORMCacheRetriesDeadlockVictims(t *testing.T) {
+	cache, db := newGORMCache[string](t, "retry")
+	ctx := context.Background()
+	var fails atomic.Int32
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:deadlock", func(tx *gorm.DB) {
+		if fails.Add(-1) >= 0 {
+			_ = tx.AddError(sqlStateError("40P01"))
+		}
+	}))
+
+	fails.Store(2)
+	require.NoError(t, cache.Set(ctx, "k", "v"), "a deadlock victim is retried")
+	v, err := cache.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "v", v)
+
+	fails.Store(100)
+	assert.True(t, isDeadlock(cache.SetMany(ctx, map[string]string{"k": "v2"})), "retries are bounded")
+
+	fails.Store(1)
+	err = db.Transaction(func(tx *gorm.DB) error { return cache.Set(WithGORMTx(ctx, tx), "k", "v3") })
+	assert.True(t, isDeadlock(err), "inside the caller's transaction, which the deadlock rolled back, nothing is retried")
 }

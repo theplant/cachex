@@ -3,6 +3,7 @@ package cachex
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"testing"
 
@@ -119,6 +120,39 @@ func TestGORMCacheOnRealDatabases(t *testing.T) {
 				for range 8 {
 					wg.Go(func() {
 						for range 5 {
+							assert.NoError(t, c.SetMany(ctx, values))
+						}
+					})
+				}
+				wg.Wait()
+			})
+
+			t.Run("concurrent SetMany and DelMany do not deadlock", func(t *testing.T) {
+				// mixed case: byte order differs from PostgreSQL's default en_US
+				// collation, which once made DELETE lock rows in another order
+				c := newCache(t)
+				keys := make([]string, 400)
+				for i := range keys {
+					keys[i] = fmt.Sprintf("%c%03d", "aBcD"[i%4], i)
+				}
+				var wg sync.WaitGroup
+				for w := range 8 {
+					wg.Go(func() {
+						for round := range 20 {
+							r := rand.New(rand.NewPCG(uint64(w), uint64(round)))
+							pick := r.Perm(len(keys))[:100]
+							if round%3 == 0 {
+								sub := make([]string, len(pick))
+								for i, j := range pick {
+									sub[i] = keys[j]
+								}
+								assert.NoError(t, c.DelMany(ctx, sub))
+								continue
+							}
+							values := map[string]string{}
+							for _, j := range pick {
+								values[keys[j]] = "v"
+							}
 							assert.NoError(t, c.SetMany(ctx, values))
 						}
 					})

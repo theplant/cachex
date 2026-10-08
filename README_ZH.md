@@ -217,6 +217,8 @@ if err := cache.Migrate(ctx); err != nil {
 
 缓存 key 区分大小写，所以 `key` 列应当精确比较。PostgreSQL 和 SQLite 默认如此；MySQL（需 8.0.17 及以上）上 `Migrate` 建表时会用 `utf8mb4_0900_bin`，大小写和末尾空格都精确比较。在这之前建的表（或手工建的表）保留原来的排序规则，通常不区分大小写和重音（`*_ci`），可以用 `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin` 转换。即使不转换也不会读到错的值：`GORMCache` 只返回 key 完全相等的那一行，只差大小写的几个 key 只会互相挤占这一行（多几次未命中）。
 
+并发的批量写入（多个实例的 `GetMany` 回填）按同一顺序锁行，彼此不会死锁；数据库仍判为死锁牺牲者的写入（MySQL 的间隙锁可能导致）会重试几次。通过 `WithGORMTx` 传入的事务里不重试，因为死锁已经回滚了整个事务，直接返回错误。
+
 ### 自定义缓存
 
 实现 `Cache[T]` 接口：
