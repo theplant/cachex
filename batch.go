@@ -401,14 +401,27 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 		}
 	}
 
-	// The batch form of backfill: skip keys written since their gen was taken,
-	// and undo the ones written while the backfill ran.
-	written := func(i int) bool { return c.stripe(keys[i]).gen.Load() != gens[i] }
+	// The batch form of backfill: hold each key's stripe for reading (TryRLock
+	// never blocks, so no lock order is needed) and skip the keys whose stripe
+	// has a write in progress or whose gen moved since it was taken.
+	held := map[*writeStripe]bool{}
+	defer func() {
+		for s, ok := range held {
+			if ok {
+				s.mu.RUnlock()
+			}
+		}
+	}()
 	found := map[string]T{}
 	var notFound []string
-	var filled []int
 	for i, key := range keys {
-		if written(i) {
+		s := c.stripe(key)
+		ok, seen := held[s]
+		if !seen {
+			ok = s.mu.TryRLock()
+			held[s] = ok
+		}
+		if !ok || s.gen.Load() != gens[i] {
 			continue
 		}
 		switch {
@@ -416,21 +429,13 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 			found[key] = results[i].value
 		case IsErrKeyNotFound(results[i].err):
 			notFound = append(notFound, key)
-		default:
-			continue
 		}
-		filled = append(filled, i)
 	}
 	if err := c.setManyWithoutUpstream(ctx, found); err != nil {
 		c.logger.WarnContext(ctx, "failed to set cache entries", "error", err)
 	}
 	if err := c.delManyWithoutUpstream(ctx, notFound); err != nil {
 		c.logger.WarnContext(ctx, "failed to delete cache entries", "error", err)
-	}
-	for _, i := range filled {
-		if written(i) {
-			c.invalidate(ctx, keys[i])
-		}
 	}
 
 	return results

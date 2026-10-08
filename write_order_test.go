@@ -274,7 +274,7 @@ func TestBackfillDoesNotOverwriteAConcurrentSet(t *testing.T) {
 	})
 }
 
-func TestBackfillRacingASetIsUndone(t *testing.T) {
+func TestBackfillIsSerializedWithSet(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name string
@@ -291,17 +291,26 @@ func TestBackfillRacingASetIsUndone(t *testing.T) {
 			backend := newHookedCache()
 			cli := NewClient[string](backend, src)
 
-			// The backfill passes its check, then a Set completes before the
-			// backfill's own write lands.
+			// The backfill passes its check and is about to write "old" when a
+			// Set of "new" starts. Either the Set waits for the backfill, or the
+			// backfill lands after the Set returned and a reader sees "old".
 			backfillReached := make(chan struct{})
-			setDone := make(chan struct{})
+			release := make(chan struct{})
 			var first atomic.Bool
+			var setReturned atomic.Bool
+			var staleAfterSet atomic.Value
 			backend.beforeSet = func(_, value string) error {
 				if value == "old" && first.CompareAndSwap(false, true) {
 					close(backfillReached)
-					<-setDone
+					<-release
 				}
 				return nil
+			}
+			backend.afterSet = func(key, value string) {
+				if value == "old" && setReturned.Load() {
+					v, _ := cli.Get(ctx, key)
+					staleAfterSet.Store(v)
+				}
 			}
 
 			done := make(chan struct{})
@@ -313,15 +322,49 @@ func TestBackfillRacingASetIsUndone(t *testing.T) {
 			}()
 			<-backfillReached
 			src.write("k", "new")
-			require.NoError(t, cli.Set(ctx, "k", "new"))
-			close(setDone)
+			setDone := make(chan struct{})
+			go func() {
+				defer close(setDone)
+				assert.NoError(t, cli.Set(ctx, "k", "new"))
+				setReturned.Store(true)
+			}()
+			select {
+			case <-setDone:
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(release)
 			<-done
+			<-setDone
 
+			assert.Nil(t, staleAfterSet.Load(), "no reader sees the old value after Set returned")
 			v, err := cli.Get(ctx, "k")
 			require.NoError(t, err)
-			assert.Equal(t, "new", v, "the late backfill is undone, so the next read sees the new value")
+			assert.Equal(t, "new", v)
 		})
 	}
+}
+
+// ctxCache is a SyncMap whose Del, like Redis or GORM, refuses a done ctx.
+type ctxCache struct{ *SyncMap[string] }
+
+func (c ctxCache) Del(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.SyncMap.Del(ctx, key)
+}
+
+func TestFailedWriteInvalidatesWithACanceledCtx(t *testing.T) {
+	backend := ctxCache{NewSyncMap[string]()}
+	require.NoError(t, backend.Set(context.Background(), "k", "old"))
+	up := newHookedCache()
+	up.beforeSet = func(string, string) error { return context.Canceled }
+	cli := NewClient[string](backend, up)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, cli.Set(ctx, "k", "new"), context.Canceled)
+	assertMissing(t, backend, "k", "the cleanup does not reuse the canceled ctx")
 }
 
 func TestInterleavedSetsKeepLayersConsistent(t *testing.T) {

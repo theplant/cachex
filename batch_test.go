@@ -1204,6 +1204,7 @@ func (m *missFirstBatch) GetMany(ctx context.Context, keys []string) (map[string
 type hookedCache struct {
 	m         *SyncMap[string]
 	beforeSet func(key, value string) error
+	afterSet  func(key, value string)
 	beforeDel func(key string) error
 }
 
@@ -1217,7 +1218,13 @@ func (h *hookedCache) Set(ctx context.Context, key, value string) error {
 			return err
 		}
 	}
-	return h.m.Set(ctx, key, value)
+	if err := h.m.Set(ctx, key, value); err != nil {
+		return err
+	}
+	if h.afterSet != nil {
+		h.afterSet(key, value)
+	}
+	return nil
 }
 
 func (h *hookedCache) Del(ctx context.Context, key string) error {

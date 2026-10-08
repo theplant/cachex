@@ -195,7 +195,8 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 // This supports both write-through and cache-aside patterns, as the chain
 // naturally terminates when upstream is not a Cache[T] implementation.
 //
-// Order: the upstream is deleted first, then this layer. If the upstream
+// Order: the upstream is deleted first, then this layer, so until this layer's
+// delete lands its readers still see the deleted value. If the upstream
 // delete fails, this layer's entry is still dropped but no not-found is
 // cached, since the upstream may still hold the key.
 func (c *Client[T]) Del(ctx context.Context, key string) error {
@@ -245,8 +246,9 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 // The type-based propagation automatically handles both write-through (multi-level caches)
 // and cache-aside (with data source) patterns correctly.
 //
-// Order: the upstream is written first, then this layer, so this layer never
-// holds a value the layer below does not. If the upstream write fails, its
+// Order: the upstream is written first, then this layer, so a new value never
+// shows up here before it is below; until this layer's write lands, readers of
+// this layer still see the old value. If the upstream write fails, its
 // state is unknown (it may have been applied and only the reply lost), so this
 // layer's entry is dropped and the next read goes down. Concurrent writes to
 // one key through the same Client are applied one at a time, in the same order
@@ -272,7 +274,7 @@ const writeStripeCount = 1024
 
 // writeStripe orders writes and backfills of the keys that hash to it.
 type writeStripe struct {
-	mu  sync.Mutex    // serializes Set/Del, so all layers apply them in one order
+	mu  sync.RWMutex  // Set/Del hold it, so all layers apply them in one order; backfills hold it for reading
 	gen atomic.Uint64 // bumped by every Set/Del, checked by backfills
 }
 
@@ -295,9 +297,8 @@ func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache
 		}
 	}
 
-	// Bumped after the upstream write and before this layer's: a backfill that
-	// read the upstream before the write either lands before this layer's
-	// write (and is overwritten) or sees the bump (and is skipped or undone).
+	// Bumped after the upstream write: a backfill that read the upstream before
+	// it took a gen older than this, so it is skipped once this lock is released.
 	s.gen.Add(1)
 	if err := toLayer(); err != nil {
 		c.invalidate(ctx, key)
@@ -306,8 +307,12 @@ func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache
 	return nil
 }
 
-// invalidate drops this layer's entry and cached not-found for key, best effort.
+// invalidate drops this layer's entry and cached not-found for key, best
+// effort. It runs after a failed write, often failed by ctx itself, so it does
+// not reuse ctx's cancellation.
 func (c *Client[T]) invalidate(ctx context.Context, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
+	defer cancel()
 	if c.notFoundCache != nil {
 		if err := c.notFoundCache.Del(ctx, key); err != nil {
 			c.logger.WarnContext(ctx, "failed to invalidate notFoundCache entry", "key", key, "error", err)
@@ -319,19 +324,21 @@ func (c *Client[T]) invalidate(ctx context.Context, key string) {
 }
 
 // backfill writes what a fetch read into this layer, unless a Set or Del of
-// the key happened since gen was taken (before reading the upstream). A
-// write that slips in between the check and the backfill is caught right
-// after, and the backfill is undone, leaving a miss rather than a stale value.
+// the key happened since gen was taken (before reading the upstream). It holds
+// the key's stripe for reading, so a write waits for it, and the fill either
+// lands before the write or is skipped. A write in progress skips it too
+// (TryRLock): reads never wait on writes, at the cost of a spare cache miss.
 func (c *Client[T]) backfill(ctx context.Context, key string, gen uint64, fill func() error, failMsg string) {
 	s := c.stripe(key)
+	if !s.mu.TryRLock() {
+		return
+	}
+	defer s.mu.RUnlock()
 	if s.gen.Load() != gen {
 		return
 	}
 	if err := fill(); err != nil {
 		c.logger.WarnContext(ctx, failMsg, "key", key, "error", err)
-	}
-	if s.gen.Load() != gen {
-		c.invalidate(ctx, key)
 	}
 }
 
