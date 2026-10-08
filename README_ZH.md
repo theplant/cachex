@@ -231,7 +231,10 @@ type Cache[T any] interface {
 ```go
 type BatchCache[T any] interface {
     Cache[T]
-    GetMany(ctx context.Context, keys []string) (map[string]T, error) // 不存在的 key 不出现在结果里
+    // 不存在的 key 不出现在结果里，不要用 ErrKeyNotFound 表示。
+    // 错误约定同下文的 BatchUpstream：除了原样返回的 *cachex.BatchError，
+    // 其他 error 都算所有 key 失败（不会当成全部未命中）。
+    GetMany(ctx context.Context, keys []string) (map[string]T, error)
     SetMany(ctx context.Context, values map[string]T) error
     DelMany(ctx context.Context, keys []string) error
 }
@@ -385,7 +388,7 @@ func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*P
 
 `Client` 自己也实现了 `BatchUpstream[T]`，所以多层缓存时一批 key 每层只走一次调用：`l1Client.GetMany` → L1 批量读 → `l2Client.GetMany` → L2 批量读 → 一次数据库查询。
 
-**错误**：返回的 map 总是包含所有成功的 key。有 key 失败（后端、上游或 context 出错）时，error 是 `*cachex.BatchError`，它的 `Errors` 按 key 列出各自的错误；`errors.Is`/`errors.As` 能穿透到每个 key 的错误。
+**错误**：返回的 map 总是包含所有成功的 key。有 key 失败（后端、上游或 context 出错）时，error 是 `*cachex.BatchError`，它的 `Errors` 按 key 列出各自的错误；`errors.Is`/`errors.As` 能穿透到每个 key 的错误。每个 key 的错误都是真正的失败，不会是「不存在」：不存在的 key 只是不出现在 map 里。
 
 ```go
 products, err := client.GetMany(ctx, ids)

@@ -729,6 +729,73 @@ func TestClientGetManyWholeBatchErrors(t *testing.T) {
 	})
 }
 
+// missThenFailBatchGet misses every key on its first GetMany and answers
+// later ones with err.
+type missThenFailBatchGet struct {
+	*SyncMap[string]
+	calls atomic.Int32
+	err   error
+}
+
+func (m *missThenFailBatchGet) GetMany(context.Context, []string) (map[string]string, error) {
+	if m.calls.Add(1) == 1 {
+		return map[string]string{}, nil
+	}
+	return nil, m.err
+}
+
+func TestClientGetManyWholeBatchErrorInterplay(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a failed double-check falls through to the upstream, even if the error looks like a cached not-found", func(t *testing.T) {
+		backend := &missThenFailBatchGet{SyncMap: NewSyncMap[string](), err: &ErrKeyNotFound{Cached: true, CacheState: StateFresh}}
+		up := &batchUpstream{data: map[string]string{"a": "1"}}
+		cli := NewClient[string](backend, up, WithDoubleCheck[string](DoubleCheckEnabled))
+
+		got, err := cli.GetMany(ctx, []string{"a"})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"a": "1"}, got, "like Get, a failed double-check is not an answer")
+		assert.Equal(t, int32(2), backend.calls.Load(), "precondition: the double-check ran")
+	})
+
+	t.Run("a Get that joins a failed batch fetch gets the failure, not a not-found", func(t *testing.T) {
+		conn := errors.New("conn reset")
+		entered, release := make(chan struct{}), make(chan struct{})
+		var calls atomic.Int32
+		up := batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
+			if calls.Add(1) == 1 {
+				close(entered)
+				<-release
+			}
+			return nil, stderrors.Join(conn, &ErrKeyNotFound{})
+		})
+		notFound := NewSyncMap[time.Time]()
+		cli := NewClient(NewSyncMap[string](), up, NotFoundWithTTL[string](notFound, time.Hour, 0))
+		var hooks hookCounts
+		hooks.install(cli, nil)
+
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, err := cli.GetMany(ctx, []string{"a"})
+			assert.ErrorIs(t, err, conn)
+		})
+		waitFor(t, entered) // GetMany owns the fetch of a
+		var getErr error
+		wg.Go(func() { _, getErr = cli.Get(ctx, "a") })
+		require.Eventually(t, func() bool { return hooks.before.Load() == 1 }, time.Second, time.Millisecond)
+		time.Sleep(50 * time.Millisecond) // let the Get join the flight
+		close(release)
+		wg.Wait()
+
+		assert.Equal(t, int32(1), calls.Load(), "the Get joined the batch's fetch")
+		require.Error(t, getErr)
+		assert.ErrorIs(t, getErr, conn)
+		assert.False(t, IsErrKeyNotFound(getErr))
+		_, err := notFound.Get(ctx, "a")
+		assert.True(t, IsErrKeyNotFound(err), "no not-found is cached")
+	})
+}
+
 func TestRedisCacheGetManyPerKeyErrors(t *testing.T) {
 	ctx := context.Background()
 	cache, mr := newRedisCache[string](t)

@@ -231,7 +231,10 @@ Optionally implement `BatchCache[T]` as well, so `Client.GetMany` reads and writ
 ```go
 type BatchCache[T any] interface {
     Cache[T]
-    GetMany(ctx context.Context, keys []string) (map[string]T, error) // missing keys are absent
+    // Missing keys are absent from the map; do not report them as ErrKeyNotFound.
+    // Errors follow BatchUpstream below: any error other than an unwrapped
+    // *cachex.BatchError fails every key (it is not read as all misses).
+    GetMany(ctx context.Context, keys []string) (map[string]T, error)
     SetMany(ctx context.Context, values map[string]T) error
     DelMany(ctx context.Context, keys []string) error
 }
@@ -386,7 +389,7 @@ How `GetMany` works:
 
 `Client` implements `BatchUpstream[T]` itself, so in a layered setup a batch travels down as one call per layer: `l1Client.GetMany` → L1 batch read → `l2Client.GetMany` → L2 batch read → one database query.
 
-**Errors**: the returned map always holds every key that succeeded. If some keys failed (backend, upstream or context errors), the error is a `*cachex.BatchError` whose `Errors` map lists them by key; `errors.Is`/`errors.As` see through it to the per-key errors.
+**Errors**: the returned map always holds every key that succeeded. If some keys failed (backend, upstream or context errors), the error is a `*cachex.BatchError` whose `Errors` map lists them by key; `errors.Is`/`errors.As` see through it to the per-key errors. A per-key error is always a real failure, never a not-found: keys that do not exist are just absent from the map.
 
 ```go
 products, err := client.GetMany(ctx, ids)

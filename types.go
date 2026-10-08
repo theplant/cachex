@@ -49,6 +49,8 @@ type BatchUpstream[T any] interface {
 // BatchCache is an optional interface for a Cache that can read and write many
 // keys in one call. Client.GetMany uses it for the backend and the not-found
 // cache when available, and falls back to Get/Set/Del per key otherwise.
+// Its GetMany follows the BatchUpstream contract: missing keys are absent, and
+// a whole-batch error is a failure of every key, not a batch of misses.
 type BatchCache[T any] interface {
 	Cache[T]
 	BatchUpstream[T]
