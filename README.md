@@ -14,7 +14,7 @@
 - **🚫 Cache Penetration Defense** - Not-Found caching mechanism prevents malicious queries from overwhelming the database
 - **🔄 Serve-Stale** - Serves stale data while asynchronously refreshing, ensuring high availability and low latency
 - **🎪 Layered Caching** - Flexible multi-level caching (L1 Memory + L2 Redis), Client can also be used as upstream
-- **📦 Batch Reads** - `GetMany` reads many keys at once and fetches all misses with one upstream call, keeping singleflight, DoubleCheck, Not-Found caching and serve-stale
+- **📦 Batch Reads** - `GetMany` reads many keys at once and fetches all misses together (one upstream call if the upstream implements `BatchUpstream`), keeping singleflight, DoubleCheck, Not-Found caching and serve-stale
 - **🚀 High Performance** - Sub-microsecond latency, 79x~1729x throughput amplification, zero error rate
 - **🎯 Type-Safe** - Go generics provide compile-time type safety, avoiding runtime type errors
 - **⏱️ Flexible TTL** - Independent fresh and stale TTL configuration for precise data lifecycle control
@@ -355,7 +355,8 @@ type BatchUpstream[T any] interface {
     // Keys absent from the map do not exist (like ErrKeyNotFound for Get).
     // A non-nil error fails the whole batch, unless it is a *cachex.BatchError
     // returned as is (not wrapped), which fails only the keys it lists.
-    // A whole-batch error fails every key, even if it wraps an ErrKeyNotFound.
+    // A whole-batch error fails every key, even if it wraps an ErrKeyNotFound:
+    // errors.Is/As still see it, but IsErrKeyNotFound reports false.
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }
 

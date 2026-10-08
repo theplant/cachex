@@ -32,9 +32,14 @@ func (e *ErrKeyNotFound) Error() string {
 	}
 }
 
-// IsErrKeyNotFound checks if the error is an ErrKeyNotFound
+// IsErrKeyNotFound checks if the error is an ErrKeyNotFound. An error that
+// failed a whole batch (see BatchUpstream) is never one, even if it wraps one.
 func IsErrKeyNotFound(err error) bool {
 	if err == nil {
+		return false
+	}
+	var w *wholeBatchError
+	if errors.As(err, &w) {
 		return false
 	}
 	var e *ErrKeyNotFound

@@ -348,7 +348,7 @@ func (c *Client[T]) fetchClaimed(ctx context.Context, key string) (result T, res
 
 func isCachedFreshNotFound(err error) bool {
 	var e *ErrKeyNotFound
-	return errors.As(err, &e) && e.Cached && e.CacheState == StateFresh
+	return IsErrKeyNotFound(err) && errors.As(err, &e) && e.Cached && e.CacheState == StateFresh
 }
 
 func (c *Client[T]) makeSFKey(key string) string {

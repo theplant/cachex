@@ -544,15 +544,26 @@ func delMany[T any](ctx context.Context, cache Cache[T], keys []string) error {
 }
 
 // errForKey returns the error a batch call reported for key: the key's own
-// entry if err is a *BatchError, otherwise err itself (the whole batch failed).
-// Only an unwrapped *BatchError is partial: a wrapped or joined one may sit
-// next to an error that failed the whole batch.
+// entry if err is a *BatchError, otherwise err itself (the whole batch failed)
+// marked as a wholeBatchError. Only an unwrapped *BatchError is partial: a
+// wrapped or joined one may sit next to an error that failed the whole batch.
 func errForKey(err error, key string) error {
 	if batchErr, ok := err.(*BatchError); ok { //nolint:errorlint // see above
 		return batchErr.Errors[key]
 	}
-	return err
+	if err == nil {
+		return nil
+	}
+	return &wholeBatchError{err: err}
 }
+
+// wholeBatchError is a whole-batch failure reported for one key. It is never
+// a not-found (see IsErrKeyNotFound), even if one sits in its chain, while
+// errors.Is and errors.As still see the original error.
+type wholeBatchError struct{ err error }
+
+func (e *wholeBatchError) Error() string { return e.err.Error() }
+func (e *wholeBatchError) Unwrap() error { return e.err }
 
 func uniqueKeys(keys []string) []string {
 	seen := make(map[string]struct{}, len(keys))

@@ -649,18 +649,84 @@ func TestClientGetManyUpstreamGoexit(t *testing.T) {
 	})
 }
 
-// notFoundBatchBackend answers a whole GetMany with ErrKeyNotFound.
-type notFoundBatchBackend struct{ *SyncMap[string] }
-
-func (notFoundBatchBackend) GetMany(context.Context, []string) (map[string]string, error) {
-	return nil, &ErrKeyNotFound{}
+// failingBatchGet answers every GetMany with err.
+type failingBatchGet[T any] struct {
+	*SyncMap[T]
+	err error
 }
 
-func TestClientGetManyBackendBatchNotFoundIsAMiss(t *testing.T) {
-	cli := NewClient[string](notFoundBatchBackend{NewSyncMap[string]()}, &batchUpstream{data: map[string]string{"a": "1"}})
-	got, err := cli.GetMany(context.Background(), []string{"a"})
-	require.NoError(t, err)
-	assert.Equal(t, map[string]string{"a": "1"}, got, "a backend that says not-found for the batch is a miss, so the key is fetched")
+func (f failingBatchGet[T]) GetMany(context.Context, []string) (map[string]T, error) {
+	return nil, f.err
+}
+
+func TestClientGetManyWholeBatchErrors(t *testing.T) {
+	ctx := context.Background()
+	conn := errors.New("conn reset")
+	joined := stderrors.Join(conn, &ErrKeyNotFound{})
+
+	// requireFailedAll checks every key failed with an error that still is conn
+	// but never reads as not-found.
+	requireFailedAll := func(t *testing.T, got map[string]string, err error, keys ...string) {
+		t.Helper()
+		assert.Empty(t, got)
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.ElementsMatch(t, keys, slices.Collect(maps.Keys(be.Errors)))
+		for _, kerr := range be.Errors {
+			assert.ErrorIs(t, kerr, conn, "the cause keeps its identity")
+			assert.False(t, IsErrKeyNotFound(kerr), "a whole-batch failure must not read as not-found")
+		}
+	}
+
+	for name, batchErr := range map[string]error{"bare not-found": &ErrKeyNotFound{}, "joined": joined} {
+		t.Run("backend: "+name+" fails every key instead of reading as misses", func(t *testing.T) {
+			up := &batchUpstream{data: map[string]string{"a": "1"}}
+			cli := NewClient[string](failingBatchGet[string]{NewSyncMap[string](), batchErr}, up)
+			got, err := cli.GetMany(ctx, []string{"a"})
+			assert.Empty(t, got)
+			var be *BatchError
+			require.ErrorAs(t, err, &be)
+			assert.False(t, IsErrKeyNotFound(be.Errors["a"]))
+			batches, ones := up.calls()
+			assert.Empty(t, batches, "a failed backend read is not a miss")
+			assert.Empty(t, ones)
+		})
+	}
+
+	t.Run("not-found cache: a joined error fails every key", func(t *testing.T) {
+		up := &batchUpstream{data: map[string]string{"a": "1"}}
+		cli := NewClient(NewSyncMap[string](), up,
+			NotFoundWithTTL[string](failingBatchGet[time.Time]{NewSyncMap[time.Time](), joined}, time.Hour, 0))
+		got, err := cli.GetMany(ctx, []string{"a", "b"})
+		requireFailedAll(t, got, err, "a", "b")
+		batches, ones := up.calls()
+		assert.Empty(t, batches, "a failed not-found cache read is not a miss")
+		assert.Empty(t, ones)
+	})
+
+	t.Run("upstream: a joined error keeps its cause and caches nothing", func(t *testing.T) {
+		notFound := NewSyncMap[time.Time]()
+		up := batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
+			return nil, joined
+		})
+		cli := NewClient(NewSyncMap[string](), up, NotFoundWithTTL[string](notFound, time.Hour, 0))
+		got, err := cli.GetMany(ctx, []string{"a", "b"})
+		requireFailedAll(t, got, err, "a", "b")
+		_, err = notFound.Get(ctx, "a")
+		assert.True(t, IsErrKeyNotFound(err), "no not-found is cached for a key the upstream never answered")
+	})
+
+	t.Run("layered: a lower layer's whole-batch failure stays a failure", func(t *testing.T) {
+		lower := NewClient(NewSyncMap[string](), batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
+			return nil, joined
+		}))
+		notFound := NewSyncMap[time.Time]()
+		cli := NewClient(NewSyncMap[string](), lower, NotFoundWithTTL[string](notFound, time.Hour, 0))
+		got, err := cli.GetMany(ctx, []string{"a"})
+		requireFailedAll(t, got, err, "a")
+		_, err = notFound.Get(ctx, "a")
+		assert.True(t, IsErrKeyNotFound(err))
+	})
 }
 
 func TestRedisCacheGetManyPerKeyErrors(t *testing.T) {

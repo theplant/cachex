@@ -14,7 +14,7 @@
 - **🚫 防御缓存穿透** - Not-Found 缓存机制，缓存不存在的 key，避免恶意查询打垮数据库
 - **🔄 Serve-Stale** - 提供陈旧数据的同时异步刷新，确保高可用性和低延迟
 - **🎪 分层缓存** - 灵活组合多级缓存（L1 内存 + L2 Redis），Client 可作为下层 Upstream
-- **📦 批量读取** - `GetMany` 一次读多个 key，未命中的合成一次上游调用，singleflight、DoubleCheck、Not-Found 缓存、serve-stale 照样生效
+- **📦 批量读取** - `GetMany` 一次读多个 key，未命中的一起拉取（上游实现了 `BatchUpstream` 就合成一次调用），singleflight、DoubleCheck、Not-Found 缓存、serve-stale 照样生效
 - **🚀 高性能** - 亚微秒级延迟，79x~1729x 吞吐量放大，零错误率
 - **🎯 类型安全** - Go 泛型提供编译时类型安全，避免运行时类型错误
 - **⏱️ 灵活 TTL** - 独立的新鲜和陈旧 TTL 配置，精确控制数据生命周期
@@ -354,7 +354,8 @@ products, err := client.GetMany(ctx, []string{"p1", "p2", "p3"})
 type BatchUpstream[T any] interface {
     // map 里没有的 key 视为不存在（相当于 Get 的 ErrKeyNotFound）。
     // 返回非 nil error 表示整批失败；如果是原样返回（没有再包一层）的 *cachex.BatchError，只有它列出的 key 失败。
-    // 整批失败的 error 即使包着 ErrKeyNotFound，也算所有 key 失败，不算不存在。
+    // 整批失败的 error 即使包着 ErrKeyNotFound，也算所有 key 失败，不算不存在：
+    // errors.Is/As 仍能找到原来的 error，只是 IsErrKeyNotFound 返回 false。
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }
 

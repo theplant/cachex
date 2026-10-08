@@ -40,7 +40,8 @@ func (f UpstreamFunc[T]) Get(ctx context.Context, key string) (T, error) {
 // ErrKeyNotFound). A non-nil error fails the whole batch, unless it is a
 // *BatchError returned as is (not wrapped), which fails only the keys it lists
 // while the map still carries the rest. A whole-batch error fails every key
-// even if it wraps an ErrKeyNotFound.
+// even if it wraps an ErrKeyNotFound: errors.Is and errors.As still see it,
+// but IsErrKeyNotFound reports false.
 type BatchUpstream[T any] interface {
 	GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }

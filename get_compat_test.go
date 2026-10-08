@@ -88,7 +88,7 @@ func TestGetCompatConcurrentMissesCoalesce(t *testing.T) {
 
 	go func() {
 		<-g.entered
-		require.Eventually(t, func() bool { return hooks.before.Load() == 20 }, time.Second, time.Millisecond)
+		assert.Eventually(t, func() bool { return hooks.before.Load() == 20 }, time.Second, time.Millisecond)
 		time.Sleep(50 * time.Millisecond) // let every caller join the flight
 		close(g.release)
 	}()
@@ -158,7 +158,7 @@ func TestGetCompatUpstreamPanic(t *testing.T) {
 
 	go func() {
 		<-entered
-		require.Eventually(t, func() bool { return hooks.before.Load() == 5 }, time.Second, time.Millisecond)
+		assert.Eventually(t, func() bool { return hooks.before.Load() == 5 }, time.Second, time.Millisecond)
 		time.Sleep(50 * time.Millisecond)
 		close(release)
 	}()
@@ -267,7 +267,7 @@ func TestGetCompatFetchConcurrencySlots(t *testing.T) {
 
 	go func() {
 		<-g.entered
-		require.Eventually(t, func() bool { return hooks.before.Load() == 60 }, time.Second, time.Millisecond)
+		assert.Eventually(t, func() bool { return hooks.before.Load() == 60 }, time.Second, time.Millisecond)
 		time.Sleep(50 * time.Millisecond)
 		close(g.release)
 	}()
