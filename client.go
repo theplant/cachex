@@ -198,7 +198,9 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 // Order: the upstream is deleted first, then this layer, so until this layer's
 // delete lands its readers still see the deleted value. If the upstream
 // delete fails, this layer's entry is still dropped but no not-found is
-// cached, since the upstream may still hold the key.
+// cached, since the upstream may still hold the key. If the upstream delete
+// succeeds but this layer's fails, the error is returned and the upstream
+// stays deleted.
 func (c *Client[T]) Del(ctx context.Context, key string) error {
 	return c.write(ctx, key,
 		func(upstream Cache[T]) error {
@@ -250,7 +252,9 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 // shows up here before it is below; until this layer's write lands, readers of
 // this layer still see the old value. If the upstream write fails, its
 // state is unknown (it may have been applied and only the reply lost), so this
-// layer's entry is dropped and the next read goes down. Concurrent writes to
+// layer's entry is dropped and the next read goes down. If the upstream write
+// succeeds but this layer's fails, the error is returned too (the upstream
+// keeps the new value) and this layer's entry is dropped. Concurrent writes to
 // one key through the same Client are applied one at a time, in the same order
 // on every layer.
 func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
