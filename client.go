@@ -79,9 +79,6 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
 		writeSeed:        maphash.MakeSeed(),
 	}
-	for i := range c.writes {
-		c.writes[i].writer = make(chan struct{}, 1)
-	}
 
 	// Apply user options
 	for _, opt := range opts {
@@ -261,8 +258,10 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 // keeps the new value) and this layer's entry is dropped. A read that starts
 // after Set returned never gets a value fetched before it. Concurrent writes to
 // one key through the same Client are applied one at a time, in the same order
-// on every layer; waiting for another write respects ctx, but once started, a
-// failed write's cleanup outlives ctx, for at most the fetch timeout.
+// on every layer. Waiting for another write or a backfill of the key's stripe
+// gives up when ctx is done (writing nothing); a write that need not wait runs
+// even with a done ctx. Once started, a failed write's cleanup outlives ctx,
+// for at most the fetch timeout.
 func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
 	return c.write(ctx, key,
 		func(upstream Cache[T]) error {
@@ -284,9 +283,31 @@ const writeStripeCount = 1024
 
 // writeStripe orders writes and backfills of the keys that hash to it.
 type writeStripe struct {
-	writer chan struct{} // capacity 1, held by the Set/Del in progress; waiting for it respects ctx
-	mu     sync.RWMutex  // that Set/Del holds it too, so all layers apply writes in one order; backfills hold it for reading
-	gen    atomic.Uint64 // bumped by every Set/Del, checked by backfills
+	mu  sync.RWMutex  // Set/Del hold it, so all layers apply them in one order; backfills hold it for reading
+	gen atomic.Uint64 // bumped by every Set/Del, checked by backfills
+}
+
+// lock takes the stripe for writing. Waiting for another write or a backfill
+// gives up when ctx is done; a free stripe is taken even with a done ctx.
+func (s *writeStripe) lock(ctx context.Context) error {
+	if s.mu.TryLock() {
+		return nil
+	}
+	locked := make(chan struct{})
+	go func() {
+		s.mu.Lock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+		return nil
+	case <-ctx.Done():
+		go func() { // hand the lock back once it is taken
+			<-locked
+			s.mu.Unlock()
+		}()
+		return ctx.Err()
+	}
 }
 
 func (c *Client[T]) stripe(key string) *writeStripe {
@@ -297,16 +318,9 @@ func (c *Client[T]) stripe(key string) *writeStripe {
 // layer. Any failure leaves this layer without an entry for the key.
 func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache[T]) error, toLayer func() error) error {
 	s := c.stripe(key)
-	if err := ctx.Err(); err != nil { // a done ctx writes nothing, even if no write is in progress
-		return errors.Wrapf(err, "context cancelled while waiting for a write in progress for key: %s", key)
+	if err := s.lock(ctx); err != nil {
+		return errors.Wrapf(err, "context cancelled while waiting to write key: %s", key)
 	}
-	select {
-	case s.writer <- struct{}{}:
-	case <-ctx.Done():
-		return errors.Wrapf(ctx.Err(), "context cancelled while waiting for a write in progress for key: %s", key)
-	}
-	defer func() { <-s.writer }()
-	s.mu.Lock() // only waits for backfills already writing this layer
 	defer s.mu.Unlock()
 
 	// Called once the upstream is written: a backfill that read the upstream

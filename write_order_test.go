@@ -462,32 +462,58 @@ func TestInterleavedSetsKeepLayersConsistent(t *testing.T) {
 }
 
 func TestReadAfterWriteDoesNotJoinAnOlderFetch(t *testing.T) {
-	ctx := context.Background()
-	src := &slowSource{data: map[string]string{"k": "old"}}
-	cli := NewClient[string](NewSyncMap[string](), src) // no not-found cache: Del leaves this layer empty
+	for _, conc := range []int{1, 4} {
+		for _, many := range []bool{false, true} {
+			t.Run(fmt.Sprintf("concurrency=%d GetMany=%v", conc, many), func(t *testing.T) {
+				ctx := context.Background()
+				src := &slowSource{data: map[string]string{"k": "old"}}
+				// no not-found cache: Del leaves this layer empty
+				cli := NewClient[string](NewSyncMap[string](), src, WithFetchConcurrency[string](conc))
 
-	src.holdReads()
-	go func() { _, _ = cli.Get(ctx, "k") }()
-	waitFor(t, src.entered) // A has read "old" and is held
+				// older reads hold a fetch in every slot, each having read "old"
+				src.holdReads()
+				require.Eventually(t, func() bool {
+					go func() { _, _ = cli.Get(ctx, "k") }()
+					cli.flights.mu.Lock()
+					defer cli.flights.mu.Unlock()
+					return len(cli.flights.flights) == conc
+				}, time.Second, time.Millisecond)
+				for range conc {
+					waitFor(t, src.entered)
+				}
 
-	src.mu.Lock()
-	delete(src.data, "k")
-	src.mu.Unlock()
-	require.NoError(t, cli.Del(ctx, "k"))
+				src.mu.Lock()
+				delete(src.data, "k")
+				src.mu.Unlock()
+				require.NoError(t, cli.Del(ctx, "k"))
 
-	type res struct {
-		v   string
-		err error
+				got := make(chan error, 1)
+				go func() {
+					if many {
+						m, err := cli.GetMany(ctx, []string{"k"})
+						if err == nil && len(m) > 0 {
+							err = fmt.Errorf("got %v", m)
+						}
+						got <- err
+						return
+					}
+					v, err := cli.Get(ctx, "k")
+					if err == nil {
+						err = fmt.Errorf("got %q", v)
+					}
+					got <- err
+				}()
+				waitFor(t, src.entered) // the new read started its own fetch instead of joining an older one
+				src.releaseReads()
+				err := <-got
+				if many {
+					assert.NoError(t, err, "a GetMany after Del sees the delete")
+				} else {
+					assert.True(t, IsErrKeyNotFound(err), "a Get after Del sees the delete: %v", err)
+				}
+			})
+		}
 	}
-	got := make(chan res, 1)
-	go func() {
-		v, err := cli.Get(ctx, "k")
-		got <- res{v, err}
-	}()
-	waitFor(t, src.entered) // B started its own read instead of joining A's
-	src.releaseReads()
-	r := <-got
-	assert.True(t, IsErrKeyNotFound(r.err), "a Get that starts after Del returned sees the delete (got %q, %v)", r.v, r.err)
 }
 
 func TestWriteWaitingForTheStripeRespectsCtx(t *testing.T) {
@@ -518,7 +544,7 @@ func TestWriteWaitingForTheStripeRespectsCtx(t *testing.T) {
 	select {
 	case err := <-secondErr:
 		require.ErrorIs(t, err, context.DeadlineExceeded)
-		assert.Equal(t, "context cancelled while waiting for a write in progress for key: k: context deadline exceeded", err.Error())
+		assert.Equal(t, "context cancelled while waiting to write key: k: context deadline exceeded", err.Error())
 	case <-time.After(5 * time.Second):
 		t.Fatal("Set kept waiting past its ctx")
 	}
@@ -527,12 +553,84 @@ func TestWriteWaitingForTheStripeRespectsCtx(t *testing.T) {
 	v, _ := up.Get(ctx, "k")
 	assert.Equal(t, "first", v, "the cancelled Set wrote nothing")
 
+	s := cli.stripe("k")
+	require.Eventually(t, func() bool { // the given-up Set hands the lock back once it gets it
+		if !s.mu.TryLock() {
+			return false
+		}
+		s.mu.Unlock()
+		return true
+	}, time.Second, time.Millisecond)
 	done, cancel := context.WithCancel(ctx)
 	cancel()
-	err := cli.Set(done, "k", "third")
-	require.ErrorIs(t, err, context.Canceled, "a done ctx writes nothing even when the stripe is free")
+	require.NoError(t, cli.Set(done, "k", "third"), "a done ctx only gives up waiting; a free stripe is written as before")
 	v, _ = up.Get(ctx, "k")
-	assert.Equal(t, "first", v)
+	assert.Equal(t, "third", v)
+}
+
+func TestWriteWaitingForABackfillRespectsCtx(t *testing.T) {
+	src := &slowSource{data: map[string]string{"k": "old"}}
+	backend := newHookedCache()
+	cli := NewClient[string](backend, src)
+	reached, release := make(chan struct{}), make(chan struct{})
+	backend.beforeSet = func(_, v string) error {
+		if v == "old" { // the GetMany backfill, holding the stripe for reading
+			close(reached)
+			<-release
+		}
+		return nil
+	}
+	getDone := make(chan struct{})
+	go func() {
+		defer close(getDone)
+		_, _ = cli.GetMany(context.Background(), []string{"k"})
+	}()
+	waitFor(t, reached)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- cli.Set(ctx, "k", "new") }()
+	select {
+	case err := <-errc:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(5 * time.Second):
+		t.Error("Set kept waiting past its ctx")
+	}
+	close(release)
+	<-getDone
+
+	v, err := backend.Get(context.Background(), "k")
+	require.NoError(t, err)
+	assert.Equal(t, "old", v, "the given-up Set wrote nothing")
+	require.NoError(t, cli.Set(context.Background(), "k", "new"), "the stripe is free again")
+}
+
+func TestDelWithADoneCtxStillInvalidates(t *testing.T) {
+	backend := NewSyncMap[string]()
+	db := map[string]string{"k": "v1"}
+	var mu sync.Mutex
+	cli := NewClient[string](backend, UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if v, ok := db[key]; ok {
+			return v, nil
+		}
+		return "", &ErrKeyNotFound{}
+	}))
+	_, err := cli.Get(context.Background(), "k")
+	require.NoError(t, err)
+
+	// cache-aside: the DB is updated, then the request's ctx is canceled before the invalidation
+	mu.Lock()
+	db["k"] = "v2"
+	mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.NoError(t, cli.Del(ctx, "k"))
+	v, err := cli.Get(context.Background(), "k")
+	require.NoError(t, err)
+	assert.Equal(t, "v2", v)
 }
 
 // holdGetCache is a hookedCache whose Get can be held after reading.
