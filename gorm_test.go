@@ -2,6 +2,7 @@ package cachex
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -270,4 +271,28 @@ func TestGORMCacheGetManyCaseSensitiveKeyColumn(t *testing.T) {
 	got, err := c.GetMany(ctx, []string{"abc", "ABC", "Abc"})
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"abc": "lower", "ABC": "upper"}, got, "distinct keys stay distinct")
+}
+
+func TestGORMCacheQuotesTheKeyColumn(t *testing.T) {
+	// "key" is reserved in MySQL; SQLite accepts it bare, so check the SQL itself
+	cache, db := newGORMCache[string](t, "quoted")
+	var sqls []string
+	capture := func(tx *gorm.DB) { sqls = append(sqls, tx.Statement.SQL.String()) }
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register("test:capture", capture))
+	require.NoError(t, db.Callback().Delete().After("gorm:delete").Register("test:capture", capture))
+	require.NoError(t, db.Callback().Create().After("gorm:create").Register("test:capture", capture))
+
+	ctx := context.Background()
+	require.NoError(t, cache.Set(ctx, "a", "1"))
+	_, _ = cache.Get(ctx, "a")
+	_, _ = cache.GetMany(ctx, []string{"a", "b"})
+	require.NoError(t, cache.SetMany(ctx, map[string]string{"b": "2"}))
+	require.NoError(t, cache.Del(ctx, "a"))
+	require.NoError(t, cache.DelMany(ctx, []string{"b"}))
+
+	require.Len(t, sqls, 6)
+	bare := regexp.MustCompile("(^|[^`\"])\\bkey\\b($|[^`\"])")
+	for _, sql := range sqls {
+		assert.NotRegexp(t, bare, sql, "the key column must be quoted")
+	}
 }

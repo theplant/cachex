@@ -13,10 +13,22 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// keyColumn is the key column as a clause, so GORM quotes it: "key" is a
+// reserved word in MySQL.
+var keyColumn = clause.Column{Name: "key"}
+
+func anys(keys []string) []any {
+	out := make([]any, len(keys))
+	for i, key := range keys {
+		out[i] = key
+	}
+	return out
+}
+
 // upsertEntry also rewrites the key column, so on a key column that is not
 // byte-exact the row belongs to the key written last, never to another one.
 var upsertEntry = clause.OnConflict{
-	Columns:   []clause.Column{{Name: "key"}},
+	Columns:   []clause.Column{keyColumn},
 	DoUpdates: clause.AssignmentColumns([]string{"key", "value", "updated_at"}),
 }
 
@@ -126,7 +138,7 @@ func (g *GORMCache[T]) Get(ctx context.Context, key string) (T, error) {
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
 	if err := tx.WithContext(ctx).
 		Table(g.tableName).
-		Where("key = ?", g.prefixedKey(key)).
+		Where(clause.Eq{Column: keyColumn, Value: g.prefixedKey(key)}).
 		First(&entry).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in gorm cache for key: %s", key)
@@ -152,7 +164,7 @@ func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
 	if err := tx.WithContext(ctx).
 		Table(g.tableName).
-		Where("key = ?", g.prefixedKey(key)).
+		Where(clause.Eq{Column: keyColumn, Value: g.prefixedKey(key)}).
 		Delete(nil).Error; err != nil {
 		return errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
 	}
@@ -185,7 +197,7 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 		var found []cacheEntry
 		if err := tx.WithContext(ctx).
 			Table(g.tableName).
-			Where("key IN ?", chunk).
+			Where(clause.IN{Column: keyColumn, Values: anys(chunk)}).
 			Find(&found).Error; err != nil {
 			return nil, errors.Wrap(err, "failed to get cache entries")
 		}
@@ -260,7 +272,7 @@ func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
 	for chunk := range slices.Chunk(prefixed, gormBatchSize) {
 		if err := tx.WithContext(ctx).
 			Table(g.tableName).
-			Where("key IN ?", chunk).
+			Where(clause.IN{Column: keyColumn, Values: anys(chunk)}).
 			Delete(nil).Error; err != nil {
 			return errors.Wrap(err, "failed to delete cache entries")
 		}
