@@ -259,7 +259,8 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 // after Set returned never gets a value fetched before it. Concurrent writes to
 // one key through the same Client are applied one at a time, in the same order
 // on every layer. Waiting for another write or a backfill of the key's stripe
-// gives up when ctx is done (writing nothing); a write that need not wait runs
+// gives up when ctx is done: nothing is written upstream, and this layer's
+// entry is dropped once the stripe is free. A write that need not wait runs
 // even with a done ctx. Once started, a failed write's cleanup outlives ctx,
 // for at most the fetch timeout.
 func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
@@ -288,8 +289,10 @@ type writeStripe struct {
 }
 
 // lock takes the stripe for writing. Waiting for another write or a backfill
-// gives up when ctx is done; a free stripe is taken even with a done ctx.
-func (s *writeStripe) lock(ctx context.Context) error {
+// gives up when ctx is done; a free stripe is taken even with a done ctx. A
+// lock given up on is still taken in the background, runs late while holding
+// it, and is released.
+func (s *writeStripe) lock(ctx context.Context, late func()) error {
 	if s.mu.TryLock() {
 		return nil
 	}
@@ -302,8 +305,9 @@ func (s *writeStripe) lock(ctx context.Context) error {
 	case <-locked:
 		return nil
 	case <-ctx.Done():
-		go func() { // hand the lock back once it is taken
+		go func() {
 			<-locked
+			late()
 			s.mu.Unlock()
 		}()
 		return ctx.Err()
@@ -318,10 +322,6 @@ func (c *Client[T]) stripe(key string) *writeStripe {
 // layer. Any failure leaves this layer without an entry for the key.
 func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache[T]) error, toLayer func() error) error {
 	s := c.stripe(key)
-	if err := s.lock(ctx); err != nil {
-		return errors.Wrapf(err, "context cancelled while waiting to write key: %s", key)
-	}
-	defer s.mu.Unlock()
 
 	// Called once the upstream is written: a backfill that read the upstream
 	// before took an older gen, so it is skipped once this lock is released, and
@@ -331,6 +331,16 @@ func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache
 		s.gen.Add(1)
 		c.dropFlights(key)
 	}
+
+	// A write that gave up waiting writes nothing upstream, but like any failed
+	// write it leaves this layer without an entry, once the stripe is free.
+	if err := s.lock(ctx, func() { written(); c.invalidate(ctx, key) }); err != nil {
+		return errors.Wrapf(err, "context cancelled while waiting to write key: %s", key)
+	}
+	defer s.mu.Unlock()
+	// also drop fetches claimed while this layer was being written: their
+	// double-check may have read the old value
+	defer c.dropFlights(key)
 
 	if upstreamCache, ok := c.upstream.(Cache[T]); ok {
 		if err := toUpstream(upstreamCache); err != nil {

@@ -600,9 +600,13 @@ func TestWriteWaitingForABackfillRespectsCtx(t *testing.T) {
 	close(release)
 	<-getDone
 
-	v, err := backend.Get(context.Background(), "k")
+	require.Eventually(t, func() bool {
+		_, err := backend.Get(context.Background(), "k")
+		return IsErrKeyNotFound(err)
+	}, time.Second, time.Millisecond, "the given-up Set drops this layer's entry once the stripe is free")
+	v, err := src.Get(context.Background(), "k")
 	require.NoError(t, err)
-	assert.Equal(t, "old", v, "the given-up Set wrote nothing")
+	assert.Equal(t, "old", v, "and writes nothing upstream")
 	require.NoError(t, cli.Set(context.Background(), "k", "new"), "the stripe is free again")
 }
 
@@ -673,4 +677,126 @@ func TestWriteThroughBackfillDuringUpstreamWrite(t *testing.T) {
 	v, err := l1Backend.Get(ctx, "k")
 	require.NoError(t, err)
 	assert.Equal(t, "new", v, "the Get that read L2 before the write does not backfill the old value")
+}
+
+func TestGivenUpDelStillInvalidates(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	db := map[string]string{"k": "v1"}
+	backend := newHookedCache()
+	cli := NewClient[string](backend, UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if v, ok := db[key]; ok {
+			return v, nil
+		}
+		return "v-" + key, nil
+	}))
+	_, err := cli.Get(ctx, "k")
+	require.NoError(t, err)
+
+	other := "" // an unrelated key in k's stripe
+	for i := 0; other == ""; i++ {
+		if k := fmt.Sprintf("o%d", i); cli.stripe(k) == cli.stripe("k") {
+			other = k
+		}
+	}
+	reached, release := make(chan struct{}), make(chan struct{})
+	backend.beforeSet = func(key, _ string) error {
+		if key == other { // its backfill holds the stripe for reading
+			close(reached)
+			<-release
+		}
+		return nil
+	}
+	getDone := make(chan struct{})
+	go func() {
+		defer close(getDone)
+		_, _ = cli.Get(ctx, other)
+	}()
+	waitFor(t, reached)
+
+	// cache-aside: the DB changes, then the request's ctx is canceled before the invalidation
+	mu.Lock()
+	db["k"] = "v2"
+	mu.Unlock()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	require.ErrorIs(t, cli.Del(canceled, "k"), context.Canceled, "the stripe is busy, so the Del gives up waiting")
+	close(release)
+	<-getDone
+
+	require.Eventually(t, func() bool {
+		v, err := cli.Get(ctx, "k")
+		return err == nil && v == "v2"
+	}, time.Second, time.Millisecond, "the old value is dropped once the stripe is free")
+}
+
+func TestReadAfterDelDoesNotJoinAFetchStartedDuringIt(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	db := map[string]string{"k": "v1"}
+	var armed atomic.Bool
+	r0Read, releaseR0 := make(chan struct{}), make(chan struct{})
+	backend := &holdGetCache{hookedCache: newHookedCache()}
+	backend.onGet = func(string) {
+		if armed.CompareAndSwap(true, false) { // R0's double-check, after reading "v1"
+			close(r0Read)
+			<-releaseR0
+		}
+	}
+	cli := NewClient[string](backend, UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if v, ok := db[key]; ok {
+			return v, nil
+		}
+		return "", &ErrKeyNotFound{}
+	}), WithDoubleCheck[string](DoubleCheckEnabled))
+
+	var starts atomic.Int32
+	r0AtClaim, r0Go := make(chan struct{}), make(chan struct{})
+	cli.testHooks = &testHooks{beforeSingleflightStart: func(context.Context, string) {
+		if starts.Add(1) == 1 { // R0 missed before anything was cached; hold it before it claims
+			close(r0AtClaim)
+			<-r0Go
+		}
+	}}
+	go func() { _, _ = cli.Get(ctx, "k") }() // R0
+	waitFor(t, r0AtClaim)
+	v, err := cli.Get(ctx, "k") // R1 caches "v1"
+	require.NoError(t, err)
+	require.Equal(t, "v1", v)
+
+	mu.Lock()
+	delete(db, "k")
+	mu.Unlock()
+	backend.beforeDel = func(string) error {
+		// between the upstream write and this layer's delete, R0 claims a fetch
+		// whose double-check reads "v1" from this layer
+		armed.Store(true)
+		close(r0Go)
+		<-r0Read
+		return nil
+	}
+	require.NoError(t, cli.Del(ctx, "k"))
+	backend.beforeDel = nil
+
+	got := make(chan error, 1)
+	go func() { // R2 starts after Del returned
+		v, err := cli.Get(ctx, "k")
+		if err == nil {
+			err = fmt.Errorf("got %q", v)
+		}
+		got <- err
+	}()
+	var r2 error
+	select {
+	case r2 = <-got:
+		close(releaseR0)
+	case <-time.After(time.Second): // R2 joined R0's fetch
+		close(releaseR0)
+		r2 = <-got
+	}
+	assert.True(t, IsErrKeyNotFound(r2), "a Get after Del returned sees the delete: %v", r2)
 }
