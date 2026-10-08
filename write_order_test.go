@@ -800,3 +800,158 @@ func TestReadAfterDelDoesNotJoinAFetchStartedDuringIt(t *testing.T) {
 	}
 	assert.True(t, IsErrKeyNotFound(r2), "a Get after Del returned sees the delete: %v", r2)
 }
+
+// jitterCache is a Cache with random latency, to shake out interleavings.
+type jitterCache struct{ m *SyncMap[string] }
+
+func jitter() { time.Sleep(time.Duration(rand.IntN(200)) * time.Microsecond) }
+
+func (j jitterCache) Get(ctx context.Context, key string) (string, error) {
+	jitter()
+	v, err := j.m.Get(ctx, key)
+	jitter() // between reading and returning: where a write can slip in before the backfill
+	jitter()
+	jitter()
+	return v, err
+}
+
+func (j jitterCache) Set(ctx context.Context, key, value string) error {
+	jitter()
+	return j.m.Set(ctx, key, value)
+}
+
+func (j jitterCache) Del(ctx context.Context, key string) error {
+	jitter()
+	return j.m.Del(ctx, key)
+}
+
+// TestRandomInterleavingsNeverReadOlderThanACompletedWrite: one writer per
+// key Sets and Dels versions 1, 2, 3...; readers Get and GetMany through two
+// layers. A read that starts after write n returned must see version n or a
+// later one that had started (a Del is the version "absent").
+func TestRandomInterleavingsNeverReadOlderThanACompletedWrite(t *testing.T) {
+	for _, notFound := range []bool{false, true} {
+		for _, dc := range []DoubleCheckMode{DoubleCheckDisabled, DoubleCheckEnabled} {
+			t.Run(fmt.Sprintf("notFoundCache=%v doubleCheck=%v", notFound, dc == DoubleCheckEnabled), func(t *testing.T) {
+				testRandomInterleavings(t, notFound, dc)
+			})
+		}
+	}
+}
+
+func testRandomInterleavings(t *testing.T, withNotFound bool, dc DoubleCheckMode) {
+	ctx := context.Background()
+	keys := []string{"a", "b"}
+	type history struct {
+		mu      sync.Mutex
+		isDel   []bool // by version; version 0 is the initial "absent"
+		started int
+		done    int
+	}
+	hist := map[string]*history{}
+	for _, k := range keys {
+		hist[k] = &history{isDel: []bool{true}}
+	}
+
+	src := jitterCache{m: NewSyncMap[string]()}
+	l2 := NewClient[string](jitterCache{m: NewSyncMap[string]()}, src)
+	opts := []ClientOption[string]{WithDoubleCheck[string](dc)}
+	if withNotFound {
+		opts = append(opts, NotFoundWithTTL[string](NewSyncMap[time.Time](), time.Hour, 0))
+	}
+	l1 := NewClient[string](NewSyncMap[string](), l2, opts...)
+
+	// check reports whether what a read saw for key is allowed, given the
+	// version completed before it started.
+	check := func(key string, floor int, v string, found bool) error {
+		h := hist[key]
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if found {
+			var n int
+			if _, err := fmt.Sscanf(v, key+":%d", &n); err != nil || n < floor || n > h.started || h.isDel[n] {
+				return fmt.Errorf("%s: got %q, but write %d had completed before the read", key, v, floor)
+			}
+			return nil
+		}
+		for n := floor; n <= h.started; n++ {
+			if h.isDel[n] {
+				return nil
+			}
+		}
+		return fmt.Errorf("%s: got absent, but write %d (a Set) had completed and no later Del had started", key, floor)
+	}
+
+	var wg sync.WaitGroup
+	for _, k := range keys {
+		wg.Go(func() {
+			h := hist[k]
+			for n := 1; n <= 300; n++ {
+				del := rand.IntN(2) == 0
+				h.mu.Lock()
+				h.isDel = append(h.isDel, del)
+				h.started = n
+				h.mu.Unlock()
+				var err error
+				if del {
+					err = l1.Del(ctx, k)
+				} else {
+					err = l1.Set(ctx, k, fmt.Sprintf("%s:%d", k, n))
+				}
+				if !assert.NoError(t, err) {
+					return
+				}
+				h.mu.Lock()
+				h.done = n
+				h.mu.Unlock()
+			}
+		})
+	}
+	var violations atomic.Int32
+	for range 12 {
+		wg.Go(func() {
+			for range 400 {
+				floors := map[string]int{}
+				for _, k := range keys {
+					hist[k].mu.Lock()
+					floors[k] = hist[k].done
+					hist[k].mu.Unlock()
+				}
+				if rand.IntN(2) == 0 {
+					k := keys[rand.IntN(len(keys))]
+					v, err := l1.Get(ctx, k)
+					if err != nil && !IsErrKeyNotFound(err) {
+						t.Errorf("Get(%s): %v", k, err)
+						return
+					}
+					if err := check(k, floors[k], v, err == nil); err != nil {
+						violations.Add(1)
+						t.Error(err)
+					}
+					continue
+				}
+				got, err := l1.GetMany(ctx, keys)
+				if err != nil {
+					t.Errorf("GetMany: %v", err)
+					return
+				}
+				for _, k := range keys {
+					v, ok := got[k]
+					if err := check(k, floors[k], v, ok); err != nil {
+						violations.Add(1)
+						t.Error(err)
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+	require.Zero(t, violations.Load())
+
+	for _, k := range keys { // quiesced: every layer agrees with the source
+		want, wantErr := src.Get(ctx, k)
+		got, err := l1.Get(ctx, k)
+		assert.Equal(t, IsErrKeyNotFound(wantErr), IsErrKeyNotFound(err), k)
+		assert.Equal(t, want, got, k)
+	}
+}
