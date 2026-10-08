@@ -111,6 +111,55 @@ func TestDelUpstreamFirst(t *testing.T) {
 	})
 }
 
+func TestLayerWriteFailureAfterUpstreamSuccess(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("boom")
+
+	t.Run("Set", func(t *testing.T) {
+		notFound := NewSyncMap[time.Time]()
+		require.NoError(t, notFound.Set(ctx, "k", time.Now()))
+		backend := newHookedCache()
+		require.NoError(t, backend.Set(ctx, "k", "old"))
+		backend.beforeSet = func(string, string) error { return boom }
+		up := newHookedCache()
+		cli := NewClient[string](backend, up, NotFoundWithTTL[string](notFound, time.Hour, 0))
+
+		err := cli.Set(ctx, "k", "new")
+		require.ErrorIs(t, err, boom)
+		assert.Equal(t, "set in backend failed for key: k: boom", err.Error())
+		v, err := up.Get(ctx, "k")
+		require.NoError(t, err)
+		assert.Equal(t, "new", v, "the upstream keeps the write")
+		assertMissing(t, backend, "k", "this layer's old value is dropped")
+		_, err = notFound.Get(ctx, "k")
+		assert.True(t, IsErrKeyNotFound(err), "the cached not-found is dropped")
+	})
+
+	t.Run("Del", func(t *testing.T) {
+		notFound := NewSyncMap[time.Time]()
+		backend := newHookedCache()
+		require.NoError(t, backend.Set(ctx, "k", "old"))
+		var failed atomic.Bool
+		backend.beforeDel = func(string) error {
+			if failed.CompareAndSwap(false, true) {
+				return boom // only this layer's own Del fails, not the cleanup
+			}
+			return nil
+		}
+		up := newHookedCache()
+		require.NoError(t, up.Set(ctx, "k", "old"))
+		cli := NewClient[string](backend, up, NotFoundWithTTL[string](notFound, time.Hour, 0))
+
+		err := cli.Del(ctx, "k")
+		require.ErrorIs(t, err, boom)
+		assert.Equal(t, "delete from backend failed for key: k: boom", err.Error())
+		assertMissing(t, up, "k", "the upstream keeps the delete")
+		assertMissing(t, backend, "k", "this layer's old value is dropped")
+		_, err = notFound.Get(ctx, "k")
+		assert.True(t, IsErrKeyNotFound(err), "the not-found written before the failure is dropped too")
+	})
+}
+
 // slowSource is a data source whose reads can be held after they have read
 // the value, to let a write slip in between the read and the backfill.
 type slowSource struct {

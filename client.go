@@ -267,7 +267,7 @@ func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
 
 // writeStripeCount is the number of write stripes per Client.
 //
-// ponytail: keys share stripes by hash, so two keys in one stripe serialize
+// Keys share stripes by hash, so two keys in one stripe serialize
 // their writes and a write to one can skip the other's backfill (a spare
 // cache miss, never a stale value); raise it if that shows up.
 const writeStripeCount = 1024
