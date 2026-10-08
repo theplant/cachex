@@ -257,6 +257,9 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 	if len(entries) == 0 {
 		return stderrors.Join(encodeErrs...)
 	}
+	// one row order for every caller, or overlapping batches lock rows in
+	// opposite orders and deadlock (MySQL, PostgreSQL)
+	slices.SortFunc(entries, func(a, b cacheEntry) int { return cmp.Compare(a.Key, b.Key) })
 
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
 	if err := tx.WithContext(ctx).

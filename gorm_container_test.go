@@ -3,6 +3,7 @@ package cachex
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -107,6 +108,23 @@ func TestGORMCacheOnRealDatabases(t *testing.T) {
 					assert.Equal(t, map[string]string{"abc": "lower"}, got)
 				})
 			}
+
+			t.Run("concurrent overlapping SetMany do not deadlock", func(t *testing.T) {
+				c := newCache(t)
+				values := map[string]string{}
+				for i := range 200 {
+					values[fmt.Sprintf("k%03d", i)] = "v"
+				}
+				var wg sync.WaitGroup
+				for range 8 {
+					wg.Go(func() {
+						for range 5 {
+							assert.NoError(t, c.SetMany(ctx, values))
+						}
+					})
+				}
+				wg.Wait()
+			})
 
 			t.Run("Client over it", func(t *testing.T) {
 				c := newCache(t)

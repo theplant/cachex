@@ -383,15 +383,32 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 	// like Get, the fetch timeout starts after the double-check. A Client below
 	// bounds each of its own fetches, so its batch is not bounded as one fetch:
 	// keys still queued there would fail with this deadline, not their own.
-	fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	if _, layered := c.upstream.(*Client[T]); !layered {
-		fetchCtx, cancel = context.WithTimeout(fetchCtx, c.fetchTimeout)
+	timeout := c.fetchTimeout
+	if lower, layered := c.upstream.(*Client[T]); layered {
+		timeout += lower.batchTimeout(len(pendingKeys))
 	}
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	for j, r := range c.doFetchMany(fetchCtx, pendingKeys) {
 		results[pending[j]] = r
 	}
 	returned = true
+}
+
+// batchTimeout is how long a GetMany of n keys sent to this Client as an
+// upstream may legitimately take: a fetch timeout for its own reads and
+// write-back, plus its fetches (one batch, a lower Client's own budget, or a
+// queue of per-key fetches, getManyConc at a time).
+func (c *Client[T]) batchTimeout(n int) time.Duration {
+	switch up := c.upstream.(type) {
+	case *Client[T]:
+		return c.fetchTimeout + up.batchTimeout(n)
+	case BatchUpstream[T]:
+		return 2 * c.fetchTimeout
+	default:
+		rounds := (n + c.getManyConc - 1) / c.getManyConc
+		return c.fetchTimeout * time.Duration(1+rounds)
+	}
 }
 
 // doFetchMany is the batch form of doFetch: fetch from the batch upstream,

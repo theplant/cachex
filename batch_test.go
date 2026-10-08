@@ -1165,6 +1165,35 @@ func TestClientGetManyOverAClientIsNotBoundedAsOneFetch(t *testing.T) {
 	assert.Len(t, got, len(keys))
 }
 
+// hangingBatchCache is a BatchCache whose reads block until ctx is done.
+type hangingBatchCache struct{ *SyncMap[string] }
+
+func (hangingBatchCache) Get(ctx context.Context, _ string) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func (hangingBatchCache) GetMany(ctx context.Context, _ []string) (map[string]string, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestClientGetManyOverAClientIsStillBounded(t *testing.T) {
+	src := UpstreamFunc[string](func(_ context.Context, key string) (string, error) { return "v-" + key, nil })
+	l2 := NewClient[string](hangingBatchCache{NewSyncMap[string]()}, src, WithFetchTimeout[string](50*time.Millisecond))
+	l1 := NewClient[string](NewSyncMap[string](), l2, WithFetchTimeout[string](50*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := l1.GetMany(ctx, []string{"k"})
+	require.Error(t, err)
+	require.Eventually(t, func() bool {
+		l1.flights.mu.Lock()
+		defer l1.flights.mu.Unlock()
+		return len(l1.flights.flights) == 0
+	}, 2*time.Second, 5*time.Millisecond, "a lower layer that hangs does not keep the key claimed forever")
+}
+
 func TestRedisCacheGetManyPerKeyErrors(t *testing.T) {
 	ctx := context.Background()
 	cache, mr := newRedisCache[string](t)
