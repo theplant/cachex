@@ -341,7 +341,9 @@ The key insight: **cache writes propagate through `Cache[T]` chains but stop whe
 - If the upstream write succeeds but this layer's own write fails, `Set`/`Del` still return the error, yet the change below is **kept** (nothing is rolled back): an error does not mean nothing was written. This layer drops its entry and cached Not-Found for the key, so the next read goes down and sees the change.
 - Concurrent `Set`/`Del` of one key through the same `Client` are applied one at a time, in the same order on every layer. A `Set`/`Del` that has to wait (for another write to its stripe, or a read writing back to this layer) gives up when its ctx is done and returns the ctx error: it writes nothing upstream, and, like any failed write, drops this layer's entry for the key as soon as the stripe is free. One that does not have to wait is applied even if its ctx is already done. So an invalidating `Del` after the request was canceled always clears this layer, at worst a moment after it returns. Once a write has started, the cleanup after a failure (dropping this layer's entry) runs even if ctx is done, for at most `WithFetchTimeout`.
 - A read that fetched a value **before** a concurrent `Set`/`Del` still returns what it fetched, but never writes it back over the newer value: each `Client` hashes keys into 1,024 stripes, each with a write lock and a write generation, and `Get`, `GetMany` and the serve-stale refresh check the key's stripe generation while holding its lock for reading, so a backfill either lands before a `Set`/`Del` (which then overwrites it) or is skipped. A backfill is also skipped while a write to the stripe is in progress, so reads never wait on writes. Keys that share a stripe share this state: their writes run one at a time, and a write to one key can skip a backfill of another. The cost is at most an extra cache miss, or a write waiting on a write to an unrelated key, or on a read writing back to this layer: a large `GetMany` holds the stripes of all its keys (about 60% of them for 1,000 keys) while the backend writes them back, so a `Set`/`Del` of any key in those stripes waits that long, and gives up if its ctx ends first.
-- These guarantees hold within one process; separate processes sharing a lower layer (e.g. Redis) can still briefly disagree in their memory layers.
+- These guarantees hold **within one process**: the stripes live in one `Client`'s memory and know nothing of other instances. With several instances sharing a lower layer (e.g. Redis):
+  - a write made on one instance does not reach the memory layers of the others, which keep their old value until it expires. Give memory layers a TTL no longer than the staleness you can accept; to invalidate them sooner, broadcast the change from your own code (e.g. Redis Pub/Sub);
+  - an instance that read the old value from the source just before another instance wrote it can still put that old value into the shared layer after the write, where it stays until it expires. This race is rare (the read and the write must overlap within milliseconds) but the stale value lives as long as the shared layer's TTL, so give that layer a TTL you can live with too.
 
 ### Not-Found Caching
 
@@ -418,7 +420,7 @@ client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick
 
 How `GetMany` works:
 
-1. **Backend**: one batch read (`BatchCache[T]`, otherwise key by key). Each value is classified by staleness: fresh values are returned, stale values are returned and refreshed in the background together (with `WithServeStale`), rotten values and misses go on.
+1. **Backend**: one batch read (`BatchCache[T]`, otherwise key by key). Each value read is handled by staleness: a fresh value goes into the result; a stale one goes into the result too (with `WithServeStale`), and those keys are refreshed together in the background; rotten values and misses go on to the next steps, and what those find goes into the same result. The whole result is returned at once.
 2. **Not-Found cache**: misses are checked against it, exactly like `Get`.
 3. **Singleflight**: every key that needs the upstream is claimed in the **same** singleflight `Get` uses. Keys already being fetched by a `Get` or another `GetMany` are waited for, not fetched again; so a `Get` and a `GetMany` (or two overlapping `GetMany`s) fetch a shared key only once. `WithFetchConcurrency` applies per key as usual.
 4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get` (in the default `DoubleCheckAuto`, only the keys whose stripe this `Client` wrote since the lookup).
@@ -428,6 +430,16 @@ How `GetMany` works:
 `Client` implements `BatchUpstream[T]` itself, so in a layered setup a batch travels down as one call per layer: `l1Client.GetMany` → L1 batch read → `l2Client.GetMany` → L2 batch read → one database query.
 
 **Errors**: the returned map always holds every key that succeeded. If some keys failed (backend, upstream or context errors), the error is a `*cachex.BatchError` whose `Errors` map lists them by key; `errors.Is`/`errors.As` see through it to the per-key errors. A per-key error is always a real failure, never a not-found: keys that do not exist are just absent from the map.
+
+`Get` and `GetMany` report the same three outcomes, each in the shape its return allows:
+
+| Outcome | `Get` | `GetMany` |
+|---|---|---|
+| found (the value may itself be `nil`) | `(value, nil)` | in the map |
+| does not exist | `cachex.IsErrKeyNotFound(err)` | absent from the map and from the `BatchError` |
+| failed | any other error | listed in the `BatchError` |
+
+A cached value can be `nil` (a nil pointer, for example) and is still a hit, so test presence with `v, ok := products[id]`, not with `products[id] == nil`.
 
 ```go
 products, err := client.GetMany(ctx, ids)

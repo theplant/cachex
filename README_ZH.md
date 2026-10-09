@@ -340,7 +340,9 @@ L1 缓存 → L2 缓存 → L3 缓存 → 数据库
 - upstream 写成功、本层自己的写入失败时，`Set`/`Del` 仍返回错误，但下层的改动**保留**（不回滚）：返回错误不代表什么都没写进去。本层会删掉这个 key 的条目和缓存的 Not-Found，下次读会回源到下层，读到改动后的结果。
 - 通过同一个 `Client` 并发 `Set`/`Del` 同一个 key 时，逐个执行，各层的写入顺序一致。需要等待的 `Set`/`Del`（等同一分片的其他写入，或者等正在回填本层的读），在 ctx 结束时放弃并返回 ctx 错误：它不写 upstream，并且和其他失败的写入一样，等分片空出来就删掉本层这个 key 的条目。不需要等待的照常执行，即使 ctx 已经结束。所以请求取消后再调 `Del` 做失效，本层总会被清掉，最多是在它返回后稍晚一点。写入一旦开始，失败后的清理（删掉本层条目）即使 ctx 已结束也会执行，最长 `WithFetchTimeout`。
 - 回源读到值**之后**、写回本层**之前**如果发生了 `Set`/`Del`，这次读仍然返回它读到的值，但绝不会用它覆盖更新的值：每个 `Client` 把 key 按哈希分到 1,024 个分片，每个分片有一把写锁和一个写入代数，`Get`、`GetMany` 和 serve-stale 的后台刷新在持有 key 所在分片的读锁时核对分片的写入代数，所以回填要么在 `Set`/`Del` 之前落下（随后被覆盖），要么被跳过。分片正在写入时回填也直接跳过，所以读永远不等写。落在同一分片的 key 共用这份状态：它们的写入逐个执行，写一个 key 可能让另一个 key 的回填被跳过。代价最多是多一次缓存未命中，或者一次写入要等另一个不相干 key 的写入、或等正在回填本层的读：一次大的 `GetMany` 在后端写回期间会占着它所有 key 的分片（1,000 个 key 约占六成），这些分片上任何 key 的 `Set`/`Del` 都要等这么久，ctx 先结束就放弃。
-- 这些保证在单个进程内成立；多个进程共用同一个下层（例如 Redis）时，各自的内存层仍可能短暂不一致。
+- 这些保证**只在单个进程内**成立：分片在一个 `Client` 的内存里，不知道其他实例的存在。多个实例共用同一个下层（例如 Redis）时：
+  - 一个实例上的写入到达不了其他实例的内存层，它们会继续返回旧值，直到过期。内存层的 TTL 不要超过你能接受的旧数据时长；要更快失效，请在业务代码里广播变更（例如 Redis Pub/Sub）；
+  - 一个实例刚从数据源读到旧值、另一个实例随即完成写入，前者仍可能在写入之后把旧值回填进共享的下层，并一直留到过期。这种竞态很少见（读和写要在几毫秒内交错），但旧值会存活整个共享层的 TTL，所以共享层的 TTL 也要设成你能接受的长度。
 
 ### Not-Found 缓存
 
@@ -416,7 +418,7 @@ client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick
 
 `GetMany` 的流程：
 
-1. **后端**：一次批量读（实现了 `BatchCache[T]` 就批量，否则逐个）。每个值按新鲜度分类：新鲜的直接返回；陈旧的先返回，再在后台合成一批刷新（开了 `WithServeStale` 时）；腐烂的和未命中的往下走。
+1. **后端**：一次批量读（实现了 `BatchCache[T]` 就批量，否则逐个）。读到的值按新鲜度处理：新鲜的放进结果；陈旧的也放进结果（开了 `WithServeStale` 时），同时这些 key 在后台合成一批刷新；腐烂的和未命中的继续走后面的步骤，查到的也放进同一份结果。整份结果一次返回。
 2. **Not-Found 缓存**：未命中的先查它，和 `Get` 一样。
 3. **Singleflight**：每个要回源的 key 都在和 `Get` **同一个** singleflight 里认领。已经有 `Get` 或别的 `GetMany` 在取的 key，等那次的结果，不再取一遍；所以 `Get` 和 `GetMany`（或两个有交集的 `GetMany`）同时要同一个 key，只回源一次。`WithFetchConcurrency` 照旧按 key 生效。
 4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存（默认的 `DoubleCheckAuto` 下，只查查找之后本 `Client` 写过其分片的那些 key）。
@@ -426,6 +428,16 @@ client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick
 `Client` 自己也实现了 `BatchUpstream[T]`，所以多层缓存时一批 key 每层只走一次调用：`l1Client.GetMany` → L1 批量读 → `l2Client.GetMany` → L2 批量读 → 一次数据库查询。
 
 **错误**：返回的 map 总是包含所有成功的 key。有 key 失败（后端、上游或 context 出错）时，error 是 `*cachex.BatchError`，它的 `Errors` 按 key 列出各自的错误；`errors.Is`/`errors.As` 能穿透到每个 key 的错误。每个 key 的错误都是真正的失败，不会是「不存在」：不存在的 key 只是不出现在 map 里。
+
+`Get` 和 `GetMany` 表达的是同样的三种结果，只是各自用了适合自己返回形式的方式：
+
+| 结果 | `Get` | `GetMany` |
+|---|---|---|
+| 找到了（值本身可能是 `nil`） | `(value, nil)` | 在 map 里 |
+| 不存在 | `cachex.IsErrKeyNotFound(err)` | 既不在 map 里，也不在 `BatchError` 里 |
+| 失败了 | 其他 error | 列在 `BatchError` 里 |
+
+缓存的值可以是 `nil`（比如空指针），它依然算命中。所以判断 key 在不在要用 `v, ok := products[id]`，不要用 `products[id] == nil`。
 
 ```go
 products, err := client.GetMany(ctx, ids)
