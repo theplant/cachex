@@ -92,20 +92,23 @@ func (r *RedisCache[T]) encode(key string, value T) (any, error) {
 	}
 }
 
-func (r *RedisCache[T]) decode(key string, data string) (T, error) {
+// decode reads a GET reply. cmd.Bytes() shares the reply's memory instead of
+// copying it; the cmd is discarded afterwards, so nothing else holds it.
+func (r *RedisCache[T]) decode(key string, cmd *redis.StringCmd) (T, error) {
 	var zero T
 
-	switch any(zero).(type) {
-	case string:
+	if _, ok := any(zero).(string); ok {
+		return any(cmd.Val()).(T), nil
+	}
+	data, _ := cmd.Bytes()
+	if _, ok := any(zero).([]byte); ok {
 		return any(data).(T), nil
-	case []byte:
-		return any([]byte(data)).(T), nil
 	}
 
 	var value T
 	if r.useBinary {
 		if unmarshaler, ok := any(&value).(encoding.BinaryUnmarshaler); ok {
-			if err := unmarshaler.UnmarshalBinary([]byte(data)); err != nil {
+			if err := unmarshaler.UnmarshalBinary(data); err != nil {
 				return zero, errors.Wrapf(err, "failed to unmarshal binary for key: %s", key)
 			}
 		}
@@ -113,7 +116,7 @@ func (r *RedisCache[T]) decode(key string, data string) (T, error) {
 	}
 
 	// For other types: unmarshal from JSON
-	if err := json.Unmarshal([]byte(data), &value); err != nil {
+	if err := json.Unmarshal(data, &value); err != nil {
 		return zero, errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
 	}
 	return value, nil
@@ -143,11 +146,11 @@ func (r *RedisCache[T]) handleRedisError(err error, key string) error {
 // Get retrieves a value from the cache
 func (r *RedisCache[T]) Get(ctx context.Context, key string) (T, error) {
 	var zero T
-	data, err := r.client.Get(ctx, r.prefixedKey(key)).Result()
-	if err != nil {
+	cmd := r.client.Get(ctx, r.prefixedKey(key))
+	if err := cmd.Err(); err != nil {
 		return zero, r.handleRedisError(err, key)
 	}
-	return r.decode(key, data)
+	return r.decode(key, cmd)
 }
 
 // Del removes a value from the cache
@@ -179,13 +182,13 @@ func (r *RedisCache[T]) GetMany(ctx context.Context, keys []string) (map[string]
 
 	var keyErrs map[string]error
 	for i, key := range keys {
-		data, err := cmds[i].Result()
+		err := cmds[i].Err()
 		if errors.Is(err, redis.Nil) {
 			continue
 		}
 		var value T
 		if err == nil {
-			value, err = r.decode(key, data)
+			value, err = r.decode(key, cmds[i])
 		} else {
 			err = r.handleRedisError(err, key)
 		}
