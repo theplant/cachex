@@ -838,7 +838,7 @@ func TestClientGetManyPerKeyFallbackIsPerKey(t *testing.T) {
 			}
 		})
 		cli := NewClient[string](NewSyncMap[string](), up,
-			WithFetchTimeout[string](100*time.Millisecond), WithGetManyConcurrency[string](1))
+			WithFetchTimeout[string](100*time.Millisecond), WithGetManyFetchConcurrency[string](1))
 		keys := make([]string, 10)
 		for i := range keys {
 			keys[i] = fmt.Sprintf("k%d", i)
@@ -857,7 +857,7 @@ func TestClientGetManyPerKeyFallbackIsPerKey(t *testing.T) {
 			}
 			return "v-" + key, nil
 		})
-		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](2))
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyFetchConcurrency[string](2))
 
 		done := make(chan struct{})
 		go func() {
@@ -1013,7 +1013,7 @@ func TestClientGetManyPerKeyFallbackDoesNotQueueOthers(t *testing.T) {
 			calls.Add(1)
 			return "v-" + key, nil
 		})
-		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](1))
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyFetchConcurrency[string](1))
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -1040,7 +1040,7 @@ func TestClientGetManyPerKeyFallbackDoesNotQueueOthers(t *testing.T) {
 			}
 			return "v-" + key, nil
 		})
-		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](1))
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyFetchConcurrency[string](1))
 		ctx, cancel := context.WithCancel(context.Background())
 		errc := make(chan error, 1)
 		go func() {
@@ -1080,7 +1080,7 @@ func TestClientGetManyRefreshOfManyKeysLogsNoFalseFailures(t *testing.T) {
 		}),
 		WithServeStale[string](true),
 		WithFetchTimeout[string](100*time.Millisecond), // each key fits, the six together do not
-		WithGetManyConcurrency[string](1),
+		WithGetManyFetchConcurrency[string](1),
 		WithLogger[string](slog.New(slog.NewTextHandler(&logBuf, nil))))
 
 	_, err := cli.GetMany(ctx, keys)
@@ -1159,7 +1159,7 @@ func TestClientGetManyOverAClientIsNotBoundedAsOneFetch(t *testing.T) {
 		time.Sleep(30 * time.Millisecond)
 		return "v-" + key, nil
 	})
-	l2 := NewClient[string](NewSyncMap[string](), src, WithGetManyConcurrency[string](1))
+	l2 := NewClient[string](NewSyncMap[string](), src, WithGetManyFetchConcurrency[string](1))
 	l1 := NewClient[string](NewSyncMap[string](), l2, WithFetchTimeout[string](100*time.Millisecond))
 	keys := []string{"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"}
 	got, err := l1.GetMany(context.Background(), keys)
@@ -1363,7 +1363,7 @@ func (m *slowSecondBatch) GetMany(ctx context.Context, keys []string) (map[strin
 func TestClientGetManyReviewFixes2(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("the per-key fallback fetches at most WithGetManyConcurrency keys at once", func(t *testing.T) {
+	t.Run("the per-key fallback fetches at most WithGetManyFetchConcurrency keys at once", func(t *testing.T) {
 		var cur, peak atomic.Int64
 		up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) {
 			n := cur.Add(1)
@@ -1377,7 +1377,7 @@ func TestClientGetManyReviewFixes2(t *testing.T) {
 			cur.Add(-1)
 			return key, nil
 		})
-		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyConcurrency[string](4))
+		cli := NewClient[string](NewSyncMap[string](), up, WithGetManyFetchConcurrency[string](4))
 		keys := make([]string, 50)
 		for i := range keys {
 			keys[i] = fmt.Sprintf("k%d", i)
@@ -1558,4 +1558,66 @@ func TestRedisCacheGetManyWhenRedisIsDown(t *testing.T) {
 	var be *BatchError
 	require.ErrorAs(t, err, &be)
 	assert.ElementsMatch(t, []string{"a", "b"}, slices.Collect(maps.Keys(be.Errors)))
+}
+
+func TestClientGetManyChunksBatchUpstreamCalls(t *testing.T) {
+	ctx := context.Background()
+	keys := []string{"k0", "k1", "k2", "k3", "k4"}
+
+	t.Run("calls carry at most the chunk size, at most the fetch concurrency at once", func(t *testing.T) {
+		var mu sync.Mutex
+		var sizes []int
+		var inFlight, peak atomic.Int32
+		up := batchUpstreamFunc[string](func(_ context.Context, ks []string) (map[string]string, error) {
+			n := inFlight.Add(1)
+			for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
+			}
+			defer inFlight.Add(-1)
+			mu.Lock()
+			sizes = append(sizes, len(ks))
+			mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+			out := map[string]string{}
+			for _, k := range ks {
+				out[k] = "v-" + k
+			}
+			return out, nil
+		})
+		cli := NewClient[string](NewSyncMap[string](), up,
+			WithGetManyChunkSize[string](2), WithGetManyFetchConcurrency[string](2))
+		got, err := cli.GetMany(ctx, keys)
+		require.NoError(t, err)
+		assert.Len(t, got, 5)
+		assert.ElementsMatch(t, []int{2, 2, 1}, sizes)
+		assert.Equal(t, int32(2), peak.Load())
+	})
+
+	t.Run("a chunk's keys are answered as soon as the chunk is done", func(t *testing.T) {
+		release := make(chan struct{})
+		up := batchUpstreamFunc[string](func(_ context.Context, ks []string) (map[string]string, error) {
+			if slices.Contains(ks, "k4") {
+				<-release // the last chunk hangs
+			}
+			out := map[string]string{}
+			for _, k := range ks {
+				out[k] = "v-" + k
+			}
+			return out, nil
+		})
+		cli := NewClient[string](NewSyncMap[string](), up,
+			WithGetManyChunkSize[string](2), WithGetManyFetchConcurrency[string](3))
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_, _ = cli.GetMany(ctx, keys)
+		}()
+		getCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		require.Eventually(t, func() bool { // k0 is claimed by the GetMany, then answered by its chunk
+			v, err := cli.Get(getCtx, "k0")
+			return err == nil && v == "v-k0"
+		}, time.Second, 5*time.Millisecond)
+		close(release)
+		<-done
+	})
 }

@@ -17,10 +17,10 @@ import (
 var (
 	DefaultFetchTimeout     = 60 * time.Second
 	DefaultFetchConcurrency = 1
-	// DefaultGetManyConcurrency bounds the concurrent upstream.Get calls of one
-	// GetMany when the upstream does not implement BatchUpstream.
-	DefaultGetManyConcurrency = 16
-	NowFunc                   = time.Now
+	// DefaultGetManyFetchConcurrency bounds the upstream requests one GetMany
+	// has in flight at once (see WithGetManyFetchConcurrency).
+	DefaultGetManyFetchConcurrency = 16
+	NowFunc                        = time.Now
 )
 
 // Client manages cache operations with automatic upstream fetching
@@ -36,6 +36,7 @@ type Client[T any] struct {
 	fetchTimeout     time.Duration
 	fetchConcurrency int
 	getManyConc      int
+	getManyChunk     int // keys per BatchUpstream call; 0 means all in one
 	logger           *slog.Logger
 
 	flights         flightGroup[T]
@@ -73,7 +74,7 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		upstream:         upstream,
 		fetchTimeout:     DefaultFetchTimeout,
 		fetchConcurrency: DefaultFetchConcurrency,
-		getManyConc:      DefaultGetManyConcurrency,
+		getManyConc:      DefaultGetManyFetchConcurrency,
 		logger:           slog.Default(),
 		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
 		writeSeed:        maphash.MakeSeed(),
@@ -93,8 +94,11 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 	if c.fetchConcurrency <= 0 {
 		panic("fetchConcurrency must be positive")
 	}
+	if c.getManyChunk < 0 {
+		panic("getManyChunkSize must not be negative")
+	}
 	if c.getManyConc <= 0 {
-		panic("getManyConcurrency must be positive")
+		panic("getManyFetchConcurrency must be positive")
 	}
 
 	return c
@@ -628,13 +632,25 @@ func WithFetchConcurrency[T any](concurrency int) ClientOption[T] {
 	}
 }
 
-// WithGetManyConcurrency sets the maximum number of keys one GetMany fetches
-// at a time when the upstream does not implement BatchUpstream (default
-// DefaultGetManyConcurrency); each is fetched as Get would, with its own fetch
-// timeout. It does not apply to a BatchUpstream, which gets one GetMany call.
-func WithGetManyConcurrency[T any](concurrency int) ClientOption[T] {
+// WithGetManyFetchConcurrency sets how many upstream requests one GetMany has
+// in flight at once (default DefaultGetManyFetchConcurrency): upstream.Get
+// calls when the upstream does not implement BatchUpstream (each key fetched as
+// Get would), or chunks of a BatchUpstream call (see WithGetManyChunkSize).
+// Unlike WithFetchConcurrency, which bounds the fetches of one key, this bounds
+// the different keys (or chunks) of one GetMany.
+func WithGetManyFetchConcurrency[T any](concurrency int) ClientOption[T] {
 	return func(c *Client[T]) {
 		c.getManyConc = concurrency
+	}
+}
+
+// WithGetManyChunkSize splits the keys one GetMany sends to a BatchUpstream into
+// calls of at most size keys, run concurrently up to WithGetManyFetchConcurrency;
+// the keys of a call are answered as soon as it returns. Zero (the default)
+// sends them in one call. Use it when the upstream limits its batch size.
+func WithGetManyChunkSize[T any](size int) ClientOption[T] {
+	return func(c *Client[T]) {
+		c.getManyChunk = size
 	}
 }
 

@@ -1,10 +1,12 @@
 package cachex
 
 import (
+	"cmp"
 	"context"
 	stderrors "errors"
 	"log/slog"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"time"
 
@@ -150,7 +152,7 @@ type result[T any] struct {
 //     BatchUpstream, the keys this call claims are double-checked
 //     (WithDoubleCheck) and fetched together with one upstream.GetMany under
 //     one fetch timeout. Otherwise each key is fetched exactly as Get would
-//     (claimed only when its turn comes), at most WithGetManyConcurrency at a
+//     (claimed only when its turn comes), at most WithGetManyFetchConcurrency at a
 //     time, and a canceled GetMany starts no more keys.
 //   - Fetched values are written to the backend and not-found keys to the
 //     not-found cache, without touching the upstream, exactly like Get: in
@@ -406,39 +408,55 @@ func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string,
 			return
 		}
 
-		pendingKeys := make([]string, len(pending))
-		for j, i := range pending {
-			pendingKeys[j] = keys[i]
+		// one call per chunk, getManyConc at a time; each answers its keys
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, c.getManyConc)
+		for chunk := range slices.Chunk(pending, cmp.Or(c.getManyChunk, len(pending))) {
+			sem <- struct{}{}
+			wg.Go(func() {
+				defer func() { <-sem }()
+				p.run(ctx, chunk, func() { c.fetchChunk(ctx, p, chunk) })
+			})
 		}
-		// like Get, the fetch timeout starts after the double-check. A Client below
-		// bounds each of its own fetches, so its batch is not bounded as one fetch:
-		// keys still queued there would fail with this deadline, not their own.
-		timeout := c.fetchTimeout
-		if lower, layered := c.upstream.(*Client[T]); layered {
-			timeout += lower.batchTimeout(len(pendingKeys))
-		}
-		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
-		for j, r := range c.doFetchMany(fetchCtx, pendingKeys) {
-			p.publish(pending[j], r)
-		}
+		wg.Wait()
 	})
+}
+
+// fetchChunk fetches the claimed flights idxs with one upstream.GetMany.
+func (c *Client[T]) fetchChunk(ctx context.Context, p *claimed[T], idxs []int) {
+	keys := make([]string, len(idxs))
+	for j, i := range idxs {
+		keys[j] = p.keys[i]
+	}
+	// like Get, the fetch timeout starts after the double-check. A Client below
+	// bounds each of its own fetches, so its call is not bounded as one fetch:
+	// keys still queued there would fail with this deadline, not their own.
+	timeout := c.fetchTimeout
+	if lower, layered := c.upstream.(*Client[T]); layered {
+		timeout += lower.batchTimeout(len(keys))
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for j, r := range c.doFetchMany(fetchCtx, keys) {
+		p.publish(idxs[j], r)
+	}
 }
 
 // batchTimeout is how long a GetMany of n keys sent to this Client as an
 // upstream may legitimately take: a fetch timeout for its own reads and
-// write-back, plus its fetches (one batch, a lower Client's own budget, or a
-// queue of per-key fetches, getManyConc at a time).
+// write-back, plus its fetches: rounds of getManyConc calls at a time, each a
+// fetch timeout (a lower Client's own budget per call), or per-key fetches.
 func (c *Client[T]) batchTimeout(n int) time.Duration {
-	switch up := c.upstream.(type) {
-	case *Client[T]:
-		return c.fetchTimeout + up.batchTimeout(n)
-	case BatchUpstream[T]:
-		return 2 * c.fetchTimeout
-	default:
-		rounds := (n + c.getManyConc - 1) / c.getManyConc
-		return c.fetchTimeout * time.Duration(1+rounds)
+	ceil := func(a, b int) int { return (a + b - 1) / b }
+	if _, ok := c.upstream.(BatchUpstream[T]); !ok {
+		return c.fetchTimeout * time.Duration(1+ceil(n, c.getManyConc))
 	}
+	size := max(1, min(n, cmp.Or(c.getManyChunk, n)))
+	rounds := time.Duration(ceil(ceil(n, size), c.getManyConc))
+	if lower, layered := c.upstream.(*Client[T]); layered {
+		return c.fetchTimeout + rounds*lower.batchTimeout(size)
+	}
+	return c.fetchTimeout + rounds*c.fetchTimeout
 }
 
 // doFetchMany is the batch form of doFetch: fetch from the batch upstream,
