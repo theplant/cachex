@@ -355,3 +355,24 @@ func TestGORMCacheRetriesDeadlockVictims(t *testing.T) {
 	err = db.Transaction(func(tx *gorm.DB) error { return cache.Set(WithGORMTx(ctx, tx), "k", "v3") })
 	assert.True(t, isDeadlock(err), "inside the caller's transaction, which the deadlock rolled back, nothing is retried")
 }
+
+func TestCheckMySQLVersion(t *testing.T) {
+	for version, ok := range map[string]bool{
+		"8.0.17":                  true,
+		"8.0.36-0ubuntu0.22.04.1": true,
+		"8.4.2":                   true,
+		"9.1.0":                   true,
+		"8.0.16":                  false,
+		"5.7.44-log":              false,
+		"10.11.6-MariaDB":         false,
+		"11.4.2-MariaDB-ubu2404":  false,
+		"garbage":                 false,
+	} {
+		err := checkMySQLVersion(version)
+		if ok {
+			assert.NoError(t, err, version)
+		} else {
+			assert.ErrorContains(t, err, "MySQL 8.0.17 or later", version)
+		}
+	}
+}

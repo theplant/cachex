@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	stderrors "errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -53,6 +54,24 @@ func isDeadlock(err error) bool {
 		return pg.SQLState() == "40P01" || pg.SQLState() == "40001"
 	}
 	return strings.Contains(err.Error(), "Error 1213 (40001)")
+}
+
+// checkMySQLVersion fails unless version (SELECT VERSION()) is MySQL 8.0.17
+// or later, the first with the utf8mb4_0900_bin collation Migrate creates
+// tables with. MariaDB has no such collation.
+func checkMySQLVersion(version string) error {
+	fail := errors.Errorf("GORMCache needs MySQL 8.0.17 or later to create its table (utf8mb4_0900_bin collation), found %q", version)
+	if strings.Contains(version, "MariaDB") {
+		return fail
+	}
+	var major, minor, patch int
+	if _, err := fmt.Sscanf(version, "%d.%d.%d", &major, &minor, &patch); err != nil {
+		return fail
+	}
+	if cmp.Or(cmp.Compare(major, 8), cmp.Compare(minor, 0), cmp.Compare(patch, 17)) < 0 {
+		return fail
+	}
+	return nil
 }
 
 // keyColumn is the key column as a clause, so GORM quotes it: "key" is a
@@ -135,6 +154,15 @@ func (g *GORMCache[T]) prefixedKey(key string) string {
 func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 	tx := cmp.Or(GetGORMTx(ctx), g.db).WithContext(ctx).Table(g.tableName)
 	if tx.Name() == "mysql" {
+		if !tx.Migrator().HasTable(g.tableName) {
+			var version string
+			if err := tx.Raw("SELECT VERSION()").Scan(&version).Error; err != nil {
+				return errors.Wrap(err, "failed to read the MySQL version")
+			}
+			if err := checkMySQLVersion(version); err != nil {
+				return err
+			}
+		}
 		// keys compare exactly (case, trailing spaces), MySQL's defaults do not; applies
 		// only when the table is created, an existing one is left as it is
 		tx = tx.Set("gorm:table_options", "CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin") // MySQL 8.0.17+
