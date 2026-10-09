@@ -172,7 +172,7 @@ sequenceDiagram
 - **NotFoundCache** - Dedicated cache for non-existent keys to prevent cache penetration
 - **Upstream** - Data source (database, API, another Client, or custom)
 - **Singleflight** - Deduplicates concurrent requests for the same key (primary defense against cache stampede)
-- **DoubleCheck** - Re-checks backend and notFoundCache before upstream fetch to catch concurrent writes (eliminates race window)
+- **DoubleCheck** - After claiming a fetch, re-checks backend and notFoundCache to catch a value another request just wrote, instead of fetching it again
 - **Entry** - Wrapper with timestamp for time-based staleness checks
 
 ## Cache Backends
@@ -421,7 +421,7 @@ How `GetMany` works:
 1. **Backend**: one batch read (`BatchCache[T]`, otherwise key by key). Each value is classified by staleness: fresh values are returned, stale values are returned and refreshed in the background together (with `WithServeStale`), rotten values and misses go on.
 2. **Not-Found cache**: misses are checked against it, exactly like `Get`.
 3. **Singleflight**: every key that needs the upstream is claimed in the **same** singleflight `Get` uses. Keys already being fetched by a `Get` or another `GetMany` are waited for, not fetched again; so a `Get` and a `GetMany` (or two overlapping `GetMany`s) fetch a shared key only once. `WithFetchConcurrency` applies per key as usual.
-4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get`.
+4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get` (in the default `DoubleCheckAuto`, only the keys whose stripe this `Client` wrote since the lookup).
 5. **Upstream**: if the upstream implements `BatchUpstream[T]`, the remaining keys are fetched with **one** `GetMany` call, or, with `WithGetManyChunkSize(n)`, with calls of at most `n` keys run concurrently (useful when the upstream limits its batch size). Each call has one `WithFetchTimeout` (over a lower `Client`, as long as that `Client`'s own fetches may take, e.g. a queue of per-key fetch timeouts). The keys of one call are answered together, as soon as it returns: a concurrent `Get` of one of them joins the call and waits for it. Otherwise each key is fetched exactly as `Get` would (its own double-check, fetch timeout and write-back, and handed to its waiters as soon as it arrives), at most `WithGetManyFetchConcurrency` (default 16) at a time. The same option bounds the concurrent chunk calls above, so it reads as "upstream requests one `GetMany` has in flight" (`WithFetchConcurrency`, by contrast, bounds the fetches of one key). A key is claimed only when its turn comes, so a concurrent `Get` of a key still queued here does not wait for the queue, and a canceled `GetMany` starts no more keys.
 6. **Write back**: found values go to the backend, missing keys to the Not-Found cache. With a `BatchUpstream` this is one `SetMany`/`DelMany` per batch (when the backend supports it); without one, each key is written back on its own, like `Get`. Either way this only touches this layer, never the upstream.
 
@@ -526,10 +526,11 @@ user, err := userCache.Get(ctx, "user:123")
    - **N > 1**: Moderate redundancy - requests distributed across N slots for higher throughput
 
 2. **DoubleCheck** (Supplementary):
-   - Handles the narrow race window where Request B checks the cache (miss) before Request A completes its write
+   - Handles the window where Request B reads the cache (miss) just before Request A's fetch writes it, but claims the key only after A's fetch finished: B re-reads instead of fetching again
    - Works **across all singleflight slots**, enabling fast convergence after first successful fetch
-   - Auto-enabled by default when notFoundCache is configured (smart detection)
-   - Configure with `WithDoubleCheck(DoubleCheckEnabled/Disabled/Auto)` based on your scenario
+   - The saving grows with how long a cache read takes to come back and how hot the key is. Measured with a key requested 20 times per ms, expiring every 20 ms, a 5 ms upstream and a cache answering in 1 ms: 18 upstream calls with it, 30 without; with an in-memory cache, no difference
+   - Default `DoubleCheckAuto` re-checks only when this `Client` wrote the key's stripe since the request read the cache, so cold keys and keys that do not exist skip the useless re-read (measured over 8000 cold keys: 1.004 cache reads per `Get`, against 2 with `DoubleCheckEnabled`)
+   - Configure with `WithDoubleCheck(DoubleCheckEnabled/Disabled/Auto)`; `DoubleCheckEnabled` also catches values other processes wrote to a shared cache
 
 ### Q: What's the difference between fresh and stale TTL?
 

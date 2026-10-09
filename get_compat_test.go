@@ -288,6 +288,7 @@ func TestGetCompatDoubleCheckRaceWindow(t *testing.T) {
 	}{
 		{"enabled: the late request reuses the value just written", DoubleCheckEnabled, 1},
 		{"disabled: the late request fetches again", DoubleCheckDisabled, 2},
+		{"auto: the early request's write-back is seen, so the late one double-checks", DoubleCheckAuto, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()

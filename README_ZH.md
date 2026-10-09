@@ -172,7 +172,7 @@ sequenceDiagram
 - **NotFoundCache** - 专门缓存不存在的 key，防止缓存穿透
 - **Upstream** - 数据源（数据库、API、另一个 Client 或自定义）
 - **Singleflight** - 对相同 key 的并发请求去重（防御缓存击穿的主要机制）
-- **DoubleCheck** - 在查询 upstream 前重新检查 backend 和 notFoundCache 以捕获并发写入（消除竞态窗口）
+- **DoubleCheck** - 认领回源之后，再查一次 backend 和 notFoundCache，如果别的请求刚把值写进去，就直接用它，不再回源
 - **Entry** - 带时间戳的包装器，用于基于时间的陈旧检查
 
 ## 缓存后端
@@ -419,7 +419,7 @@ client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick
 1. **后端**：一次批量读（实现了 `BatchCache[T]` 就批量，否则逐个）。每个值按新鲜度分类：新鲜的直接返回；陈旧的先返回，再在后台合成一批刷新（开了 `WithServeStale` 时）；腐烂的和未命中的往下走。
 2. **Not-Found 缓存**：未命中的先查它，和 `Get` 一样。
 3. **Singleflight**：每个要回源的 key 都在和 `Get` **同一个** singleflight 里认领。已经有 `Get` 或别的 `GetMany` 在取的 key，等那次的结果，不再取一遍；所以 `Get` 和 `GetMany`（或两个有交集的 `GetMany`）同时要同一个 key，只回源一次。`WithFetchConcurrency` 照旧按 key 生效。
-4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存。
+4. **DoubleCheck**：认领到的 key 按和 `Get` 相同的规则再查一次后端和 Not-Found 缓存（默认的 `DoubleCheckAuto` 下，只查查找之后本 `Client` 写过其分片的那些 key）。
 5. **上游**：上游实现了 `BatchUpstream[T]`，剩下的 key 就调**一次** `GetMany`；设了 `WithGetManyChunkSize(n)` 时，切成每次最多 `n` 个 key 的多次调用并发执行（适合上游限制了批量大小的情况）。每次调用共用一个 `WithFetchTimeout`（下层是 `Client` 时，上限放宽到下层自己的拉取最多可能用的时间，比如逐 key 排队时按轮数累加的超时）。同一次调用里的 key 在这次调用返回时一起返回：并发 `Get` 其中某个 key 会加入这次调用，等它结束。否则每个 key 都和 `Get` 完全一样地拉取（各自 double check、各自超时、各自回填，拉到就交给等它的调用方），同时最多 `WithGetManyFetchConcurrency` 个（默认 16）。上面分批调用的并发数也由它限制，所以它的含义是「一次 `GetMany` 同时向上游发出的请求数」（相比之下，`WithFetchConcurrency` 限制的是同一个 key 的并发回源数）；每个 key 轮到时才认领，所以并发的 `Get` 碰上还在这里排队的 key 不用等整个队列，`GetMany` 被取消后也不再开始新的 key。
 6. **回填**：取到的值写回后端，不存在的 key 写进 Not-Found 缓存。上游实现了 `BatchUpstream` 时，一批只调一次 `SetMany`/`DelMany`（后端支持的话）；否则每个 key 各自回填，和 `Get` 一样。两种情况都只写本层，不写上游。
 
@@ -524,10 +524,11 @@ user, err := userCache.Get(ctx, "user:123")
    - **N > 1**：适度冗余 - 请求分布在 N 个 slot 中，提升吞吐量
 
 2. **DoubleCheck**（辅助）：
-   - 处理窄竞态窗口，即请求 B 在请求 A 完成写入之前检查缓存（miss）
+   - 处理这样的窗口：请求 B 在请求 A 的回源写入缓存之前读到未命中，却在 A 的回源结束之后才认领这个 key；B 改为再读一次缓存，而不是再回源一次
    - **跨所有 singleflight slot 工作**，确保首次成功 fetch 后快速收敛
-   - 默认情况下当配置了 notFoundCache 时自动启用（智能检测）
-   - 可通过 `WithDoubleCheck(DoubleCheckEnabled/Disabled/Auto)` 根据场景配置
+   - 收益随缓存读的响应时间和 key 的热度增长。实测：一个 key 每毫秒 20 次请求、每 20ms 过期一次、上游 5ms、缓存 1ms 响应时，开启时上游调用 18 次，关闭时 30 次；内存缓存则没有区别
+   - 默认的 `DoubleCheckAuto` 只在请求读缓存之后、本 `Client` 写过这个 key 所在分片时才再读，冷 key 和不存在的 key 就不会白读一次（实测 8000 个冷 key：每次 `Get` 读缓存 1.004 次，`DoubleCheckEnabled` 是 2 次）
+   - 用 `WithDoubleCheck(DoubleCheckEnabled/Disabled/Auto)` 配置；`DoubleCheckEnabled` 还能抓到其他进程写进共享缓存的值
 
 ### Q: 新鲜 TTL 和过期 TTL 有什么区别？
 

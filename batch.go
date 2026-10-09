@@ -175,11 +175,13 @@ func (c *Client[T]) GetMany(ctx context.Context, keys []string) (map[string]T, e
 	errs := map[string]error{}
 
 	var fetchKeys, refreshKeys []string
+	var fetchSeen, refreshSeen []uint64
 	for i, r := range c.lookupMany(ctx, keys, false) {
 		key := keys[i]
 		switch {
 		case r.fetch:
 			fetchKeys = append(fetchKeys, key)
+			fetchSeen = append(fetchSeen, r.seen)
 		case r.err == nil:
 			out[key] = r.value
 		case !IsErrKeyNotFound(r.err):
@@ -187,11 +189,12 @@ func (c *Client[T]) GetMany(ctx context.Context, keys []string) (map[string]T, e
 		}
 		if r.refresh {
 			refreshKeys = append(refreshKeys, key)
+			refreshSeen = append(refreshSeen, r.seen)
 		}
 	}
 
 	if len(refreshKeys) > 0 {
-		c.asyncRefreshMany(context.WithoutCancel(ctx), refreshKeys)
+		c.asyncRefreshMany(context.WithoutCancel(ctx), refreshKeys, refreshSeen)
 	}
 
 	if len(fetchKeys) > 0 {
@@ -199,7 +202,7 @@ func (c *Client[T]) GetMany(ctx context.Context, keys []string) (map[string]T, e
 		for i, key := range fetchKeys {
 			sfKeys[i] = c.makeSFKey(key)
 		}
-		for i, r := range c.fetchMany(ctx, fetchKeys, sfKeys) {
+		for i, r := range c.fetchMany(ctx, fetchKeys, sfKeys, fetchSeen) {
 			key := fetchKeys[i]
 			switch {
 			case r.err == nil:
@@ -219,9 +222,10 @@ func (c *Client[T]) GetMany(ctx context.Context, keys []string) (map[string]T, e
 // lookup is what the caches say about one key.
 type lookup[T any] struct {
 	value   T
-	err     error // final error (ErrKeyNotFound for a cached not-found), unless fetch
-	fetch   bool  // must be fetched from upstream
-	refresh bool  // served stale, refresh in the background
+	err     error  // final error (ErrKeyNotFound for a cached not-found), unless fetch
+	fetch   bool   // must be fetched from upstream
+	refresh bool   // served stale, refresh in the background
+	seen    uint64 // the key's stripe epoch before reading, see shouldDoubleCheck
 }
 
 // lookupMany is the batch form of the cache part of get: it reads the backend
@@ -234,6 +238,9 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 		checkDataStale = alwaysFresh[T]
 	}
 
+	for i, key := range keys {
+		res[i].seen = c.stripe(key).epoch()
+	}
 	values, err := getMany(ctx, c.backend, keys)
 	var missing []int
 	for i, key := range keys {
@@ -312,13 +319,14 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 // fetchMany fetches keys through the flight group. For a BatchUpstream it
 // claims every key, fetches the claimed ones as one batch, and waits for all
 // of them (including those claimed by others); otherwise see fetchEach.
-func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []result[T] {
+func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string, seen []uint64) []result[T] {
 	if _, ok := c.upstream.(BatchUpstream[T]); !ok {
-		return c.fetchEach(ctx, keys, sfKeys)
+		return c.fetchEach(ctx, keys, sfKeys, seen)
 	}
 	flights := make([]*flight[T], len(keys))
 	var ownKeys, ownSFKeys []string
 	var ownFlights []*flight[T]
+	var ownSeen []uint64
 	for i, sfKey := range sfKeys {
 		f, leader := c.flights.claim(sfKey)
 		flights[i] = f
@@ -326,10 +334,11 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 			ownKeys = append(ownKeys, keys[i])
 			ownSFKeys = append(ownSFKeys, sfKey)
 			ownFlights = append(ownFlights, f)
+			ownSeen = append(ownSeen, seen[i])
 		}
 	}
 	if len(ownKeys) > 0 {
-		go c.fetchClaimedMany(flightCtx(ctx), ownKeys, ownSFKeys, ownFlights)
+		go c.fetchClaimedMany(flightCtx(ctx), ownKeys, ownSFKeys, ownFlights, ownSeen)
 	}
 
 	results := make([]result[T], len(keys))
@@ -352,7 +361,7 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 // as Get would, at most getManyConc at a time. A key is claimed only when its
 // turn comes, so a Get of a key still queued here does not wait for the queue,
 // and once ctx is done no more keys are started.
-func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string) []result[T] {
+func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string, seen []uint64) []result[T] {
 	results := make([]result[T], len(keys))
 	sem := make(chan struct{}, c.getManyConc)
 	var wg sync.WaitGroup
@@ -362,7 +371,7 @@ func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string) []resu
 			case sem <- struct{}{}:
 				wg.Go(func() {
 					defer func() { <-sem }()
-					value, err := c.fetchFromUpstreamWithSFKey(ctx, key, sfKeys[i])
+					value, err := c.fetchFromUpstreamWithSFKey(ctx, key, sfKeys[i], seen[i])
 					results[i] = result[T]{value: value, err: err}
 				})
 				continue
@@ -378,20 +387,31 @@ func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string) []resu
 // fetchClaimedMany is the batch form of fetchClaimed for a BatchUpstream:
 // double-check, then fetch what is still missing; every flight is answered as
 // soon as its result is known.
-func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight[T]) {
+func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight[T], seen []uint64) {
 	p := c.claimedFlights(keys, sfKeys, flights)
 	all := make([]int, len(keys))
 	for i := range all {
 		all[i] = i
 	}
 	p.run(ctx, all, func() {
-		pending := all
-		if c.enableDoubleCheck {
-			pending = nil
+		var pending, check []int
+		for i, key := range keys {
+			if c.shouldDoubleCheck(key, seen[i]) {
+				check = append(check, i)
+			} else {
+				pending = append(pending, i)
+			}
+		}
+		if len(check) > 0 {
+			checkKeys := make([]string, len(check))
+			for j, i := range check {
+				checkKeys[j] = keys[i]
+			}
 			checkCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
-			lookups := c.lookupMany(checkCtx, keys, true)
+			lookups := c.lookupMany(checkCtx, checkKeys, true)
 			cancel()
-			for i, r := range lookups {
+			for j, r := range lookups {
+				i := check[j]
 				switch {
 				case r.fetch:
 					pending = append(pending, i)
@@ -492,6 +512,7 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 	}()
 	found := map[string]T{}
 	var notFound []string
+	filled := map[*writeStripe]bool{}
 	for i, key := range keys {
 		s := c.stripe(key)
 		ok, seen := held[s]
@@ -505,8 +526,10 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 		switch {
 		case results[i].err == nil:
 			found[key] = results[i].value
+			filled[s] = true
 		case IsErrKeyNotFound(results[i].err):
 			notFound = append(notFound, key)
+			filled[s] = true
 		}
 	}
 	if err := c.setManyWithoutUpstream(ctx, found); err != nil {
@@ -514,6 +537,9 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 	}
 	if err := c.delManyWithoutUpstream(ctx, notFound); err != nil {
 		c.logger.WarnContext(ctx, "failed to delete cache entries", "error", err)
+	}
+	for s := range filled { // see writeStripe.epoch
+		s.fills.Add(1)
 	}
 
 	return results
@@ -567,13 +593,15 @@ func (c *Client[T]) delManyWithoutUpstream(ctx context.Context, keys []string) e
 
 // asyncRefreshMany is the batch form of asyncRefresh: the stale keys of one
 // GetMany are refreshed together in the background.
-func (c *Client[T]) asyncRefreshMany(ctx context.Context, keys []string) {
+func (c *Client[T]) asyncRefreshMany(ctx context.Context, keys []string, seen []uint64) {
 	var refreshKeys, sfKeys []string
-	for _, key := range keys {
+	var refreshSeen []uint64
+	for i, key := range keys {
 		sfKey := c.makeSFKey(key)
 		if _, loaded := c.asyncRefreshing.LoadOrStore(sfKey, struct{}{}); !loaded {
 			refreshKeys = append(refreshKeys, key)
 			sfKeys = append(sfKeys, sfKey)
+			refreshSeen = append(refreshSeen, seen[i])
 		}
 	}
 	if len(refreshKeys) == 0 {
@@ -588,7 +616,7 @@ func (c *Client[T]) asyncRefreshMany(ctx context.Context, keys []string) {
 		}()
 		// every fetch answers its waiters (bounded by its fetch timeout, and with
 		// an error if it panics or exits), so this wait needs no bound of its own
-		for i, r := range c.fetchMany(ctx, refreshKeys, sfKeys) {
+		for i, r := range c.fetchMany(ctx, refreshKeys, sfKeys, refreshSeen) {
 			if r.err != nil && !IsErrKeyNotFound(r.err) {
 				c.logger.ErrorContext(ctx, "async refresh failed", "key", refreshKeys[i], "error", r.err)
 			}
