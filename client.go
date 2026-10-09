@@ -7,7 +7,6 @@ import (
 	"hash/maphash"
 	"log/slog"
 	"math/rand/v2"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -433,7 +432,7 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 
 	f, leader := c.flights.claim(sfKey)
 	if leader {
-		go c.runClaimed(ctx, key, sfKey, f)
+		go c.runClaimed(flightCtx(ctx), key, sfKey, f)
 	}
 
 	select {
@@ -450,38 +449,27 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 	}
 }
 
+// flightCtx is the ctx of a fetch claimed by one request but awaited by every
+// request of the key: it keeps ctx's values (tracing, etc.) but not its
+// cancellation, which belongs to that one request, nor its GORM transaction.
+func flightCtx(ctx context.Context) context.Context {
+	return withoutGORMTx(context.WithoutCancel(ctx))
+}
+
 // runClaimed fetches a key this request has claimed and publishes the result.
 func (c *Client[T]) runClaimed(ctx context.Context, key, sfKey string, f *flight[T]) {
-	returned := false
-	defer func() {
-		if !returned {
-			// runtime.Goexit in the upstream: release the key without
-			// publishing, like x/sync/singleflight; waiters wait for their ctx.
-			c.flights.forget(sfKey, f)
-		}
-	}()
-	value, err := c.fetchClaimed(ctx, key)
-	returned = true
-	c.flights.finish(sfKey, f, value, err)
+	p := c.claimedFlights([]string{key}, []string{sfKey}, []*flight[T]{f})
+	p.run(ctx, []int{0}, func() {
+		value, err := c.fetchClaimed(ctx, key)
+		p.publish(0, result[T]{value: value, err: err})
+	})
 }
 
 // fetchClaimed fetches a key this request has claimed in the flight group.
-func (c *Client[T]) fetchClaimed(ctx context.Context, key string) (result T, resultErr error) {
+func (c *Client[T]) fetchClaimed(ctx context.Context, key string) (T, error) {
 	if c.testHooks != nil && c.testHooks.afterSingleflightStart != nil {
 		c.testHooks.afterSingleflightStart(ctx, key)
 	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			c.logger.ErrorContext(ctx, "panic during upstream fetch",
-				"key", key,
-				"panic", r,
-				"stack", string(debug.Stack()))
-			var zero T
-			result = zero
-			resultErr = errors.Errorf("panic during upstream fetch: %v", r)
-		}
-	}()
 
 	// Double-check optimization: check cache again before fetching from upstream
 	// This handles the narrow window after a write completes but before singleflight releases
@@ -491,7 +479,9 @@ func (c *Client[T]) fetchClaimed(ctx context.Context, key string) (result T, res
 	// 2. Once ANY slot completes, ALL slots should converge to reuse that result (convergence phase)
 	// 3. Using key ensures cross-slot visibility, maximizing result reuse after first completion
 	if c.enableDoubleCheck {
-		cachedValue, err := c.get(ctx, key, true)
+		checkCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+		cachedValue, err := c.get(checkCtx, key, true)
+		cancel()
 
 		if err == nil {
 			return cachedValue, nil
@@ -503,7 +493,7 @@ func (c *Client[T]) fetchClaimed(ctx context.Context, key string) (result T, res
 		// otherwise, fetch from upstream
 	}
 
-	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
+	fetchCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
 	defer cancel()
 	return c.doFetch(fetchCtx, key)
 }

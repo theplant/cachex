@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestClientBasics(t *testing.T) {
@@ -874,4 +875,50 @@ func waitAsyncRefreshDone[T any](t *testing.T, cli *Client[T]) {
 		})
 		return idle
 	}, time.Second, time.Millisecond, "background refresh should finish")
+}
+
+func TestFetchIsDetachedFromTheLeader(t *testing.T) {
+	t.Run("a leader that gives up does not fail the double-check for the others", func(t *testing.T) {
+		backend := ctxCache{NewSyncMap[string]()} // refuses a done ctx, like Redis or GORM
+		var calls atomic.Int32
+		cli := NewClient[string](ctxGetCache{backend}, UpstreamFunc[string](func(context.Context, string) (string, error) {
+			calls.Add(1)
+			return "from-upstream", nil
+		}), WithDoubleCheck[string](DoubleCheckEnabled))
+		leaderCtx, cancel := context.WithCancel(context.Background())
+		cli.testHooks = &testHooks{afterSingleflightStart: func(context.Context, string) {
+			// between the leader's miss and its double-check: another request
+			// filled the cache, and the leader's caller gave up
+			_ = backend.Set(context.Background(), "k", "filled-meanwhile")
+			cancel()
+		}}
+		_, _ = cli.Get(leaderCtx, "k")
+		require.Eventually(t, func() bool {
+			v, err := backend.Get(context.Background(), "k")
+			return err == nil && v == "filled-meanwhile"
+		}, time.Second, time.Millisecond)
+		time.Sleep(20 * time.Millisecond) // let a wrongly started fetch show up
+		assert.Zero(t, calls.Load(), "the double-check ran with the flight's ctx, found the value, and skipped the upstream")
+	})
+
+	t.Run("the fetch does not run in the leader's GORM transaction", func(t *testing.T) {
+		var sawTx atomic.Bool
+		cli := NewClient[string](NewSyncMap[string](), UpstreamFunc[string](func(ctx context.Context, _ string) (string, error) {
+			sawTx.Store(GetGORMTx(ctx) != nil)
+			return "v", nil
+		}))
+		_, err := cli.Get(WithGORMTx(context.Background(), &gorm.DB{}), "k")
+		require.NoError(t, err)
+		assert.False(t, sawTx.Load(), "the fetch serves every waiter, so it must not write inside one caller's transaction")
+	})
+}
+
+// ctxGetCache is a cache whose Get refuses a done ctx, like Redis or GORM.
+type ctxGetCache struct{ ctxCache }
+
+func (c ctxGetCache) Get(ctx context.Context, key string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return c.SyncMap.Get(ctx, key)
 }

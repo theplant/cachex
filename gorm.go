@@ -154,6 +154,15 @@ func WithGORMTx(ctx context.Context, tx *gorm.DB) context.Context {
 	return context.WithValue(ctx, ctxKeyGORMTx{}, tx)
 }
 
+// withoutGORMTx hides ctx's GORM transaction: a fetch shared by every waiter
+// must not write inside one caller's transaction.
+func withoutGORMTx(ctx context.Context) context.Context {
+	if GetGORMTx(ctx) == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyGORMTx{}, (*gorm.DB)(nil))
+}
+
 // GetGORMTx retrieves the GORM transaction from the context.
 // Returns nil if no transaction is attached to the context.
 func GetGORMTx(ctx context.Context) *gorm.DB {

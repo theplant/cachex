@@ -615,7 +615,7 @@ func BenchmarkGetManyVsGet(b *testing.B) {
 }
 
 func TestClientGetManyUpstreamGoexit(t *testing.T) {
-	t.Run("batch upstream: the claims are released like Get", func(t *testing.T) {
+	t.Run("batch upstream: every claimed key gets the failure, like Get", func(t *testing.T) {
 		var calls atomic.Int64
 		up := batchUpstreamFunc[string](func(_ context.Context, keys []string) (map[string]string, error) {
 			if calls.Add(1) == 1 {
@@ -625,10 +625,10 @@ func TestClientGetManyUpstreamGoexit(t *testing.T) {
 		})
 		cli := NewClient(NewSyncMap[string](), up)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-		_, err := cli.GetMany(ctx, []string{"a"})
-		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		_, err := cli.GetMany(context.Background(), []string{"a"}) // no deadline: must not hang
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.Equal(t, "upstream fetch exited without returning (runtime.Goexit)", be.Errors["a"].Error())
 
 		ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 		defer cancel2()
@@ -646,13 +646,11 @@ func TestClientGetManyUpstreamGoexit(t *testing.T) {
 			return "v-" + key, nil
 		}))
 
-		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer cancel()
-		got, err := cli.GetMany(ctx, []string{"a", "bad"})
+		got, err := cli.GetMany(context.Background(), []string{"a", "bad"})
 		assert.Equal(t, map[string]string{"a": "v-a"}, got)
 		var be *BatchError
 		require.ErrorAs(t, err, &be)
-		assert.ErrorIs(t, be.Errors["bad"], context.DeadlineExceeded, "waiters wait for their ctx, like Get")
+		assert.Equal(t, "upstream fetch exited without returning (runtime.Goexit)", be.Errors["bad"].Error())
 		_, err = backend.Get(context.Background(), "bad")
 		assert.True(t, IsErrKeyNotFound(err), "nothing is written for the key")
 	})

@@ -185,12 +185,11 @@ func TestGetCompatUpstreamGoexit(t *testing.T) {
 		return "ok", nil
 	}))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	_, err := cli.Get(ctx, "k")
+	// unlike main (x/sync's DoChan never answered its waiters then), the fetch
+	// publishes an error, so a waiter without a deadline does not hang
+	_, err := cli.Get(context.Background(), "k")
 	require.Error(t, err)
-	assert.ErrorIs(t, err, context.DeadlineExceeded, "a fetch that exits without returning publishes nothing; waiters wait for their ctx")
-	assert.Equal(t, "context cancelled during fetch for key: k: context deadline exceeded", err.Error())
+	assert.Equal(t, "upstream fetch exited without returning (runtime.Goexit)", err.Error())
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()

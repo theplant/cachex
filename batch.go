@@ -3,6 +3,7 @@ package cachex
 import (
 	"context"
 	stderrors "errors"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -68,6 +69,66 @@ func (g *flightGroup[T]) forget(sfKey string, f *flight[T]) {
 	if g.flights[sfKey] == f {
 		delete(g.flights, sfKey)
 	}
+}
+
+// claimed are flights one request has claimed. Each gets exactly one result,
+// published as soon as it is known; run makes sure an upstream that panics or
+// calls runtime.Goexit still answers every waiter, with an error.
+type claimed[T any] struct {
+	c       *Client[T]
+	keys    []string
+	sfKeys  []string
+	flights []*flight[T]
+	mu      sync.Mutex
+	done    []bool
+}
+
+func (c *Client[T]) claimedFlights(keys, sfKeys []string, flights []*flight[T]) *claimed[T] {
+	return &claimed[T]{c: c, keys: keys, sfKeys: sfKeys, flights: flights, done: make([]bool, len(keys))}
+}
+
+// publish answers the waiters of flight i, once.
+func (p *claimed[T]) publish(i int, r result[T]) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done[i] {
+		return
+	}
+	p.done[i] = true
+	p.c.flights.finish(p.sfKeys[i], p.flights[i], r.value, r.err)
+}
+
+// run runs body, which fetches flights idxs, and publishes an error for each
+// of them still unanswered if body panics or calls runtime.Goexit.
+func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
+	returned := false
+	defer func() {
+		var err error
+		if r := recover(); r != nil {
+			keys := make([]string, len(idxs))
+			for j, i := range idxs {
+				keys[j] = p.keys[i]
+			}
+			attr := slog.Any("keys", keys)
+			if len(keys) == 1 {
+				attr = slog.String("key", keys[0])
+			}
+			p.c.logger.ErrorContext(ctx, "panic during upstream fetch",
+				attr,
+				"panic", r,
+				"stack", string(debug.Stack()))
+			err = errors.Errorf("panic during upstream fetch: %v", r)
+		} else if !returned {
+			err = errors.New("upstream fetch exited without returning (runtime.Goexit)")
+		}
+		if err != nil {
+			for _, i := range idxs {
+				p.publish(i, result[T]{err: err})
+			}
+		}
+	}()
+	body()
+	returned = true
 }
 
 type result[T any] struct {
@@ -266,7 +327,7 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string) []resu
 		}
 	}
 	if len(ownKeys) > 0 {
-		go c.fetchClaimedMany(ctx, ownKeys, ownSFKeys, ownFlights)
+		go c.fetchClaimedMany(flightCtx(ctx), ownKeys, ownSFKeys, ownFlights)
 	}
 
 	results := make([]result[T], len(keys))
@@ -313,86 +374,55 @@ func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string) []resu
 }
 
 // fetchClaimedMany is the batch form of fetchClaimed for a BatchUpstream:
-// double-check, then fetch what is still missing, then finish every flight.
+// double-check, then fetch what is still missing; every flight is answered as
+// soon as its result is known.
 func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight[T]) {
-	results := make([]result[T], len(keys))
-	var pending []int // keys still to fetch after the double-check; nil until it ran
-	returned := false
-	defer func() {
-		r := recover()
-		if r == nil && !returned {
-			// runtime.Goexit in the upstream: release the keys without
-			// publishing, like Get; waiters wait for their ctx.
-			for i, f := range flights {
-				c.flights.forget(sfKeys[i], f)
-			}
-			return
-		}
-		if r != nil {
-			c.logger.ErrorContext(ctx, "panic during upstream fetch",
-				"keys", keys,
-				"panic", r,
-				"stack", string(debug.Stack()))
-			err := errors.Errorf("panic during upstream fetch: %v", r)
-			failed := pending
-			if failed == nil {
-				failed = make([]int, len(keys))
-				for i := range failed {
-					failed[i] = i
+	p := c.claimedFlights(keys, sfKeys, flights)
+	all := make([]int, len(keys))
+	for i := range all {
+		all[i] = i
+	}
+	p.run(ctx, all, func() {
+		pending := all
+		if c.enableDoubleCheck {
+			pending = nil
+			checkCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+			lookups := c.lookupMany(checkCtx, keys, true)
+			cancel()
+			for i, r := range lookups {
+				switch {
+				case r.fetch:
+					pending = append(pending, i)
+				case r.err == nil:
+					p.publish(i, result[T]{value: r.value})
+				case isCachedFreshNotFound(r.err):
+					p.publish(i, result[T]{err: r.err})
+				default:
+					pending = append(pending, i) // like Get: a failed double-check falls through to upstream
 				}
 			}
-			for _, i := range failed {
-				results[i] = result[T]{err: err}
-			}
 		}
-		for i, f := range flights {
-			c.flights.finish(sfKeys[i], f, results[i].value, results[i].err)
+		if len(pending) == 0 {
+			return
 		}
-	}()
 
-	checked := make([]int, 0, len(keys))
-	if c.enableDoubleCheck {
-		// like Get, the double-check reads with the request ctx
-		for i, r := range c.lookupMany(ctx, keys, true) {
-			switch {
-			case r.fetch:
-				checked = append(checked, i)
-			case r.err == nil:
-				results[i].value = r.value
-			case isCachedFreshNotFound(r.err):
-				results[i].err = r.err
-			default:
-				checked = append(checked, i) // like Get: a failed double-check falls through to upstream
-			}
+		pendingKeys := make([]string, len(pending))
+		for j, i := range pending {
+			pendingKeys[j] = keys[i]
 		}
-	} else {
-		for i := range keys {
-			checked = append(checked, i)
+		// like Get, the fetch timeout starts after the double-check. A Client below
+		// bounds each of its own fetches, so its batch is not bounded as one fetch:
+		// keys still queued there would fail with this deadline, not their own.
+		timeout := c.fetchTimeout
+		if lower, layered := c.upstream.(*Client[T]); layered {
+			timeout += lower.batchTimeout(len(pendingKeys))
 		}
-	}
-	pending = checked
-	if len(pending) == 0 {
-		returned = true
-		return
-	}
-
-	pendingKeys := make([]string, len(pending))
-	for j, i := range pending {
-		pendingKeys[j] = keys[i]
-	}
-	// like Get, the fetch timeout starts after the double-check. A Client below
-	// bounds each of its own fetches, so its batch is not bounded as one fetch:
-	// keys still queued there would fail with this deadline, not their own.
-	timeout := c.fetchTimeout
-	if lower, layered := c.upstream.(*Client[T]); layered {
-		timeout += lower.batchTimeout(len(pendingKeys))
-	}
-	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-	defer cancel()
-	for j, r := range c.doFetchMany(fetchCtx, pendingKeys) {
-		results[pending[j]] = r
-	}
-	returned = true
+		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		for j, r := range c.doFetchMany(fetchCtx, pendingKeys) {
+			p.publish(pending[j], r)
+		}
+	})
 }
 
 // batchTimeout is how long a GetMany of n keys sent to this Client as an
@@ -538,22 +568,10 @@ func (c *Client[T]) asyncRefreshMany(ctx context.Context, keys []string) {
 				c.asyncRefreshing.Delete(sfKey)
 			}
 		}()
-		if _, ok := c.upstream.(BatchUpstream[T]); ok {
-			// Bound the wait: some keys may be fetched by other callers, and a
-			// fetch that never finishes (runtime.Goexit) must not pin the whole
-			// batch. Keys key by key need no bound: each has its own fetch
-			// timeout, as in Get's refresh.
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, c.fetchTimeout)
-			defer cancel()
-		}
+		// every fetch answers its waiters (bounded by its fetch timeout, and with
+		// an error if it panics or exits), so this wait needs no bound of its own
 		for i, r := range c.fetchMany(ctx, refreshKeys, sfKeys) {
-			switch {
-			case r.err == nil || IsErrKeyNotFound(r.err):
-			case ctx.Err() != nil && stderrors.Is(r.err, ctx.Err()):
-				// no longer waited for; it may still finish (or fail) on its own
-				c.logger.WarnContext(ctx, "async refresh not finished within the fetch timeout", "key", refreshKeys[i])
-			default:
+			if r.err != nil && !IsErrKeyNotFound(r.err) {
 				c.logger.ErrorContext(ctx, "async refresh failed", "key", refreshKeys[i], "error", r.err)
 			}
 		}
