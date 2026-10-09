@@ -16,11 +16,16 @@ import (
 )
 
 func newGORMCache[T any](tb testing.TB, tableName string) (*GORMCache[T], *gorm.DB) {
+	return newGORMCacheWith[T](tb, tableName, 0)
+}
+
+func newGORMCacheWith[T any](tb testing.TB, tableName string, chunkSize int) (*GORMCache[T], *gorm.DB) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(tb, err)
 	cache := NewGORMCache[T](&GORMCacheConfig{
 		DB:        db,
 		TableName: tableName,
+		ChunkSize: chunkSize,
 	})
 	require.NoError(tb, cache.Migrate(context.Background()))
 	return cache, db

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"runtime"
 	"slices"
 	"strings"
@@ -15,9 +16,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/pkg/errors"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // testBatchCache checks the BatchCache contract against one implementation.
@@ -1439,4 +1443,121 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+func TestBatchWritesAreBestEffortAndReportFailedKeys(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("RedisCache reports every key of a failed pipeline", func(t *testing.T) {
+		cache, mr := newRedisCache[string](t)
+		mr.Close()
+		var be *BatchError
+		require.ErrorAs(t, cache.SetMany(ctx, map[string]string{"a": "1", "b": "2"}), &be)
+		assert.ElementsMatch(t, []string{"a", "b"}, slices.Collect(maps.Keys(be.Errors)))
+		require.ErrorAs(t, cache.DelMany(ctx, []string{"a", "b"}), &be)
+		assert.ElementsMatch(t, []string{"a", "b"}, slices.Collect(maps.Keys(be.Errors)))
+	})
+
+	t.Run("RedisCache reports a value that cannot be encoded by key", func(t *testing.T) {
+		cache, _ := newRedisCache[float64](t)
+		err := cache.SetMany(ctx, map[string]float64{"ok": 1, "bad": math.NaN()})
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.Equal(t, []string{"bad"}, slices.Collect(maps.Keys(be.Errors)))
+		v, err := cache.Get(ctx, "ok")
+		require.NoError(t, err)
+		assert.Equal(t, 1.0, v)
+	})
+
+	t.Run("GORMCache keeps writing the chunks after a failed one", func(t *testing.T) {
+		cache, db := newGORMCacheWith[string](t, "besteffort", 2)
+		var creates atomic.Int32
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:fail-first", func(tx *gorm.DB) {
+			if creates.Add(1) == 1 {
+				_ = tx.AddError(errors.New("boom"))
+			}
+		}))
+		values := map[string]string{"a": "1", "b": "2", "c": "3", "d": "4"} // sorted: chunks [a b] [c d]
+		err := cache.SetMany(ctx, values)
+		var be *BatchError
+		require.ErrorAs(t, err, &be)
+		assert.ElementsMatch(t, []string{"a", "b"}, slices.Collect(maps.Keys(be.Errors)), "the keys of the failed chunk")
+		got, err := cache.GetMany(ctx, []string{"a", "b", "c", "d"})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"c": "3", "d": "4"}, got, "the next chunk is still written")
+		assert.Equal(t, int32(2), creates.Load(), "one statement per chunk")
+
+		var deletes atomic.Int32
+		require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("test:fail-first", func(tx *gorm.DB) {
+			if deletes.Add(1) == 1 {
+				_ = tx.AddError(errors.New("boom"))
+			}
+		}))
+		err = cache.DelMany(ctx, []string{"c", "d", "x", "y"})
+		require.ErrorAs(t, err, &be)
+		assert.ElementsMatch(t, []string{"c", "d"}, slices.Collect(maps.Keys(be.Errors)))
+		assert.Equal(t, int32(2), deletes.Load(), "DelMany goes on after a failed chunk")
+	})
+
+	t.Run("the per-key fallback for a plain Cache reports by key too", func(t *testing.T) {
+		c := keyFailingCache[string]{m: NewSyncMap[string](), bad: "bad"}
+		var be *BatchError
+		require.ErrorAs(t, setMany[string](ctx, c, map[string]string{"ok": "1", "bad": "2"}), &be)
+		assert.Equal(t, []string{"bad"}, slices.Collect(maps.Keys(be.Errors)))
+		require.ErrorAs(t, delMany[string](ctx, c, []string{"ok", "bad"}), &be)
+		assert.Equal(t, []string{"bad"}, slices.Collect(maps.Keys(be.Errors)))
+	})
+}
+
+func TestBatchBackendsSplitLargeCallsIntoChunks(t *testing.T) {
+	ctx := context.Background()
+	t.Run("RedisCache", func(t *testing.T) {
+		mr := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = client.Close() })
+		require.NoError(t, client.Ping(ctx).Err()) // the connection handshake is a pipeline too
+		var pipelines atomic.Int32
+		client.AddHook(pipelineCounter{&pipelines})
+		cache := NewRedisCache[string](&RedisCacheConfig{Client: client, ChunkSize: 2})
+		require.NoError(t, cache.SetMany(ctx, map[string]string{"a": "1", "b": "2", "c": "3"}))
+		got, err := cache.GetMany(ctx, []string{"a", "b", "c"})
+		require.NoError(t, err)
+		assert.Len(t, got, 3)
+		require.NoError(t, cache.DelMany(ctx, []string{"a", "b", "c"}))
+		assert.Equal(t, int32(6), pipelines.Load(), "3 keys in chunks of 2: two pipelines per call")
+	})
+	t.Run("GORMCache", func(t *testing.T) {
+		cache, db := newGORMCacheWith[string](t, "chunks", 2)
+		var queries atomic.Int32
+		require.NoError(t, db.Callback().Query().Before("gorm:query").Register("test:count", func(*gorm.DB) { queries.Add(1) }))
+		require.NoError(t, cache.SetMany(ctx, map[string]string{"a": "1", "b": "2", "c": "3"}))
+		got, err := cache.GetMany(ctx, []string{"a", "b", "c"})
+		require.NoError(t, err)
+		assert.Len(t, got, 3)
+		assert.Equal(t, int32(2), queries.Load())
+	})
+}
+
+// pipelineCounter counts the pipelines a go-redis client sends.
+type pipelineCounter struct{ n *atomic.Int32 }
+
+func (pipelineCounter) DialHook(next redis.DialHook) redis.DialHook          { return next }
+func (pipelineCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (p pipelineCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		p.n.Add(1)
+		return next(ctx, cmds)
+	}
+}
+
+func TestRedisCacheGetManyWhenRedisIsDown(t *testing.T) {
+	ctx := context.Background()
+	cache, mr := newRedisCache[string](t)
+	require.NoError(t, cache.Set(ctx, "a", "1"))
+	mr.Close()
+	got, err := cache.GetMany(ctx, []string{"a", "b"})
+	assert.Empty(t, got, "nothing was read, so nothing is returned as found")
+	var be *BatchError
+	require.ErrorAs(t, err, &be)
+	assert.ElementsMatch(t, []string{"a", "b"}, slices.Collect(maps.Keys(be.Errors)))
 }

@@ -583,17 +583,30 @@ func getMany[T any](ctx context.Context, from Upstream[T], keys []string) (map[s
 	return out, nil
 }
 
+// DefaultChunkSize is how many keys one pipeline or statement of the built-in
+// batch backends carries unless configured otherwise.
+const DefaultChunkSize = 1000
+
+func chunkSizeOr(size, def int) int {
+	if size <= 0 {
+		return def
+	}
+	return size
+}
+
 // setMany writes many keys, in one call when cache implements BatchCache,
 // otherwise key by key; like Get, one key failing does not stop the others.
 func setMany[T any](ctx context.Context, cache Cache[T], values map[string]T) error {
 	if batch, ok := cache.(BatchCache[T]); ok {
 		return batch.SetMany(ctx, values)
 	}
-	var errs []error
+	errs := map[string]error{}
 	for key, value := range values {
-		errs = append(errs, cache.Set(ctx, key, value))
+		if err := cache.Set(ctx, key, value); err != nil {
+			errs[key] = err
+		}
 	}
-	return stderrors.Join(errs...)
+	return batchError(errs)
 }
 
 // delMany is the delete counterpart of setMany.
@@ -601,11 +614,13 @@ func delMany[T any](ctx context.Context, cache Cache[T], keys []string) error {
 	if batch, ok := cache.(BatchCache[T]); ok {
 		return batch.DelMany(ctx, keys)
 	}
-	var errs []error
+	errs := map[string]error{}
 	for _, key := range keys {
-		errs = append(errs, cache.Del(ctx, key))
+		if err := cache.Del(ctx, key); err != nil {
+			errs[key] = err
+		}
 	}
-	return stderrors.Join(errs...)
+	return batchError(errs)
 }
 
 // errForKey returns the error a batch call reported for key: the key's own

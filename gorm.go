@@ -79,6 +79,7 @@ type GORMCache[T any] struct {
 	db        *gorm.DB
 	tableName string
 	keyPrefix string
+	chunkSize int
 }
 
 var _ BatchCache[any] = &GORMCache[any]{}
@@ -102,6 +103,11 @@ type GORMCacheConfig struct {
 
 	// KeyPrefix is the prefix for all keys (optional)
 	KeyPrefix string
+
+	// ChunkSize is how many keys one statement of GetMany, SetMany or DelMany
+	// carries; a larger call runs several statements, one after another. Zero
+	// means DefaultChunkSize; values above gormMaxChunkSize are capped to it.
+	ChunkSize int
 }
 
 // NewGORMCache creates a new GORM-based cache with configuration
@@ -117,6 +123,7 @@ func NewGORMCache[T any](config *GORMCacheConfig) *GORMCache[T] {
 		db:        config.DB,
 		tableName: config.TableName,
 		keyPrefix: config.KeyPrefix,
+		chunkSize: min(chunkSizeOr(config.ChunkSize, DefaultChunkSize), gormMaxChunkSize),
 	}
 }
 
@@ -214,15 +221,14 @@ func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
 	return nil
 }
 
-// gormBatchSize bounds the keys per statement, keeping every batch statement
-// well under the databases' bound parameter limits (32766 on SQLite, 65535 on
-// PostgreSQL, 65535 on MySQL).
-const gormBatchSize = 1000
+// gormMaxChunkSize keeps every statement under the databases' bound parameter
+// limits: an upsert binds 3 parameters per row, and SQLite allows 32766.
+const gormMaxChunkSize = 10000
 
 // GetMany retrieves many values with `WHERE key IN (...)` queries of up to
-// gormBatchSize keys each.
-// Missing keys are absent from the result; a value that fails to unmarshal is
-// reported in a *BatchError without hiding the others.
+// ChunkSize keys each.
+// Missing keys are absent from the result; a key that fails (its chunk's query,
+// or unmarshaling its value) is reported in a *BatchError without hiding the others.
 func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, error) {
 	out := make(map[string]T, len(keys))
 	if len(keys) == 0 {
@@ -234,24 +240,26 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 		prefixed[i] = g.prefixedKey(key)
 	}
 
-	var entries []cacheEntry
+	stored := make(map[string]cacheEntry, len(keys))
+	keyErrs := map[string]error{}
 	tx := cmp.Or(GetGORMTx(ctx), g.db)
-	for chunk := range slices.Chunk(prefixed, gormBatchSize) {
+	for start := 0; start < len(keys); start += g.chunkSize {
+		chunk := prefixed[start:min(start+g.chunkSize, len(keys))]
 		var found []cacheEntry
 		if err := tx.WithContext(ctx).
 			Table(g.tableName).
 			Where(clause.IN{Column: keyColumn, Values: anys(chunk)}).
 			Find(&found).Error; err != nil {
-			return nil, errors.Wrap(err, "failed to get cache entries")
+			for _, key := range keys[start : start+len(chunk)] {
+				keyErrs[key] = errors.Wrapf(err, "failed to get cache entry for key: %s", key)
+			}
+			continue
 		}
-		entries = append(entries, found...)
+		for _, entry := range found {
+			stored[entry.Key] = entry
+		}
 	}
 
-	stored := make(map[string]cacheEntry, len(entries))
-	for _, entry := range entries {
-		stored[entry.Key] = entry
-	}
-	var keyErrs map[string]error
 	for i, key := range keys {
 		// exact lookup: a key column that is not byte-exact (e.g. MySQL's _ci
 		// collations) can return another key's row, which is not this key's value
@@ -259,67 +267,70 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 		if !ok {
 			continue
 		}
+		if _, failed := keyErrs[key]; failed {
+			continue
+		}
 		var value T
 		if err := json.Unmarshal(entry.Value, &value); err != nil {
-			if keyErrs == nil {
-				keyErrs = map[string]error{}
-			}
 			keyErrs[key] = errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
 			continue
 		}
 		out[key] = value
 	}
-	if keyErrs != nil {
-		return out, &BatchError{Errors: keyErrs}
-	}
-	return out, nil
+	return out, batchError(keyErrs)
 }
 
-// SetMany stores many values with multi-row upserts of up to gormBatchSize rows each
+// SetMany stores many values with multi-row upserts of up to ChunkSize rows
+// each, every statement on its own. It is best effort: every key is tried, and
+// the keys that failed (to be encoded, or their chunk's statement) are reported
+// in a *BatchError.
 func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
-	if len(values) == 0 {
-		return nil
+	keyErrs := map[string]error{}
+	type row struct {
+		key   string
+		entry cacheEntry
 	}
-
-	entries := make([]cacheEntry, 0, len(values))
-	var encodeErrs []error // like RedisCache, a value that cannot be encoded does not stop the others
+	rows := make([]row, 0, len(values))
 	for key, value := range values {
 		data, err := json.Marshal(value)
 		if err != nil {
-			encodeErrs = append(encodeErrs, errors.Wrapf(err, "failed to marshal value for key: %s", key))
+			keyErrs[key] = errors.Wrapf(err, "failed to marshal value for key: %s", key)
 			continue
 		}
-		entries = append(entries, cacheEntry{Key: g.prefixedKey(key), Value: data})
-	}
-	if len(entries) == 0 {
-		return stderrors.Join(encodeErrs...)
+		rows = append(rows, row{key: key, entry: cacheEntry{Key: g.prefixedKey(key), Value: data}})
 	}
 	// one row order for every caller, or overlapping batches lock rows in
 	// opposite orders and deadlock (MySQL, PostgreSQL)
-	slices.SortFunc(entries, func(a, b cacheEntry) int { return cmp.Compare(a.Key, b.Key) })
+	slices.SortFunc(rows, func(a, b row) int { return cmp.Compare(a.entry.Key, b.entry.Key) })
 
-	if err := g.write(ctx, func(tx *gorm.DB) error {
-		return tx.Table(g.tableName).Clauses(upsertEntry).CreateInBatches(&entries, gormBatchSize).Error
-	}); err != nil {
-		return errors.Wrap(err, "failed to set cache entries")
+	for chunk := range slices.Chunk(rows, g.chunkSize) {
+		entries := make([]cacheEntry, len(chunk))
+		for i, r := range chunk {
+			entries[i] = r.entry
+		}
+		if err := g.write(ctx, func(tx *gorm.DB) error {
+			return tx.Table(g.tableName).Clauses(upsertEntry).Create(&entries).Error
+		}); err != nil {
+			for _, r := range chunk {
+				keyErrs[r.key] = errors.Wrapf(err, "failed to set cache entry for key: %s", r.key)
+			}
+		}
 	}
-	return stderrors.Join(encodeErrs...)
+	return batchError(keyErrs)
 }
 
-// DelMany removes many keys with `WHERE key IN (...)` deletes of up to gormBatchSize keys each
+// DelMany removes many keys with `WHERE key IN (...)` deletes of up to
+// ChunkSize keys each, every statement on its own. It is best effort: every key
+// is tried, and the keys of a failed statement are reported in a *BatchError.
 func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
-	if len(keys) == 0 {
-		return nil
-	}
-
-	prefixed := make([]string, len(keys))
-	for i, key := range keys {
-		prefixed[i] = g.prefixedKey(key)
-	}
-
-	for chunk := range slices.Chunk(prefixed, gormBatchSize) {
+	keyErrs := map[string]error{}
+	for chunk := range slices.Chunk(keys, g.chunkSize) {
+		prefixed := make([]string, len(chunk))
+		for i, key := range chunk {
+			prefixed[i] = g.prefixedKey(key)
+		}
 		if err := g.write(ctx, func(tx *gorm.DB) error {
-			in := clause.IN{Column: keyColumn, Values: anys(chunk)}
+			in := clause.IN{Column: keyColumn, Values: anys(prefixed)}
 			if tx.Name() != "postgres" {
 				return tx.Table(g.tableName).Where(in).Delete(nil).Error
 			}
@@ -332,8 +343,10 @@ func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
 				Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate})
 			return tx.Table(g.tableName).Where("? IN (?)", keyColumn, locked).Delete(nil).Error
 		}); err != nil {
-			return errors.Wrap(err, "failed to delete cache entries")
+			for _, key := range chunk {
+				keyErrs[key] = errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
+			}
 		}
 	}
-	return nil
+	return batchError(keyErrs)
 }

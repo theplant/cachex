@@ -51,6 +51,9 @@ type BatchUpstream[T any] interface {
 // cache when available, and falls back to Get/Set/Del per key otherwise.
 // Its GetMany follows the BatchUpstream contract: missing keys are absent, and
 // a whole-batch error is a failure of every key, not a batch of misses.
+// SetMany and DelMany are best effort: they apply every key they can, and
+// report the keys that failed in a *BatchError returned as is; any other error
+// means it is unknown which keys were applied.
 type BatchCache[T any] interface {
 	Cache[T]
 	BatchUpstream[T]

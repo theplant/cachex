@@ -244,6 +244,8 @@ type BatchCache[T any] interface {
     // 错误约定同下文的 BatchUpstream：除了原样返回的 *cachex.BatchError，
     // 其他 error 都算所有 key 失败（不会当成全部未命中）。
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
+    // 尽力而为：能写的 key 都写，失败的 key 列在原样返回的 *cachex.BatchError 里；
+    // 其他 error 表示不知道哪些 key 写成功了。
     SetMany(ctx context.Context, values map[string]T) error
     DelMany(ctx context.Context, keys []string) error
 }
@@ -436,7 +438,7 @@ if errors.As(err, &batchErr) {
 // 不管有没有 err，products 都能用
 ```
 
-以下内置后端实现了 `BatchCache[T]`：`RistrettoCache`、`SyncMap`、`RedisCache`（一个 `GET`/`SET`/`DEL` 的 pipeline，Redis Cluster 下也能用）和 `GORMCache`（`WHERE key IN (...)` 和多行 upsert，每条语句 1000 个 key，不会超出数据库的绑定参数上限）。`BigCache` 和 `Transform` 包装没有实现，`GetMany` 对它们逐个 key 读写（用 `Transform` 包一层 `RedisCache`，就是每个 key 一次往返）。
+以下内置后端实现了 `BatchCache[T]`：`RistrettoCache`、`SyncMap`、`RedisCache`（`GET`/`SET`/`DEL` 的 pipeline，Redis Cluster 下也能用）和 `GORMCache`（`WHERE key IN (...)` 和多行 upsert）。两者都会把大调用按 `ChunkSize` 个 key 切成多个 pipeline 或语句（默认 1000，在各自的配置里设置；`GORMCache` 最多 10000，不会超出数据库的绑定参数上限），依次发送；写入尽力而为：某一段失败会按 key 报告，其他段照常写入。`BigCache` 和 `Transform` 包装没有实现，`GetMany` 对它们逐个 key 读写（用 `Transform` 包一层 `RedisCache`，就是每个 key 一次往返）。
 
 上游每次调用耗时 1ms，取 100 个全未命中的 key（`BenchmarkGetManyVsGet`）：
 

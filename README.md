@@ -244,6 +244,9 @@ type BatchCache[T any] interface {
     // Errors follow BatchUpstream below: any error other than an unwrapped
     // *cachex.BatchError fails every key (it is not read as all misses).
     GetMany(ctx context.Context, keys []string) (map[string]T, error)
+    // Best effort: apply every key you can and list the keys that failed in a
+    // *cachex.BatchError returned as is; any other error means it is unknown
+    // which keys were applied.
     SetMany(ctx context.Context, values map[string]T) error
     DelMany(ctx context.Context, keys []string) error
 }
@@ -437,7 +440,7 @@ if errors.As(err, &batchErr) {
 // products is usable either way
 ```
 
-These built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (one pipeline of `GET`/`SET`/`DEL`, which also works on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and multi-row upserts, 1000 keys per statement to stay under the bound parameter limits). `BigCache` and the `Transform` wrappers do not, so `GetMany` reads and writes them key by key (wrapping a `RedisCache` in `Transform` means one round trip per key).
+These built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (pipelines of `GET`/`SET`/`DEL`, which also work on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and multi-row upserts). Both split a large call into pipelines or statements of `ChunkSize` keys (default 1000, set in their config; `GORMCache` caps it at 10000 to stay under the bound parameter limits), sent one after another, and write best effort: a failed chunk is reported by key and the others are still written. `BigCache` and the `Transform` wrappers do not, so `GetMany` reads and writes them key by key (wrapping a `RedisCache` in `Transform` means one round trip per key).
 
 Fetching 100 missing keys through an upstream that costs 1ms per call (`BenchmarkGetManyVsGet`):
 

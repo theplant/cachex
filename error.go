@@ -63,6 +63,14 @@ func (e *BatchError) Error() string {
 	return fmt.Sprintf("%d keys failed: %s", len(keys), strings.Join(parts, "; "))
 }
 
+// batchError returns errs as a *BatchError, or nil if no key failed.
+func batchError(errs map[string]error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	return &BatchError{Errors: errs}
+}
+
 // Unwrap returns the per-key errors, in sorted key order
 func (e *BatchError) Unwrap() []error {
 	keys := slices.Sorted(maps.Keys(e.Errors))
