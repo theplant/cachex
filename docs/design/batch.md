@@ -43,7 +43,7 @@ sequenceDiagram
     K->>G: 发布 k3、k5（k4 已在读第二层后发布）
     K->>L1: 回填：k3 写值，k5 按不存在记录处理
     K->>L0: 回填
-    K->>G: 回填完成，移除登记
+    K->>G: 回填完成，注销在途回源
     K-->>C: {k1, k2, k3}（k4、k5 不存在，所以不在 map 里）
 ```
 
@@ -55,13 +55,13 @@ sequenceDiagram
 4. **二次检查**：只对需要的 key 再读一次第一层（默认的 `DoubleCheckAuto` 下，只检查读取之后本 `Cache` 写过其分片的 key）。
 5. **读下面各层**：每层一次调用（只剩一个 key 时用 `Get`）。可用的 key 立刻发布，再回填它上面的层，其余的继续往下。
 6. **问数据源**：见下一节。
-7. **发布并回填**：每次数据源调用返回后，马上发布它这些 key，再回填；回填完成后才移除它们的在途登记（见 [singleflight.md](singleflight.md#发布与移除)）。
+7. **发布并回填**：每次数据源调用返回后，马上发布它这些 key，再回填，最后注销（见 [singleflight.md](singleflight.md#发布与注销)）。
 
 ## 回源怎么发
 
 | 数据源 | 怎么发 | 每个请求的超时 | key 什么时候拿到结果 |
 |---|---|---|---|
-| 实现了 `BatchSource` | 一次 `GetMany`；设置了 `WithGetManyChunkSize(n)` 时，切成每段最多 n 个 key、并发执行 | 每段一个 `WithFetchTimeout`，覆盖这次调用和随后的回填 | 这一段返回时，一起拿到 |
+| 实现了 `BatchSource` | 一次 `GetMany`；设置了 `WithGetManyChunkSize(n)` 时，切成每段最多 n 个 key、并发执行 | 每段一个 `WithFetchTimeout`，覆盖这次调用和随后的回填（见 [singleflight.md](singleflight.md#回源用的-ctx)） | 这一段返回时，一起拿到 |
 | 没有实现 | 每个 key 一次 `Get`，并发执行 | 每个 key 一个 `WithFetchTimeout` | 自己那个 key 返回时 |
 
 两种情况的并发上限都是 `WithGetManyConcurrency`（默认 16），它的含义是「一个回源 goroutine 同时向数据源发出的请求数」。不要和 `WithFetchesPerKey` 混淆，后者是同一个 key 同时最多几个在途回源。
@@ -104,7 +104,7 @@ sequenceDiagram
 | 原样返回的 `*BatchError`（不要再包一层） | 部分失败：只有它列出的 key 失败，map 里照常放其余 key |
 | 其他任何 error | **整批失败**：所有 key 都按失败处理 |
 
-只有**原样返回**的 `*BatchError` 才算部分失败，因为被包过一层或 join 过的 `BatchError`，旁边可能还有一个让整批失败的错误。整批失败的 error 里如果包着 `ErrNotFound`，`errors.Is` 会认出来，这是实现方的错误用法：不存在只能用「不在 map 里」表示。
+只有**原样返回**的 `*BatchError` 才算部分失败，因为被包过一层或 join 过的 `BatchError`，旁边可能还有一个让整批失败的错误。`BatchSource.GetMany` 整批失败的 error 里如果包着 `ErrNotFound`，`errors.Is` 会认出来，这一批的 key 都被读成不存在，但什么也不缓存，下次读取再回源。这是实现方的错误用法：不存在只能用「不在 map 里」表示。
 
 ### 批量写
 
