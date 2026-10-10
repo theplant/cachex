@@ -43,18 +43,27 @@ func (g *Group[K, T]) Claim(key K) (*Flight[T], bool) {
 	return f, true
 }
 
-// Finish publishes f's result. It unregisters f first (if f is still the one
-// registered for key), so a caller that sees the result and comes back starts
-// a new flight instead of joining a finished one; and a flight that was
-// dropped does not unregister the one that replaced it.
+// Finish publishes f's result and unregisters f: Publish then Forget.
 func (g *Group[K, T]) Finish(key K, f *Flight[T], value T, err error) {
+	g.Forget(key, f)
+	g.Publish(f, value, err)
+}
+
+// Publish answers f's waiters. f stays registered, so a caller that claims
+// key until Forget joins f and gets its result at once.
+func (g *Group[K, T]) Publish(f *Flight[T], value T, err error) {
+	f.value, f.err = value, err
+	close(f.done)
+}
+
+// Forget unregisters f, if it is still the flight registered for key: a
+// flight that was dropped does not unregister the one that replaced it.
+func (g *Group[K, T]) Forget(key K, f *Flight[T]) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.flights[key] == f {
 		delete(g.flights, key)
 	}
-	g.mu.Unlock()
-	f.value, f.err = value, err
-	close(f.done)
 }
 
 // Drop unregisters whatever flight holds key without publishing or

@@ -143,6 +143,7 @@ func TestOnRealDatabases(t *testing.T) {
 				m, err := c.GetMany(ctx, []string{"a", "b", "x"})
 				require.NoError(t, err)
 				assert.Equal(t, map[string]string{"a": "va", "b": "vb"}, m)
+				require.NoError(t, c.Close()) // the backfill finishes after the read returns
 				require.NoError(t, c.Set(ctx, "a", "new"))
 				e, ok, err := b.Get(ctx, "a")
 				require.NoError(t, err)

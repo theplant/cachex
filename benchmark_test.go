@@ -110,12 +110,15 @@ func BenchmarkGet(b *testing.B) {
 		if _, err := c.Get(ctx, "k"); err != nil {
 			b.Fatal(err)
 		}
+		// the read and its backfill, which finishes after the read returns:
+		// each round waits for it, or the next read would join this one
 		b.ReportAllocs()
 		for b.Loop() {
 			_ = l1.Del(ctx, "k")
 			if _, err := c.Get(ctx, "k"); err != nil {
 				b.Fatal(err)
 			}
+			cachex.Settle(c)
 		}
 	})
 
@@ -154,12 +157,15 @@ func BenchmarkGet(b *testing.B) {
 	b.Run("miss", func(b *testing.B) {
 		mem := cachextest.NewMap[string]()
 		c := cachex.New[string](benchSource{}, []cachex.Layer[string]{layer(mem)})
+		// the read and its backfill, which finishes after the read returns:
+		// each round waits for it, or the next read would join this one
 		b.ReportAllocs()
 		for b.Loop() {
 			_ = mem.Del(ctx, "k")
 			if _, err := c.Get(ctx, "k"); err != nil {
 				b.Fatal(err)
 			}
+			cachex.Settle(c)
 		}
 	})
 	b.Run("miss/x-sync-baseline", func(b *testing.B) {

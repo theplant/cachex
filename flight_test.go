@@ -202,6 +202,7 @@ func TestDoubleCheck(t *testing.T) {
 		<-mem.read
 		_, err := c.Get(ctx, "a") // B
 		require.NoError(t, err)
+		cachex.Settle(c) // B's fetch is backfilled and gone before A claims
 		close(mem.release)
 		<-done
 		return src.calls.Load()

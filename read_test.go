@@ -50,6 +50,7 @@ func TestFreshness(t *testing.T) {
 		}, now)
 		_, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 
 		src.set("a", "2")
 		src.gate = make(chan struct{}) // holds the refresh until the reads are done
@@ -68,6 +69,7 @@ func TestFreshness(t *testing.T) {
 
 		v, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		assert.Equal(t, "2", v)
 	})
 
@@ -79,10 +81,12 @@ func TestFreshness(t *testing.T) {
 		}, now)
 		_, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		src.set("a", "2")
 		clock.Advance(time.Minute + time.Hour)
 		v, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		assert.Equal(t, "2", v)
 	})
 
@@ -94,10 +98,12 @@ func TestFreshness(t *testing.T) {
 		}, now)
 		_, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		src.set("a", "2")
 		clock.Advance(time.Minute)
 		v, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		assert.Equal(t, "2", v)
 	})
 
@@ -111,9 +117,11 @@ func TestFreshness(t *testing.T) {
 		}, now, log.option())
 		_, err := c.Get(ctx, "x")
 		require.ErrorIs(t, err, cachex.ErrNotFound)
+		cachex.Settle(c)
 		clock.Advance(2 * time.Second)
 		_, err = c.Get(ctx, "x")
 		require.ErrorIs(t, err, cachex.ErrNotFound)
+		cachex.Settle(c)
 		require.NoError(t, c.Close())
 		assert.EqualValues(t, 2, src.calls.Load())
 		e, _ := stored(t, mem, "x")
@@ -131,10 +139,12 @@ func TestFreshness(t *testing.T) {
 		}, now, log.option())
 		_, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		src.fail["a"] = errBoom
 		clock.Advance(2 * time.Minute)
 		v, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		assert.Equal(t, "1", v)
 		require.NoError(t, c.Close())
 		e, _ := stored(t, mem, "a")
@@ -150,10 +160,12 @@ func TestFreshness(t *testing.T) {
 		}, now)
 		_, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		require.NoError(t, c.Close())
 		clock.Advance(2 * time.Minute)
 		v, err := c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(c)
 		assert.Equal(t, "1", v)
 		require.NoError(t, c.Close()) // would wait for a refresh, had one started
 		assert.EqualValues(t, 1, src.calls.Load())
@@ -184,6 +196,7 @@ func TestLayers(t *testing.T) {
 		s := newSetup([]cachex.LayerOption{cachex.TTL(time.Minute, 0)}, []cachex.LayerOption{cachex.TTL(time.Hour, 0)})
 		_, err := s.c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(s.c)
 		e1, ok1 := stored(t, s.l1, "a")
 		e2, ok2 := stored(t, s.l2, "a")
 		require.True(t, ok1)
@@ -200,6 +213,7 @@ func TestLayers(t *testing.T) {
 		s.clock.Advance(30 * time.Second)
 		v, err := s.c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(s.c)
 		assert.Equal(t, "below", v)
 		assert.Zero(t, s.src.calls.Load())
 		e1, ok := stored(t, s.l1, "a")
@@ -212,6 +226,7 @@ func TestLayers(t *testing.T) {
 		s := newSetup([]cachex.LayerOption{cachex.TTL(30*time.Second, time.Minute)}, []cachex.LayerOption{cachex.TTL(5*time.Minute, time.Hour)})
 		_, err := s.c.Get(ctx, "a") // source answers at epoch; both layers filled
 		require.NoError(t, err)
+		cachex.Settle(s.c)
 		s.l2Reads.Store(0)
 		for _, at := range []time.Duration{40 * time.Second, 2 * time.Minute, 4 * time.Minute} {
 			s.clock.Advance(at - s.clock.Now().Sub(epoch))
@@ -219,7 +234,7 @@ func TestLayers(t *testing.T) {
 				v, err := s.c.Get(ctx, "a")
 				require.NoError(t, err)
 				assert.Equal(t, "1", v)
-				require.NoError(t, s.c.Close()) // let a refresh it started finish
+				cachex.Settle(s.c) // let a refresh it started finish
 			}
 		}
 		assert.EqualValues(t, 1, s.src.calls.Load(), "the entry below is fresh: the source is asked once")
@@ -233,6 +248,7 @@ func TestLayers(t *testing.T) {
 		}))
 		_, err := s.c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(s.c)
 		e1, _ := stored(t, s.l1, "a")
 		assert.Equal(t, epoch.Add(time.Minute), e1.FreshUntil)
 		assert.Equal(t, epoch.Add(time.Minute), e1.ExpiresAt)
@@ -246,6 +262,7 @@ func TestLayers(t *testing.T) {
 		s.clock.Advance(30 * time.Second)
 		_, err := s.c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(s.c)
 		e1, _ := stored(t, s.l1, "a")
 		assert.Equal(t, epoch.Add(time.Minute), e1.FreshUntil)
 		assert.Equal(t, epoch.Add(time.Hour), e1.ExpiresAt)
@@ -260,7 +277,7 @@ func TestLayers(t *testing.T) {
 		v, err := s.c.Get(ctx, "a")
 		require.NoError(t, err)
 		assert.Equal(t, "old", v)
-		require.NoError(t, s.c.Close())
+		cachex.Settle(s.c) // the refresh starts after the answer
 		assert.EqualValues(t, 1, s.src.calls.Load())
 		e1, _ := stored(t, s.l1, "a")
 		e2, _ := stored(t, s.l2, "a")
@@ -276,6 +293,7 @@ func TestLayers(t *testing.T) {
 		s.clock.Advance(time.Minute)
 		v, err := s.c.Get(ctx, "a")
 		require.NoError(t, err)
+		cachex.Settle(s.c)
 		assert.Equal(t, "1", v)
 	})
 
@@ -289,6 +307,7 @@ func TestLayers(t *testing.T) {
 		}))
 		_, err := s.c.Get(ctx, "x")
 		require.ErrorIs(t, err, cachex.ErrNotFound)
+		cachex.Settle(s.c)
 		_, ok := stored(t, s.l1, "x")
 		assert.False(t, ok, "a layer without a not-found TTL drops the key")
 		e2, ok := stored(t, s.l2, "x")
@@ -297,6 +316,7 @@ func TestLayers(t *testing.T) {
 
 		_, err = s.c.Get(ctx, "x")
 		require.ErrorIs(t, err, cachex.ErrNotFound)
+		cachex.Settle(s.c)
 		assert.EqualValues(t, 1, s.src.calls.Load(), "the second read is answered by the layer below")
 	})
 
@@ -340,6 +360,7 @@ func TestLayers(t *testing.T) {
 		v, err := c.Get(ctx, "a")
 		require.NoError(t, err)
 		assert.Equal(t, "1", v)
+		cachex.Settle(c)
 		assert.Contains(t, log.String(), "backfill failed")
 	})
 }
@@ -357,6 +378,7 @@ func TestMaxAgeAndJitter(t *testing.T) {
 		}, now, cachex.WithMaxAge(func(v string) time.Duration { return time.Duration(len(v)) * 10 * time.Second }))
 		_, err := c.GetMany(ctx, []string{"short", "long"})
 		require.NoError(t, err)
+		cachex.Settle(c)
 
 		e1, _ := stored(t, l1, "short")
 		e2, _ := stored(t, l2, "short")
@@ -375,6 +397,7 @@ func TestMaxAgeAndJitter(t *testing.T) {
 		for range 2 {
 			v, err := c.Get(ctx, "a")
 			require.NoError(t, err)
+			cachex.Settle(c)
 			assert.Equal(t, "1", v)
 		}
 		assert.EqualValues(t, 2, src.calls.Load())
@@ -395,6 +418,7 @@ func TestMaxAgeAndJitter(t *testing.T) {
 		}, now)
 		_, err := c.GetMany(ctx, keys)
 		require.NoError(t, err)
+		cachex.Settle(c)
 		distinct := map[time.Time]bool{}
 		for _, k := range keys {
 			e, _ := stored(t, mem, k)
@@ -432,4 +456,41 @@ func TestCloseWaitsForTheFetchesInProgress(t *testing.T) {
 	close(src.gate)
 	<-closed
 	assert.Equal(t, 1, mem.Len(), "the backfill is done before Close returns")
+}
+
+// blockingFill wraps a backend: Set and SetMany wait for release once entered.
+type blockingFill struct {
+	cachex.Backend[string]
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingFill) Set(ctx context.Context, key string, e cachex.Entry[string]) error {
+	b.entered <- struct{}{}
+	<-b.release
+	return b.Backend.Set(ctx, key, e)
+}
+
+func (b *blockingFill) SetMany(ctx context.Context, entries map[string]cachex.Entry[string]) error {
+	b.entered <- struct{}{}
+	<-b.release
+	return b.Backend.SetMany(ctx, entries)
+}
+
+func TestAReadDoesNotWaitForTheBackfill(t *testing.T) {
+	ctx := context.Background()
+	src := newSource(map[string]string{"a": "1"})
+	mem := &blockingFill{Backend: cachextest.NewMap[string](), entered: make(chan struct{}, 1), release: make(chan struct{})}
+	c := cachex.New(src, oneLayer(mem))
+
+	v, err := c.Get(ctx, "a") // returns while the backfill waits
+	require.NoError(t, err)
+	assert.Equal(t, "1", v)
+	<-mem.entered
+	v, err = c.Get(ctx, "a") // the layer is not filled yet: joins the answered fetch
+	require.NoError(t, err)
+	assert.Equal(t, "1", v)
+	assert.EqualValues(t, 1, src.calls.Load(), "no second fetch while the first is being backfilled")
+	close(mem.release)
+	require.NoError(t, c.Close())
 }

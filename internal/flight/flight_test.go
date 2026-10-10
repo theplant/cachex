@@ -54,3 +54,31 @@ func TestDropKeepsTheOldFlightsWaitersAndItsReplacement(t *testing.T) {
 	assert.False(t, leader)
 	assert.Same(t, replacement, f)
 }
+
+func TestPublishAnswersWaitersAndLaterClaimsUntilForget(t *testing.T) {
+	var g Group[string, string]
+	f, _ := g.Claim("k")
+	g.Publish(f, "v", nil)
+	<-f.Done()
+	joined, leader := g.Claim("k")
+	assert.False(t, leader, "a published flight still registered is joined")
+	assert.Same(t, f, joined)
+	v, _ := joined.Result()
+	assert.Equal(t, "v", v)
+
+	g.Forget("k", f)
+	_, leader = g.Claim("k")
+	assert.True(t, leader, "after Forget a claim starts anew")
+}
+
+func TestForgetLeavesAReplacementRegistered(t *testing.T) {
+	var g Group[string, string]
+	old, _ := g.Claim("k")
+	g.Drop("k")
+	replacement, _ := g.Claim("k")
+	g.Publish(old, "old", nil)
+	g.Forget("k", old)
+	f, leader := g.Claim("k")
+	assert.False(t, leader)
+	assert.Same(t, replacement, f)
+}

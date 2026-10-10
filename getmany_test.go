@@ -29,6 +29,7 @@ func TestGetMany(t *testing.T) {
 
 		m, err := c.GetMany(ctx, []string{"a", "b", "c", "x", "b"})
 		require.NoError(t, err)
+		cachex.Settle(c)
 		assert.Equal(t, map[string]string{"a": "1", "b": "2", "c": "3"}, m, "x does not exist: absent, not an error")
 		require.Len(t, src.batchCalls(), 1)
 		assert.ElementsMatch(t, []string{"b", "c", "x"}, src.batchCalls()[0], "one call for the misses, each once")
@@ -126,6 +127,7 @@ func TestGetMany(t *testing.T) {
 		}, now)
 		_, err := c.GetMany(ctx, []string{"a", "b"})
 		require.NoError(t, err)
+		cachex.Settle(c)
 		src.set("a", "10")
 		clock.Advance(2 * time.Minute)
 		m, err := c.GetMany(ctx, []string{"a", "b"})

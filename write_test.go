@@ -107,6 +107,7 @@ func TestDelInvalidatesEveryLayerBottomUp(t *testing.T) {
 	s := newTwoLayers(t)
 	_, err := s.c.Get(ctx, "a")
 	require.NoError(t, err)
+	cachex.Settle(s.c)
 	s.writes()
 
 	s.src.set("a", "2") // an update, then Del to invalidate
@@ -131,6 +132,7 @@ func TestAFailedWriteLeavesNoEntryAtOrAboveTheFailedLayer(t *testing.T) {
 			s := newTwoLayers(t)
 			_, err := s.c.Get(ctx, "a") // both layers hold "1"
 			require.NoError(t, err)
+			cachex.Settle(s.c)
 			failing := map[string]*faulty[string]{"l1": s.l1, "l2": s.l2}[tc.layer]
 			failing.failOn(tc.op, errBoom)
 			if tc.op == "set" {
@@ -270,6 +272,7 @@ func TestSetManyAndDelMany(t *testing.T) {
 		s := newTwoLayers(t)
 		_, err := s.c.GetMany(ctx, []string{"a", "b"})
 		require.NoError(t, err)
+		cachex.Settle(s.c)
 		s.l2.failOn("set", errBoom)
 		err = s.c.SetMany(ctx, map[string]string{"a": "A", "b": "B"})
 		var be *cachex.BatchError

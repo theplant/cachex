@@ -24,6 +24,7 @@ func TestGetFetchesAMissAndBackfillsIt(t *testing.T) {
 
 	v, err := c.Get(ctx, "a")
 	require.NoError(t, err)
+	cachex.Settle(c)
 	assert.Equal(t, "1", v)
 	e, ok := stored(t, mem, "a")
 	require.True(t, ok, "the fetched value is backfilled")
@@ -36,6 +37,7 @@ func TestGetFetchesAMissAndBackfillsIt(t *testing.T) {
 
 	v, err = c.Get(ctx, "a")
 	require.NoError(t, err)
+	cachex.Settle(c)
 	assert.Equal(t, "1", v)
 	assert.EqualValues(t, 1, src.calls.Load(), "the second Get hits the layer")
 }
@@ -49,6 +51,7 @@ func TestGetOfAMissingKey(t *testing.T) {
 		c := cachex.New(src, []cachex.Layer[string]{cachex.NewLayer(mem, cachex.TTL(time.Minute, 0))})
 		for range 2 {
 			_, err := c.Get(ctx, "x")
+			cachex.Settle(c)
 			assert.ErrorIs(t, err, cachex.ErrNotFound)
 		}
 		assert.EqualValues(t, 2, src.calls.Load())
@@ -64,6 +67,7 @@ func TestGetOfAMissingKey(t *testing.T) {
 		}, now)
 		for range 2 {
 			_, err := c.Get(ctx, "x")
+			cachex.Settle(c)
 			assert.ErrorIs(t, err, cachex.ErrNotFound)
 		}
 		assert.EqualValues(t, 1, src.calls.Load())
@@ -85,6 +89,7 @@ func TestGetOfAMissingKey(t *testing.T) {
 			cachex.NewLayer(mem, cachex.TTL(time.Minute, 0), cachex.NotFoundTTL(time.Second, 0)),
 		})
 		_, err := c.Get(ctx, "x")
+		cachex.Settle(c)
 		assert.ErrorIs(t, err, cachex.ErrNotFound)
 		e, ok := stored(t, mem, "x")
 		require.True(t, ok)
@@ -103,12 +108,14 @@ func TestGetSourceErrorsAreReturnedAndNotCached(t *testing.T) {
 
 	_, err := c.Get(ctx, "a")
 	require.ErrorIs(t, err, errBoom)
+	cachex.Settle(c)
 	assert.NotErrorIs(t, err, cachex.ErrNotFound)
 	assert.Zero(t, mem.Len())
 
 	delete(src.fail, "a")
 	v, err := c.Get(ctx, "a")
 	require.NoError(t, err)
+	cachex.Settle(c)
 	assert.Equal(t, "1", v)
 }
 
@@ -121,6 +128,7 @@ func TestGetFailsWhenALayerCannotBeRead(t *testing.T) {
 
 	_, err := c.Get(ctx, "a")
 	require.ErrorIs(t, err, errBoom)
+	cachex.Settle(c)
 	assert.Zero(t, src.calls.Load(), "a broken layer does not send every read to the source")
 }
 

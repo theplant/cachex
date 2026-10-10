@@ -196,7 +196,9 @@ func (c *Cache[T]) claim(keys []string, fks []flightKey, flights []*flight.Fligh
 	return &claimed[T]{c: c, keys: keys, fks: fks, flights: flights, done: make([]bool, len(keys))}
 }
 
-// publish answers the waiters of flight i, once.
+// publish answers the waiters of flight i, once. The flight stays registered
+// until forget (or the end of run), so a read that comes while the answer is
+// being backfilled joins it instead of fetching again.
 func (p *claimed[T]) publish(i int, value T, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -204,13 +206,27 @@ func (p *claimed[T]) publish(i int, value T, err error) {
 		return
 	}
 	p.done[i] = true
-	p.c.flights.Finish(p.fks[i], p.flights[i], value, err)
+	p.c.flights.Publish(p.flights[i], value, err)
+}
+
+// forget unregisters flight i, once its answer is backfilled.
+func (p *claimed[T]) forget(idxs ...int) {
+	for _, i := range idxs {
+		p.c.flights.Forget(p.fks[i], p.flights[i])
+	}
+}
+
+// answer publishes an answer that is not backfilled.
+func (p *claimed[T]) answer(i int, value T, err error) {
+	p.publish(i, value, err)
+	p.forget(i)
 }
 
 // run runs body, which resolves flights idxs, and publishes an error for each
 // of them still unanswered if body panics or calls runtime.Goexit.
 func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
 	returned := false
+	defer p.forget(idxs...)
 	defer func() {
 		var err error
 		if r := recover(); r != nil {
@@ -297,7 +313,7 @@ func (c *Cache[T]) doubleCheck(ctx context.Context, p *claimed[T], seen []uint64
 		key := p.keys[i]
 		if e, ok, err := found(key); ok && err == nil && e.state(now) == fresh {
 			value, rerr := e.result()
-			p.publish(i, value, rerr)
+			p.answer(i, value, rerr)
 			continue
 		}
 		pending = append(pending, i) // a failed re-read falls through to the fetch
@@ -329,7 +345,7 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], gens []uint64, 
 			e, ok, err := found(key)
 			if err != nil {
 				var zero T
-				p.publish(i, zero, fmt.Errorf("cachex: get %q from layer %d: %w", key, li, err))
+				p.answer(i, zero, fmt.Errorf("cachex: get %q from layer %d: %w", key, li, err))
 				continue
 			}
 			if ok {
@@ -344,12 +360,13 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], gens []uint64, 
 			}
 			next = append(next, i)
 		}
-		c.backfill(lctx, li, fills)
-		cancel()
 		for j, i := range hit {
 			value, rerr := fills[j].entry.result()
 			p.publish(i, value, rerr)
 		}
+		c.backfill(lctx, li, fills)
+		cancel()
+		p.forget(hit...)
 		if len(staleKeys) > 0 {
 			c.refresh(ctx, staleKeys, nil)
 		}
@@ -398,13 +415,15 @@ func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], gens []uint6
 	var zero T
 	switch {
 	case err == nil:
-		c.backfillOne(sctx, len(c.layers), c.sourceFill(key, gens[i], value, false))
 		p.publish(i, value, nil)
+		c.backfillOne(sctx, len(c.layers), c.sourceFill(key, gens[i], value, false))
+		p.forget(i)
 	case errors.Is(err, ErrNotFound):
-		c.backfillOne(sctx, len(c.layers), c.sourceFill(key, gens[i], zero, true))
 		p.publish(i, zero, ErrNotFound)
+		c.backfillOne(sctx, len(c.layers), c.sourceFill(key, gens[i], zero, true))
+		p.forget(i)
 	default:
-		p.publish(i, zero, fmt.Errorf("cachex: get %q from source: %w", key, err))
+		p.answer(i, zero, fmt.Errorf("cachex: get %q from source: %w", key, err))
 	}
 }
 
@@ -418,18 +437,19 @@ func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], gens []uin
 	for _, i := range idxs {
 		key := p.keys[i]
 		if kerr := errForKey(err, key); kerr != nil {
-			p.publish(i, zero, fmt.Errorf("cachex: get %q from source: %w", key, kerr))
+			p.answer(i, zero, fmt.Errorf("cachex: get %q from source: %w", key, kerr))
 			continue
 		}
 		value, ok := values[key]
 		fills = append(fills, c.sourceFill(key, gens[i], value, !ok))
 		answered = append(answered, i)
 	}
-	c.backfill(sctx, len(c.layers), fills)
 	for j, i := range answered {
 		value, rerr := fills[j].entry.result()
 		p.publish(i, value, rerr)
 	}
+	c.backfill(sctx, len(c.layers), fills)
+	p.forget(answered...)
 }
 
 // sourceFill is the source's answer for key as a fill: no bounds but the
