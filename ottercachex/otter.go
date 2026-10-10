@@ -45,7 +45,9 @@ func New[T any](cfg Config[T]) (*Backend[T], error) {
 		MaximumWeight: cfg.MaximumWeight,
 		Weigher:       cfg.Weigher,
 		ExpiryCalculator: otter.ExpiryWritingFunc(func(e otter.Entry[string, cachex.Entry[T]]) time.Duration {
-			return time.Until(e.Value.ExpiresAt)
+			// otter keeps an entry with a non-positive expiry forever: one
+			// already expired expires at once instead
+			return max(time.Until(e.Value.ExpiresAt), 1)
 		}),
 	}
 	cache, err := otter.New(opts)

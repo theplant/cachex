@@ -32,6 +32,22 @@ func TestContract(t *testing.T) {
 	}, []item{{ID: 1, Tags: []string{"a"}}, {}, {ID: 2}})
 }
 
+func TestAnEntryAlreadyExpiredIsNotKept(t *testing.T) {
+	ctx := context.Background()
+	b, err := ottercachex.New[string](ottercachex.Config[string]{MaximumSize: 10})
+	require.NoError(t, err)
+	past := cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(-time.Second)}
+	require.NoError(t, b.Set(ctx, "new", past))
+	require.NoError(t, b.Set(ctx, "replaced", cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}))
+	require.NoError(t, b.Set(ctx, "replaced", past))
+	require.NoError(t, b.SetMany(ctx, map[string]cachex.Entry[string]{"many": past}))
+	for _, key := range []string{"new", "replaced", "many"} {
+		_, ok, err := b.Get(ctx, key)
+		require.NoError(t, err)
+		assert.False(t, ok, "%s: otter takes a non-positive expiry as none, and would keep it forever", key)
+	}
+}
+
 func TestEntriesExpireOnTheirOwn(t *testing.T) {
 	ctx := context.Background()
 	b, err := ottercachex.New[string](ottercachex.Config[string]{MaximumSize: 10})
