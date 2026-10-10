@@ -151,7 +151,7 @@ v2 重写了读写路径（见 [ADR 0012](../adr/0012-one-cache-over-layers.md)�
 
 ### 没解决的
 
-- `BenchmarkHotKeyStampede` 偶尔断言失败（每轮回源 0.9995 次，而不是 1 次）：先发布、再回填之后，上一轮的回填可能落在下一轮开头的 `mem.Del` 之后，这一轮就读到了值、不回源。是基准的问题，不是 cachex 的：每轮结束时要调用 `cachex.Settle`。这一轮交替测量里 v2 有 2 到 4 个样本因此缺失，耗时数字仍然可用。
+- `BenchmarkHotKeyStampede` 在这一轮交替测量里偶尔断言失败（每轮回源 0.9995 次，而不是 1 次）：先发布、再回填之后，上一轮的回填可能落在下一轮开头的 `mem.Del` 之后，这一轮就读到了值、不回源。是基准的问题，不是 cachex 的，已改为每轮结束时调用 `cachex.Settle`。v2 有 2 到 4 个样本因此缺失，耗时数字仍然可用。
 - otter 单 key 串行读的开销来自它的维护 goroutine，不在 cachex 里。
 - 内存层全命中时，`GetMany` 每个 key 约 105 到 118ns，比循环 `Get` 慢；它的分配（去重、结果 map）是固定的。
 

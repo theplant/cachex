@@ -262,6 +262,7 @@ func BenchmarkHotKeyStampede(b *testing.B) {
 			})
 		}
 		wg.Wait()
+		cachex.Settle(c) // or this round's backfill could land after the next round's Del
 	}
 	if got := float64(calls.Load()) / float64(b.N); got != 1 {
 		b.Fatalf("source calls per stampede = %v, want 1", got)
