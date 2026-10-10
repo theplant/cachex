@@ -25,9 +25,6 @@ import (
 // containers (skipped without Docker): SQLite accepts things they do not, such
 // as the bare reserved word "key", and compares keys byte-exactly by default.
 func TestOnRealDatabases(t *testing.T) {
-	if testing.Short() {
-		t.Skip("containers")
-	}
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 	ctx := context.Background()
 
