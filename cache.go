@@ -142,7 +142,8 @@ func WithFetchTimeout(timeout time.Duration) Option {
 
 // WithFetchesPerKey sets how many fetches of one key may run at once. With 1
 // (the default) concurrent misses of a key share one fetch; with n they are
-// spread over n, trading some load on the layers below for throughput.
+// spread over n, trading some load on the layers below for throughput. A
+// background refresh of the key is one more fetch, of its own.
 func WithFetchesPerKey(n int) Option {
 	return func(o *options) { o.fetchesPerKey = n }
 }

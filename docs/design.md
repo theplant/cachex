@@ -106,7 +106,7 @@ flowchart LR
 | 选项 | 默认 | 作用 | 详见 |
 |---|---|---|---|
 | `WithFetchTimeout(d)` | `DefaultFetchTimeout` = 60 秒 | 各自限时：二次检查；读下面每一层，连同回填它找到的结果；每次问数据源，连同回填它的回答；写入失败后的失效 | [singleflight.md](design/singleflight.md#回源用的-ctx) |
-| `WithFetchesPerKey(n)` | `DefaultFetchesPerKey` = 1 | 同一个 key 同时最多几个回源；1 表示并发未命中共用一次回源 | [singleflight.md](design/singleflight.md#每个-key-的回源数) |
+| `WithFetchesPerKey(n)` | `DefaultFetchesPerKey` = 1 | 同一个 key 同时最多几个读取的回源（后台刷新另算一个）；1 表示并发未命中共用一次回源 | [singleflight.md](design/singleflight.md#每个-key-的回源数) |
 | `WithGetManyConcurrency(n)` | `DefaultGetManyConcurrency` = 16 | 一次 `GetMany` 同时向数据源发出的请求数：数据源不是批量数据源时是 `Get` 调用，否则是分段调用 | [batch.md](design/batch.md#回源怎么发) |
 | `WithGetManyChunkSize(n)` | 0（不分段） | 发往批量数据源的每次调用最多多少个 key；每段一返回就回答并回填 | [batch.md](design/batch.md#回源怎么发) |
 | `WithMaxAge(func(T) time.Duration)` | 不限 | 按值给条目定寿命上限，在回源拿到值时调用一次，`Set`/`SetMany` 写入值时也调用；返回 0 或负数表示不缓存；`T` 必须和 `Cache` 的一致，否则 `New` panic | [read-path.md](design/read-path.md#条目的寿命) |

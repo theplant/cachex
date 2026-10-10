@@ -135,7 +135,7 @@ sequenceDiagram
 
 ## 每个 key 的回源数
 
-`WithFetchesPerKey(n)` 允许同一个 key 同时有 n 个在途回源。实现上，登记的 key 是 `flightKey{key, slot}`，n 大于 1 时 `slot` 是 `[0, n)` 里的随机数，每次请求随机落进一份；n 为 1 时 `slot` 恒为 0。用结构体而不是拼字符串，认领时不分配内存。
+`WithFetchesPerKey(n)` 允许同一个 key 同时有 n 个读取的在途回源；后台刷新另有自己的在途回源（一个 key 同时最多一个刷新），不算在 n 里。实现上，登记的 key 是 `flightKey{key, slot, refresh}`，n 大于 1 时 `slot` 是 `[0, n)` 里的随机数，每次请求随机落进一份；n 为 1 时 `slot` 恒为 0。用结构体而不是拼字符串，认领时不分配内存。
 
 - `n = 1`（默认）：完全合并，一个 key 同一时刻只回源一次。
 - `n > 1`：请求分散到 n 份，最多同时回源 n 次。代价是多打下层和数据源，好处是避免单个慢回源拖住所有请求。
