@@ -151,7 +151,7 @@ TTL 是**不主动写入**时旧数据的存活上限。`Set`/`Del` 是你主动
 
 ### 多个实例同时写 `gormcachex` 会死锁吗？
 
-极少失败：写入统一按字节序加锁，偶发的死锁（MySQL 的间隙锁）会自动重试（最多执行 5 次）。重试用尽仍会报错；回填失败只记 WARN 日志，下次读取再回源。在你自己的事务里（`gormcachex.WithTx`）不会重试，因为死锁已经回滚了整个事务。见 [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md)。
+极少失败：写入统一按字节序加锁，偶发的死锁（MySQL 的间隙锁）会自动重试（最多执行 5 次）。重试用尽仍会报错；回填失败只记 WARN 日志，下次读取再回源。见 [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md)。
 
 ### `gormcachex` 对数据库的隔离级别有要求吗？
 

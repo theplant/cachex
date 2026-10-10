@@ -151,7 +151,7 @@ When the memory layer holds millions of entries and the garbage collector shows 
 
 ### Do concurrent writes to `gormcachex` from several instances deadlock?
 
-They rarely fail: writes lock rows in byte order, and the occasional deadlock (MySQL's gap locks) is retried automatically (at most 5 attempts). When the attempts run out, the error is returned; a failed backfill is only logged at WARN and the next read fetches again. Inside your own transaction (`gormcachex.WithTx`) nothing is retried, since the deadlock has rolled the whole transaction back. See [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md) (Chinese).
+They rarely fail: writes lock rows in byte order, and the occasional deadlock (MySQL's gap locks) is retried automatically (at most 5 attempts). When the attempts run out, the error is returned; a failed backfill is only logged at WARN and the next read fetches again. See [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md) (Chinese).
 
 ### Does `gormcachex` need a particular isolation level?
 

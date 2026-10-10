@@ -34,7 +34,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 | `BigCache` | `bigcachex.New`, which returns a `cachex.Backend[T]` |
 | `RedisCache`, `RedisCacheConfig.TTL` | `rediscachex.New`, which returns a `cachex.Backend[T]`; no TTL setting, see below |
 | `GORMCache` | `gormcachex.New`, which returns a `*gormcachex.Backend[T]` with `Migrate` |
-| `WithGORMTx`, `GetGORMTx` | `gormcachex.WithTx`, `gormcachex.TxFrom` |
+| `WithGORMTx`, `GetGORMTx` | removed: `gormcachex` never joins your transaction, see below |
 | `SyncMap` | `cachextest.Map`, for tests only (unbounded) |
 | — | `Cache.SetMany`, `Cache.DelMany`, `Cache.Close`, `IsShared` |
 | — | `cachextest.TestBackend(t, newBackend, values)` and `cachextest.TestByteBackend(t, newBackend)`, contract tests for your own backends |
@@ -51,7 +51,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **`Del` only invalidates.** v1 recorded a "does not exist" on `Del` when `WithNotFound` was configured, so a `Del` after an update hid the updated row until that record expired. v2 drops the key from every layer; the next read asks the source. *What to do:* nothing; if you relied on `Del` meaning "deleted", the next read records it.
 
-**Fetches outlive their caller.** † A fetch is shared by every request of the key, so it does not end with the caller that started it; its ctx keeps the caller's values but not its cancellation, and `IsShared(ctx)` reports it. `gormcachex` does not use the caller's transaction in such a ctx. *What to do:* nothing; don't expect a backfill to join your transaction.
+**Fetches outlive their caller.** † A fetch is shared by every request of the key, so it does not end with the caller that started it; its ctx keeps the caller's values but not its cancellation, and `IsShared(ctx)` reports it. *What to do:* nothing; a backend you write must not use caller state, such as a transaction, from such a ctx.
 
 **A fetch that panics or calls `runtime.Goexit` answers every waiter with an error.** † In v1, waiters of a Goexit'ed fetch waited until their own ctx ended.
 
@@ -61,7 +61,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **The storage format changed.** v1 data in Redis or a table is not readable by v2 and reads as misses. *What to do:* use a new `KeyPrefix` (or Redis database), and a new table for `gormcachex` (its columns changed: `value` holds the encoded entry, `expires_at` was added); run `Migrate`.
 
-**`gormcachex.Migrate` never runs in your transaction.** It runs on `Config.DB` even if ctx carries a transaction from `WithTx`: on MySQL, DDL would commit it. *What to do:* nothing; call `Migrate` outside your transaction.
+**`gormcachex` never joins your transaction.** v1's `WithGORMTx` put cache writes in your transaction; v2 has no such option, and every statement commits on its own. A write held in a transaction keeps its row locks across `Cache` calls while the `Cache` orders writes of a key in the process, and the two can wait for each other forever. *What to do:* change the source in your transaction, then call `Set`/`Del` after it commits.
 
 **Backends expire entries by the wall clock.** `WithNow` (v1's `NowFunc`) sets the clock the `Cache` judges entries by, but Redis, otter and the byte-storing backends drop an entry once its `ExpiresAt` has passed by `time.Now`. *What to do:* in tests that use a `cachextest.Clock` with such a backend, start the clock at `time.Now()`.
 

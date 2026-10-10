@@ -20,4 +20,4 @@
 - 自写的字节存储实现 `ByteBackend`，再用 `Encoded` 包装；存值本身、只有单 key 能力的存储仍然实现 `SingleBackend` 再用 `Batched` 包装。
 - `WithNow` 设的时钟离真实时间很远时（比如从 1970 年开始的 `cachextest.Clock`），按它算出的 `ExpiresAt` 在真实时钟看来早已过去，字节后端和 `ottercachex` 会当场丢掉条目，于是每次都未命中。这类测试用 `cachextest.Map`，或者让测试时钟从 `time.Now()` 开始。
 - 多一层间接调用：`bigcachex` 第一层命中约慢 8ns（94ns → 102ns）；写入的基准变化在 5% 以内；第二层命中反而快了约 38%（`Get/hit/l2` 3.99µs → 2.48µs）。
-- `Encoded.SetMany` 遇到同一批里既有未腐烂、又有已经腐烂的条目时，要发一次 `SetMany` 和一次 `DelMany`。在调用方的 gorm 事务里，这是两遍各自排好序的加锁，不是一个全局顺序，见 [todo.md](../todo.md)。
+- `Encoded.SetMany` 遇到同一批里既有未腐烂、又有已经腐烂的条目时，要发一次 `SetMany` 和一次 `DelMany`。gormcachex 的语句各自提交、不进调用方的事务（[ADR 0017](0017-gorm-never-joins-a-caller-transaction.md)），两遍加锁不会互相死锁。

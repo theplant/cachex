@@ -104,7 +104,7 @@ sequenceDiagram
 | 原样返回的 `*BatchError`（不要再包一层） | 部分失败：只有它列出的 key 失败，map 里照常放其余 key |
 | 其他任何 error | **整批失败**：所有 key 都按失败处理 |
 
-只有**原样返回**的 `*BatchError` 才算部分失败，因为被包过一层或 join 过的 `BatchError`，旁边可能还有一个让整批失败的错误。`BatchSource.GetMany` 整批失败的 error 里如果包着 `ErrNotFound`，`errors.Is` 会认出来，这一批的 key 都被读成不存在，但什么也不缓存，下次读取再回源。这是实现方的错误用法：不存在只能用「不在 map 里」表示。
+只有**原样返回**的 `*BatchError` 才算部分失败，因为被包过一层或 join 过的 `BatchError`，旁边可能还有一个让整批失败的错误。`BatchSource.GetMany` 整批失败的 error 里如果包着 `ErrNotFound`，`errors.Is` 会认出来，这一批的 key 都被读成不存在，但什么也不缓存，下次读取再回源。这是实现方的错误用法：不存在只能用「不在 map 里」表示。后端不同：一层读取的错误（单个 key 的和整批的都一样）即使包着 `ErrNotFound`，也按失败处理，`errors.Is(err, ErrNotFound)` 认不出它，因为后端报告不存在只用 false 或「不在 map 里」。
 
 ### 批量写
 

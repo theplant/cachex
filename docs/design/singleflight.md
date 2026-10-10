@@ -101,7 +101,7 @@ sequenceDiagram
 
 - **保留**领头请求 ctx 里的值（trace、日志字段等）；
 - **去掉**它的取消和截止时间（`context.WithoutCancel`）：领头请求放弃了，回源仍然继续；
-- **打上共享标记**：`cachex.IsShared(ctx)` 为真。后端据此不使用调用方的状态，比如 `gormcachex` 不加入 `WithTx` 放进来的事务，回填不能写进某一个调用方的事务里。
+- **打上共享标记**：`cachex.IsShared(ctx)` 为真。后端据此不使用调用方的状态（比如放在 ctx 里的事务），回填不能写进某一个调用方的状态里。内置的后端都不从 ctx 取调用方的状态；这个标记是给自己写的后端的约定。
 
 在这个 ctx 之上，每次调用各自受 `WithFetchTimeout` 限制，各开一个超时：
 

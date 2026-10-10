@@ -34,7 +34,7 @@ import "github.com/theplant/cachex/v2"
 | `BigCache` | `bigcachex.New`，返回 `cachex.Backend[T]` |
 | `RedisCache`、`RedisCacheConfig.TTL` | `rediscachex.New`，返回 `cachex.Backend[T]`；没有 TTL 配置，见下文 |
 | `GORMCache` | `gormcachex.New`，返回带 `Migrate` 的 `*gormcachex.Backend[T]` |
-| `WithGORMTx`、`GetGORMTx` | `gormcachex.WithTx`、`gormcachex.TxFrom` |
+| `WithGORMTx`、`GetGORMTx` | 已删除：`gormcachex` 从不加入你的事务，见下文 |
 | `SyncMap` | `cachextest.Map`，只用于测试（没有容量上限） |
 | — | `Cache.SetMany`、`Cache.DelMany`、`Cache.Close`、`IsShared` |
 | — | `cachextest.TestBackend(t, newBackend, values)` 和 `cachextest.TestByteBackend(t, newBackend)`，给自写后端用的契约测试 |
@@ -51,7 +51,7 @@ import "github.com/theplant/cachex/v2"
 
 **`Del` 只做失效。** v1 配置了 `WithNotFound` 时，`Del` 会记下「不存在」，于是更新之后的 `Del` 会让更新过的行在这条记录过期前都读不到。v2 只从每一层删掉这个 key，下次读取去问数据源。*怎么做：* 不用处理；如果你依赖 `Del` 表示「已删除」，下次读取会把它记下来。
 
-**回源比发起它的调用方活得更久。** † 一次回源被这个 key 的所有请求共用，所以不会随发起它的调用方结束；它的 ctx 保留调用方的值，但不带它的取消，`IsShared(ctx)` 能识别它。`gormcachex` 在这样的 ctx 里不使用调用方的事务。*怎么做：* 不用处理；不要指望回填加入你的事务。
+**回源比发起它的调用方活得更久。** † 一次回源被这个 key 的所有请求共用，所以不会随发起它的调用方结束；它的 ctx 保留调用方的值，但不带它的取消，`IsShared(ctx)` 能识别它。*怎么做：* 不用处理；你自己写的后端不能使用这样的 ctx 里属于调用方的状态，比如事务。
 
 **回源 panic 或调用 `runtime.Goexit` 时，每个等待方都会收到错误。** † v1 里 Goexit 的回源的等待方要一直等到自己的 ctx 结束。
 
@@ -61,7 +61,7 @@ import "github.com/theplant/cachex/v2"
 
 **存储格式变了。** Redis 或数据表里的 v1 数据 v2 读不了，会被当作未命中。*怎么做：* 换一个 `KeyPrefix`（或 Redis 库）；`gormcachex` 用一张新表（列变了：`value` 存编码后的条目，新增 `expires_at`），并运行 `Migrate`。
 
-**`gormcachex.Migrate` 从不在你的事务里执行。** 即使 ctx 里有 `WithTx` 放进来的事务，它也在 `Config.DB` 上执行：在 MySQL 上，DDL 会把那个事务提交掉。*怎么做：* 不用处理；在事务之外调用 `Migrate`。
+**`gormcachex` 从不加入你的事务。** v1 的 `WithGORMTx` 让缓存写入进你的事务；v2 没有这个选项，每条语句独立提交。写入留在事务里，行锁就会跨 `Cache` 调用持有，而 `Cache` 在进程内给同一个 key 的写入排队，两者可能永远互相等待。*怎么做：* 在事务里改数据源，提交之后再调用 `Set`/`Del`。
 
 **后端按真实时钟让条目过期。** `WithNow`（v1 的 `NowFunc`）设的是 `Cache` 判断条目所用的时钟，但 Redis、otter 和存字节的后端在条目的 `ExpiresAt` 按 `time.Now` 过去之后就丢掉它。*怎么做：* 测试里用 `cachextest.Clock` 配这类后端时，让时钟从 `time.Now()` 开始。
 

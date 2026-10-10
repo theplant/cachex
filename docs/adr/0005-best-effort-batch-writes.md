@@ -12,4 +12,3 @@
 - 错误规则和 `GetMany` 一致：原样返回的 `*BatchError` 表示部分失败，其他 error 表示整批失败。
 - `Cache.SetMany`/`DelMany` 把失败的 key 列在 `*BatchError` 里，其余 key 照常写完。
 - GORM 的一次大批量写入不是原子的。对缓存来说这没有问题。
-- 在调用方自己的事务里（`gormcachex.WithTx`），某条语句失败后，PostgreSQL 会让整个事务失效，后面的段也会失败。它们会被如实报告在 `BatchError` 里。

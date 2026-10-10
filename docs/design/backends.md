@@ -142,14 +142,13 @@ type row struct {
 
 ### 批量与死锁
 
-- `GetMany`/`SetMany`/`DelMany` 按 `ChunkSize`（默认 1000，最大 8000：一行绑定 4 个参数，SQLite 一条语句最多 32766 个）切成多条语句，依次执行，**每条语句独立提交**（在 `WithTx` 传入的事务里时除外）。某一段失败时，这一段的 key 记进 `*BatchError`，然后继续执行后面的段。单个 key 的方法就是只有一个 key 的批量。
+- `GetMany`/`SetMany`/`DelMany` 按 `ChunkSize`（默认 1000，最大 8000：一行绑定 4 个参数，SQLite 一条语句最多 32766 个）切成多条语句，依次执行，**每条语句独立提交**，从不进调用方的事务（见下文）。某一段失败时，这一段的 key 记进 `*BatchError`，然后继续执行后面的段。单个 key 的方法就是只有一个 key 的批量。
 - 已经腐烂的条目由 `Encoded` 改为删除，不写入。
 - **统一加锁顺序**：
   - `SetMany` 插入前按 key 的字节序排序。否则多个实例同时回填有重叠的 key 时，会以相反的顺序锁行而死锁。
   - `DelMany` 同样先按 key 排序；PostgreSQL 上再用 `SELECT … ORDER BY key COLLATE "C" FOR UPDATE` 按字节序锁好行，再删除。`DELETE` 是按扫描顺序加锁的，而扫描顺序跟着列的排序规则走（官方镜像默认是 `en_US.utf8`），和 `SetMany` 的字节序不一致。
   - MySQL 的 `utf8mb4_0900_bin` 按码点排序，和 UTF-8 的字节序一致，所以不需要额外处理。
 - **死锁重试**：MySQL 的间隙锁仍可能偶发死锁，InnoDB 要求应用自行重试。所以每条写语句被数据库判为死锁牺牲者时会重试，最多执行 5 次（即重试 4 次），每次退避的时间带随机抖动，并尊重 ctx。识别方式：PostgreSQL 看 SQLSTATE `40P01`/`40001`；MySQL 匹配驱动的错误文本 `Error 1213 (40001)`，因为 go-sql-driver 的错误类型没有提供 SQLState 方法。
-- **调用方自己的事务里不重试**：死锁已经让数据库回滚了整个事务，只重试一条语句是错的，所以直接把错误返回给调用方。
 
 ### 隔离级别
 
@@ -162,11 +161,7 @@ type row struct {
 
 ### 事务
 
-`WithTx(ctx, tx)` 让 gormcachex 用这个 ctx 的读写都在调用方的事务里进行，`TxFrom(ctx)` 取回它。但 ctx 带着共享标记时（`cachex.IsShared(ctx)`，即回源、回填、写入失败后的失效），**不用**这个事务：一次回源服务的是所有等待方，回填不能写进某一个调用方的事务里（见 [ADR 0007](../adr/0007-detached-fetch-context.md)）。
-
-所以 `Cache.Set(WithTx(ctx, tx), …)` 写这一层是在事务里的；事务回滚后，这一层的写入也没了，而上面的层（比如内存层）仍是新值，直到它腐烂。需要两者一致时，在事务提交之后再调用 `Set`/`Del`。
-
-`Migrate` 总是在 `Config.DB` 上执行，不进 `WithTx` 放进 ctx 的事务：MySQL 的 DDL 会隐式提交调用方的事务。
+gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立提交，行锁不跨语句持有。写入要是留在事务里，行锁会跨 `Cache` 调用持有，和分片锁形成数据库检测不到的死锁，见 [ADR 0017](../adr/0017-gorm-never-joins-a-caller-transaction.md)。正确的用法是在事务里改数据源，提交之后再 `Set`/`Del`。
 
 ## cachextest
 

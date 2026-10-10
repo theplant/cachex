@@ -180,7 +180,7 @@ if errors.As(err, &be) {
 - **`ottercachex` 没设上限。** `New` 会失败：设置 `MaximumSize`，或者 `MaximumWeight` 加 `Weigher`。
 - **`bigcachex` 的 `LifeWindow` 比层的 TTL 短。** 条目会提前消失。只在内存层有数百万条、profile 里 GC 明显时才用它；每次读取都要解码。
 - **`gormcachex` 不调 `Migrate`，或者 MySQL 表不是 `utf8mb4_0900_bin`。** `Migrate` 会建表，并拒绝 key 列用其他任何排序规则的已有 MySQL 表。key 连同 `KeyPrefix` 最长 255 个字符。过期的行不会自动删除。只支持各数据库默认的隔离级别。
-- **用 `gormcachex.WithTx` 时以为所有写入都在事务里。** 带这个 ctx 的 `Set`/`Del` 在；回源的回填永远不在，`Migrate` 也不在，它总是在 `Config.DB` 上执行。
+- **在修改数据源的事务里调用 `Set`/`Del`。** `gormcachex` 从不加入事务：每条语句独立提交，事务回滚不会撤销缓存的写入。在提交之后再调用。
 - **`cachextest.Clock` 远远落后于真实时钟，后端又会让条目过期。** 不管 `WithNow` 怎么设，后端都按真实时钟让条目过期，所以按这个时钟算出的条目会被当场丢掉，每次读取都未命中。让时钟从 `time.Now()` 开始，或者用 `cachextest.Map`。
 
 **生命周期**

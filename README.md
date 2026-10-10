@@ -181,7 +181,7 @@ Each item: the mistake, what happens, what to do.
 - **`ottercachex` without a bound.** `New` fails: set `MaximumSize`, or `MaximumWeight` with a `Weigher`.
 - **`bigcachex` with a `LifeWindow` shorter than the layer's TTLs.** Entries disappear early. Use it only for millions of entries where GC shows in profiles; every read decodes.
 - **`gormcachex` without `Migrate`, or a MySQL table not in `utf8mb4_0900_bin`.** `Migrate` creates the table, and rejects an existing MySQL table whose key column uses any other collation. Keys, `KeyPrefix` included, are at most 255 characters. Expired rows are not deleted for you. Only each database's default isolation level is supported.
-- **`gormcachex.WithTx` expecting every write to join the transaction.** `Set`/`Del` with that ctx do; the backfill of a fetch never does, and neither does `Migrate`, which always runs on `Config.DB`.
+- **Calling `Set`/`Del` inside the transaction that changes the source.** `gormcachex` never joins it: every statement commits on its own, so a rollback does not undo the cache. Call them after the commit.
 - **A `cachextest.Clock` far behind the wall clock, with a backend that expires entries.** Backends expire entries by the wall clock whatever `WithNow` says, so they drop entries computed by such a clock at once and every read misses. Start the clock at `time.Now()`, or use `cachextest.Map`.
 
 **Lifecycle**

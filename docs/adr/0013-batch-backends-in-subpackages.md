@@ -9,7 +9,7 @@ v2 的做法：
 - **只有一个后端接口 `Backend[T]`**，单 key 和批量方法都要实现，单 key 的 `Get` 用 `(Entry[T], bool, error)` 表示有没有，不用错误表示未命中。只有单 key 能力的存储实现 `SingleBackend[T]`，用 `cachex.Batched` 升级成 `Backend[T]`。
 - **数据源仍分两种**：`Source[T]`（必需）和 `BatchSource[T]`（可选）。数据源确实有两种形态，这是真实的分叉，不是包装的产物。
 - **后端拆成子包**：`rediscachex`、`gormcachex`、`ottercachex`、`bigcachex`，各自 import 自己的库；核心包只 import 标准库和 `internal/`。测试用的内存后端、时钟和后端契约测试在 `cachextest`。
-- **核心不再认识 GORM**：核心在回源和回填用的 ctx 上打一个标记（`cachex.IsShared(ctx)`），`gormcachex` 看到这个标记就不用调用方的事务。ADR 0007 的目标不变，依赖方向反过来了：后端认识核心，核心不认识后端。
+- **核心不再认识 GORM**：核心在回源和回填用的 ctx 上打一个标记（`cachex.IsShared(ctx)`），`gormcachex` 当时看到这个标记就不用调用方的事务（后来它完全不进调用方的事务，见 ADR 0017）。ADR 0007 的目标不变，依赖方向反过来了：后端认识核心，核心不认识后端。
 - **存字节的后端接收 `Codec[T]`**，默认 JSON；条目的时间字段由 `cachex.EncodeEntry`/`DecodeEntry` 统一编码。去掉 `Transform`、`JSONTransform`、`StringJSONTransform`。
 - **解码失败算未命中**：后端记一条 WARN 日志并删掉这个条目，读取照常回源。v1 里结构体有不兼容的改动时，解码失败会被当成后端故障，`Get` 一直报错直到条目过期。
 
