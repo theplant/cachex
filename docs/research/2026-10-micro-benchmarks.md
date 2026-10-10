@@ -77,11 +77,85 @@
 - 一次完整回源 2.66µs，是「`sync.Map` + x/sync singleflight」对照组的 11 倍。多出来的是分片锁、写入代数检查、二次检查判断、不存在缓存的清理和错误包装。和任何真实上游的一次往返（通常是 100µs 以上）相比仍然很小。
 - 热点 key 击穿：64 个并发读者，每轮上游只被调用 1 次（断言）。
 
+## v2
+
+v2 重写了读写路径（见 [ADR 0012](../adr/0012-one-cache-over-layers.md)），这组基准随之移植到新接口：后端换成 `cachextest.Map`、ristretto 换成 otter，并新增 `Get/hit/bigcache`、`ZipfMixed/otter`。下面先比较 v1 和 v2，再记下移植时修掉的问题。
+
+### 方法
+
+- 机器同上（Apple M3 Pro）。Linux 的数字来自同一台 Mac 上 Docker Desktop 的 Linux 虚拟机（linux/arm64，12 个 CPU，Go 1.26.9），不是服务器。macOS 上用 Go 1.27.1。
+- 测试时机器上还有别的负载（load average 10 到 20）。为了让负载对两版的影响相同，v1（提交 8683de5，即去掉 pkg/errors 之后）和 v2 各编译成一个测试二进制，交替运行 10 轮，每轮 `-benchtime 200ms`，再用 benchstat 比较。v1 的基准名按 v2 的叫法改名（`hit/syncmap` → `hit/map`，`hit/ristretto` → `hit/otter`，`ZipfMixed` → `ZipfMixed/map`）。
+- 读时钟本身的成本单独测过：`time.Now()` 在 macOS 上约 30ns，在 Linux 虚拟机里约 38ns。
+
+### v1 → v2
+
+| 基准 | Linux v1 | Linux v2 | macOS v1 | macOS v2 | 分配 v1 → v2 |
+|---|---|---|---|---|---|
+| `Get/hit/map/serial` | 17.8ns | 86.3ns | 17.7ns | 58.7ns | 0 → 0 |
+| `Get/hit/map/parallel` | 2.5ns | 11.3ns | 2.4ns | 11.4ns | 0 → 0 |
+| `Get/hit/otter/serial` | 38.8ns | 203ns | 36.6ns | 165ns | 0 → 0 |
+| `Get/hit/otter/parallel` | 126ns | 28.2ns | 105ns | 23.6ns | 0 → 0 |
+| `Get/notfound-hit` | 552ns | 86.0ns | 500ns | 57.9ns | 12 → 0 |
+| `Get/stale-hit` | 105ns | 74.0ns | 88.4ns | 70.7ns | 2 → 1 |
+| `Get/miss` | 2.82µs | 2.13µs | 2.78µs | 2.06µs | 26 → 21 |
+| `Get/miss/x-sync-baseline` | 274ns | 160ns | 263ns | 142ns | 7 → 4 |
+| `Get/hit/l2` | 2.61µs | 3.90µs | 2.61µs | 3.92µs | 23 → 24 |
+| `GetMany/hit/n=100/GetMany` | 11.6µs | 12.2µs | 10.1µs | 11.0µs | 14 → 14 |
+| `GetMany/hit/n=100/loop-Get` | 2.40µs | 8.80µs | 2.40µs | 6.40µs | 0 → 0 |
+| `GetMany/half-miss/n=100/GetMany` | 66.8µs | 55.2µs | 56.5µs | 43.2µs | 598 → 210 |
+| `GetMany/half-miss/n=100/loop-Get` | 155µs | 108µs | 159µs | 105µs | 1500 → 900 |
+| `HotKeyStampede`（每轮，数据源调用 1 次） | 85.7µs | 66.3µs | 65.9µs | 50.3µs | 546 → 151 |
+| `SetDel/spread` | 339ns | 267ns | 371ns | 244ns | 4 → 4 |
+| `SetDel/same-stripe` | 370ns | 528ns | 283ns | 351ns | 6 → 7 |
+| `ZipfMixed/map` | 262ns | 224ns | 182ns | 149ns | 4 → 2 |
+| `ZipfMixed/otter`（只有 v2） | | 230ns | | 194ns | 2 |
+
+- **命中变贵了，主要是读时钟**：v2 每次命中都按条目的时间判断新鲜度，而 v1 的命中基准存的是不带新鲜度判断的值。时钟约占命中耗时的一半，剩下约 25ns 是找分片（命中前要记下分片纪元，见 ADR 0008）和复制条目。把分片纪元挪到读取之后试过：远端的第一层读得慢时，读取期间的回填会被漏掉，`TestDoubleCheck` 失败，所以没有采用。
+- **不存在命中几乎不花钱**：只读一层、只读一次，`ErrNotFound` 原样返回。
+- **otter 单 key 串行慢**：profile 显示约 80% 的时间在 `pthread_cond_signal/wait`，即 otter 的读缓冲攒满后唤醒维护 goroutine；cachex 自己约占 13%。并行、分散到很多 key 时，它比 v1 的 ristretto 快 4 到 5 倍。
+- **`Get/hit/l2` 慢 50%**：profile 里约 90% 是 goroutine 交接（线程唤醒和休眠），cachex 自身约 5%。v1 同样要起一个 goroutine，差别来自分配和调度的波动，没有继续追。
+
+### 移植后做的性能修复
+
+移植后第一次完整测量（提交 ba54dad 之前）有几项明显比 v1 慢，修复后（macOS，同一时段，`-count=5`）：
+
+| 基准 | 修复前 | 修复后 | 做了什么 |
+|---|---|---|---|
+| `Get/hit/map/parallel` | 97ns | 12ns | 测试后端 `cachextest.Map` 从 `RWMutex` 换成 `sync.Map`：多核读时 RLock 的计数器在 CPU 间争用。v1 的 SyncMap 本来就是 `sync.Map` |
+| `Get/miss` | 4.83µs，2432B，28 次分配 | 2.24µs，960B，21 次分配 | 只回填一个 key 时不再建 map；回填沿用所在调用的超时，不再另开一个 `WithTimeout` |
+| `Get/hit/l2` | 5.0µs，3656B，33 次分配 | 3.9µs，1240B，24 次分配 | 下层只读一个 key 时用 `Get`，并且不建只有一个元素的 map（一个条目约 96 字节，一个 map 至少分配 8 个槽，近 1KB） |
+| `SetDel/spread` | 493ns，849B，8 次分配 | 239ns，218B，4 次分配 | 单个 key 的 `Set`/`Del` 走单独的快路径，不建批量写用的 map 和切片 |
+| `SetDel/same-stripe` | 1185ns | 约 430ns | 同上 |
+
+### 移植时发现的 bug
+
+数据源实现了 `BatchSource`、而要找的 key 全在下层命中时，`askSource` 拿到空的 key 列表，`slices.Chunk(…, 0)` panic。panic 被接住了，而且结果已经发布，所以调用方照样拿到值，只是多一条 ERROR 日志。已有测试没覆盖「多层 + 批量数据源 + 下层命中」这个组合。修复时补了回归测试，并让 `Close` 等待它之前开始的回源结束（否则测试断言日志时 panic 还没发生）。
+
+### 没解决的
+
+- 同一分片里的写入比 v1 慢 24% 到 43%：排队等锁时 `Lock` 要起一个 goroutine，每次写入还要为抖动取一个随机数。
+- otter 单 key 串行读的开销来自它的维护 goroutine，不在 cachex 里。
+- 内存层全命中时，`GetMany` 每个 key 约 110 到 120ns，比循环 `Get` 慢；它的分配（去重、结果 map）是固定的。
+
 ## 复跑
 
 ```sh
 go test -run '^$' -bench . -benchmem -benchtime 300ms -count=10 . > new.txt
 go run golang.org/x/perf/cmd/benchstat@latest old.txt new.txt
 ```
+
+机器上有别的负载时，像 v2 那样把两个版本各编译成测试二进制，交替运行：
+
+```sh
+go test -c -o v2.test .                       # 在 v2 的目录里
+(cd ../v1 && go test -c -o ../v2/v1.test .)   # v1 的 worktree
+for i in $(seq 10); do
+  ./v1.test -test.run '^$' -test.bench . -test.benchmem -test.benchtime 200ms >> v1.txt
+  ./v2.test -test.run '^$' -test.bench . -test.benchmem -test.benchtime 200ms >> v2.txt
+done
+go run golang.org/x/perf/cmd/benchstat@latest v1=v1.txt v2=v2.txt
+```
+
+Linux 上用 `GOOS=linux go test -c` 交叉编译，再在 `golang:1.26` 容器里运行同样的循环。
 
 数字只在同一台机器上前后对比有意义。

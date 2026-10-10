@@ -1,366 +1,60 @@
-# Cachex Benchmark Results
+# Benchmarks
 
-This document presents comprehensive benchmark results for the `cachex` library, simulating a realistic product search interface scenario with 10,000 products.
+English | [中文](BENCHMARK_ZH.md)
 
-## 🔥 Important Note: Cold Start Testing
+These are micro benchmarks of cachex's own overhead. Every source answers at once and nothing sleeps, so the numbers are the cost of the library per call, not of simulated I/O. A real fetch (a Redis round trip, a database query) costs 100µs or more; compare against that before acting on anything here.
 
-**These benchmarks showcase cold start (no pre-warming) performance.**
+The code is in [`benchmark_test.go`](benchmark_test.go); the full report, with the v1 baseline and the fixes made while porting the suite, is [docs/research/2026-10-micro-benchmarks.md](docs/research/2026-10-micro-benchmarks.md) (Chinese).
 
-- ✅ **No Cache Pre-warming**: All tests start with empty caches, truly reflecting system startup behavior
-- ✅ **Cold Start Zero Errors**: Under current test configurations, all scenarios achieve zero errors
-- 🚀 **After Pre-warming**: With cache pre-warming (99%+ hit rate), throughput increases dramatically and DB load drops to minimal levels
+## How to run
 
-> 💡 **Why Cold Start Matters?** Cold start is the system's most vulnerable moment and most prone to cascading failures. Cachex provides excellent cold start performance through Singleflight + DoubleCheck mechanisms with proper TTL configuration.
-
-## Test Environment
-
-- **Platform:** darwin/arm64
-- **CPU:** Apple M3 Pro
-- **Go Version:** 1.23+
-- **Total Products:** 10,000
-- **Test Duration:** 10 seconds per scenario
-- **Database Simulation:** Semaphore-based connection pool (realistic database connection pool behavior)
-
-## Traffic Pattern
-
-The benchmark simulates realistic e-commerce traffic following the **Pareto Principle (80/20 rule)**:
-
-- **80%** - Hot Products (top 50 products)
-- **15%** - Warm Products (#51-500)
-- **4%** - Cold Products (#501-5,000)
-- **1%** - Not-Found Requests
-
-> 💡 This distribution reflects real-world e-commerce patterns where a small number of products receive the majority of traffic.
-
-## Benchmark Scenarios
-
-### Scenario 1: High Performance DB
-
-Simulates a high-performance database with large connection pool (100 connections) and extremely aggressive cache refresh strategy, demonstrating performance under high load.
-
-```text
-Configuration:
-  DB Conn Pool:        100 (large pool)
-  DB Latency:          90ms
-  Fetch Timeout:       2s
-  Data Fresh TTL:      1s  (extremely aggressive refresh)
-  Data Stale TTL:      24h (additional)
-  NotFound Fresh TTL:  500ms
-  NotFound Stale TTL:  24h (additional)
-  Concurrency:         600
-  Duration:            10s
-
-Results (Cold Start):
-  Total Requests:   5,049,890
-  Success:          4,999,371 (99.0%)
-  Not Found:        50,519 (1.0%)
-  Errors:           0 (0.0%)
-  Overall QPS:      504,989 req/s
-
-Cache Performance:
-  Cache Hit Rate:   99.81%
-  DB Queries:       9,826 (0.2%)
-  DB QPS:           982.5 req/s
-  DB Rejected:      0
-  DB Utilization:   88.4% (high load)
-  Amplification:    514.0x
-
-Latency:
-  P50:              291ns
-  P95:              750ns
-  P99:              3.375µs
-
-Latency Distribution:
-  <1ms      99.9%  ████████████████████████████████████████████████
+```sh
+go test -run '^$' -bench . -benchmem -count=10 . > new.txt
+go run golang.org/x/perf/cmd/benchstat@latest old.txt new.txt
 ```
 
-> 💡 **Key Insights (Cold Start):**
->
-> - **99.81% cache hit rate** even with 1s extremely aggressive refresh strategy
-> - **505K QPS** exceptional throughput demonstrating outstanding performance with 600 concurrency
-> - Ultra-low latency: P50 only 291ns, P99 at 3.3µs
-> - **88.4% DB utilization**: High load operation while retaining 11.6% buffer for traffic spikes
-> - **982.5 DB QPS**, exceptional **514.0x** amplification
-> - Zero-error cold start: Singleflight + DoubleCheck work perfectly under high load
-> - **Potential After Pre-warming**: Hit rate can reach 99.9%+, DB load drops below 1%
-
----
-
-### Scenario 2: Cloud DB
-
-Simulates a cloud database with medium connection pool (20 connections) and balanced TTL configuration.
-
-```text
-Configuration:
-  DB Conn Pool:        20 (medium pool)
-  DB Latency:          85ms
-  Fetch Timeout:       1s
-  Data Fresh TTL:      5s
-  Data Stale TTL:      24h (additional)
-  NotFound Fresh TTL:  3s
-  NotFound Stale TTL:  24h (additional)
-  Concurrency:         100
-  Duration:            10s
-
-Results (Cold Start):
-  Total Requests:   552,220
-  Success:          546,698 (99.0%)
-  Not Found:        5,522 (1.0%)
-  Errors:           0 (0.0%)
-  Overall QPS:      55,222 req/s
-
-Cache Performance:
-  Cache Hit Rate:   99.61%
-  DB Queries:       2,138 (0.4%)
-  DB QPS:           213.8 req/s
-  DB Rejected:      0
-  DB Utilization:   90.9% (ideal range)
-  Amplification:    235.0x
-
-Latency:
-  P50:              833ns
-  P95:              5.25µs
-  P99:              12µs
-
-Latency Distribution:
-  <1ms      99.7%  ████████████████████████████████████████████████
-```
-
-> 💡 **Key Insights (Cold Start):**
->
-> - **99.61% cache hit rate** with 5s balanced refresh strategy
-> - **90.9% DB utilization**: Near optimal utilization while retaining 9% buffer
-> - P50 latency 833ns, P99 only 12µs, excellent latency distribution
-> - **213.8 DB QPS**, 235.0x amplification
-> - Zero-error cold start: Connection pool queuing in test ensures no request rejections
-> - **Potential After Pre-warming**: Hit rate can reach 99.9%+, DB utilization drops below 10%
-
----
-
-### Scenario 3: Shared DB
-
-Simulates a shared database environment with small connection pool (13 connections) and conservative TTL to reduce load.
-
-```text
-Configuration:
-  DB Conn Pool:        13 (small pool)
-  DB Latency:          125ms
-  Fetch Timeout:       5s
-  Data Fresh TTL:      10s
-  Data Stale TTL:      24h (additional)
-  NotFound Fresh TTL:  5s
-  NotFound Stale TTL:  24h (additional)
-  Concurrency:         100
-  Duration:            10s
-
-Results (Cold Start):
-  Total Requests:   73,060
-  Success:          72,330 (99.0%)
-  Not Found:        730 (1.0%)
-  Errors:           0 (0.0%)
-  Overall QPS:      7,306 req/s
-
-Cache Performance:
-  Cache Hit Rate:   98.59%
-  DB Queries:       1,074 (1.4%)
-  DB QPS:           103.0 req/s
-  DB Rejected:      0
-  DB Utilization:   99.0% (near capacity)
-  Amplification:    70.2x
-
-Latency:
-  P50:              791ns
-  P95:              5.833µs
-  P99:              831ms
-
-Latency Distribution:
-  <1ms      98.6%  ████████████████████████████████████████████████
-  <10ms     99.8%  █
-```
-
-> 💡 **Key Insights (Cold Start):**
->
-> - **98.59% cache hit rate** even with 10s short refresh strategy
-> - **99.0% DB utilization**: Near capacity, fully utilizing limited connection pool
-> - P99 latency 831ms, limited by connection pool queuing pressure
-> - **103.0 DB QPS**, 70.2x amplification
-> - Zero-error cold start: Connection pool queuing in test ensures no request rejections
-> - **Potential After Pre-warming**: Hit rate can reach 99.9%+, DB utilization drops below 20%, latency significantly reduced
-
----
-
-### Scenario 4: Constrained DB
-
-Simulates an extremely constrained database with tiny connection pool (8 connections) and very conservative caching.
-
-```text
-Configuration:
-  DB Conn Pool:        8 (tiny pool)
-  DB Latency:          190ms
-  Fetch Timeout:       10s
-  Data Fresh TTL:      20s
-  Data Stale TTL:      24h (additional)
-  NotFound Fresh TTL:  10s
-  NotFound Stale TTL:  24h (additional)
-  Concurrency:         100
-  Duration:            10s
-
-Results (Cold Start):
-  Total Requests:   6,950
-  Success:          6,533 (94.0%)
-  Not Found:        417 (6.0%)
-  Errors:           0 (0.0%)
-  Overall QPS:      695 req/s
-
-Cache Performance:
-  Cache Hit Rate:   94.01%
-  DB Queries:       493 (7.1%)
-  DB QPS:           41.6 req/s
-  DB Rejected:      0
-  DB Utilization:   98.8% (near capacity)
-  Amplification:    16.7x
-
-Latency:
-  P50:              1.33µs
-  P95:              1.12s
-  P99:              2.04s
-
-Latency Distribution:
-  <1ms      93.9%  ████████████████████████████████████████████
-  <10ms     95.2%  █
-  <100ms    96.4%  █
-  <1s       98.2%  █
-  <10s      100.0% █
-```
-
-> 💡 **Key Insights (Cold Start):**
->
-> - **94.01% cache hit rate** even with 20s short refresh strategy
-> - **98.8% DB utilization**: Tiny connection pool near capacity, fully utilizing limited resources
-> - P99 latency 2.04s, limited by tiny connection pool queuing pressure
-> - **41.6 DB QPS**, 16.7x amplification
-> - Zero-error cold start: Connection pool queuing in test ensures no request rejections
-> - **Potential After Pre-warming**: Hit rate can reach 99.9%+, DB utilization drops below 10%, latency drops to sub-second
-> - Demonstrates cache's critical role in protecting extremely constrained databases
-
----
-
-## Performance Characteristics
-
-### Cold Start Latency Performance
-
-| Scenario       |    P50 |     P95 |   P99 | Cache Hit Rate |
-| :------------- | -----: | ------: | ----: | -------------: |
-| High Perf DB   |  791ns | 5.375µs |   5µs |         99.56% |
-| Cloud DB       |  833ns |  5.25µs |  12µs |         99.62% |
-| Shared DB      |  791ns | 5.833µs | 831ms |         98.57% |
-| Constrained DB | 1.33µs |   1.12s | 2.04s |         94.01% |
-
-> 📊 **Observation (Cold Start):**
->
-> - **High Perf/Cloud DB**: Cache hits remain in sub-microsecond to low-microsecond range, even during cold start
-> - **Shared/Constrained DB**: Higher P99 latencies due to connection pool queuing (cold start pressure)
-> - **After Pre-warming**: With cache pre-warming, hit rates improve to 99.9%+, latencies significantly reduce
-
-### Throughput vs DB Utilization (Cold Start)
-
-| Scenario       | Concurrency | Application QPS | DB Conn Pool | Theoretical DB QPS | Amplification | DB Utilization |
-| :------------- | ----------: | --------------: | -----------: | -----------------: | ------------: | -------------: |
-| High Perf DB   |         600 |         504,989 |          100 |              1,111 |        514.0x |          88.4% |
-| Cloud DB       |         100 |          55,222 |           20 |                235 |        235.0x |          90.9% |
-| Shared DB      |         100 |           7,306 |           13 |                104 |         70.2x |          99.0% |
-| Constrained DB |         100 |             695 |            8 |                 42 |         16.7x |          98.8% |
-
-> 📊 **Observation (Cold Start):**
->
-> - **Throughput Amplification** = Application QPS / Theoretical DB Capacity, where Theoretical DB Capacity = Conn Pool / (Latency / 1000ms)
-> - **High Perf DB**: 514.0x amplification, 88.4% utilization, high load operation with 11.6% buffer for traffic spikes
-> - **Cloud DB**: 235.0x amplification, 90.9% ideal utilization, balanced performance and resource usage
-> - **Shared/Constrained**: 70.2x / 16.7x amplification, near capacity (99%+), connection pool fully utilized
-> - **Key Value**: Connection pool-based realistic simulation accurately reflects database behavior during cold start
-
-## Configuration Strategy
-
-### TTL Strategy by Scenario (Cold Start Optimized)
-
-| Scenario       | Fresh TTL | Use Case                | DB Conn Pool |
-| :------------- | :-------: | :---------------------- | :----------: |
-| High Perf DB   |  **3s**   | Aggressive refresh      |     100      |
-| Cloud DB       |  **5s**   | Balanced performance    |      20      |
-| Shared DB      |  **10s**  | Conservative protection |      13      |
-| Constrained DB |  **20s**  | Maximum protection      |      8       |
-
-> 💡 **Cold Start Configuration Principles**:
->
-> - TTL strategy adjusts based on connection pool size to ensure zero errors during cold start
-> - Smaller connection pools require longer TTLs to reduce DB pressure during cold start
-> - **After Pre-warming**: Cache can use significantly shorter TTLs to improve data freshness
-
-## Key Takeaways
-
-### 1. Cold Start Performance Optimization 🔥
-
-**This is the most critical feature!** Cachex provides excellent cold start performance through **Singleflight + DoubleCheck** mechanisms with proper TTL configuration. Under current test configurations, all scenarios achieve **0% error rate**.
-
-### 2. Realistic Database Simulation
-
-The benchmark uses **Semaphore connection pool mechanism** instead of simple QPS counters. This realistically simulates database connection pool queuing behavior, making results closer to production environments.
-
-### 3. High Cache Efficiency During Cold Start
-
-Even during cold start, cache hit rates achieve:
-
-- **High Perf/Cloud DB**: 99.56%+ hit rate
-- **Shared/Constrained DB**: 94%+ hit rate (limited by connection pool queuing)
-
-### 4. Massive Potential After Pre-warming 🚀
-
-These are **cold start** results! After cache pre-warming:
-
-- **Hit Rate**: Can improve to 99.9%+
-- **Throughput**: Significantly increases (DB load drops to minimal levels)
-- **Latency**: P99 drops to microsecond or sub-second range
-- **DB Utilization**: Drops to 1-20%
-
-### 5. Adaptive Connection Pool Strategy
-
-Different scenarios demonstrate connection pool size vs TTL trade-offs:
-
-- **Large pool (100)**: Aggressive TTL (3s), plenty of headroom
-- **Medium pool (20)**: Balanced TTL (5s), 90% utilization
-- **Small pool (8-13)**: Conservative TTL (10-20s), near capacity but zero errors
-
-### 6. Connection Pool vs QPS Limit
-
-Key values of switching from QPS limits to connection pool mechanism:
-
-- ✅ **More Realistic**: Accurately simulates database connection pool queuing behavior
-- ✅ **Zero Rejections**: Requests queue instead of immediate rejection, `FetchTimeout` becomes truly effective
-- ✅ **Predictable**: DB utilization based on connection capacity, easy to understand and optimize
-
-## Traffic Distribution Details
-
-The benchmark uses a **Pareto-based traffic pattern** reflecting real e-commerce behavior:
-
-```go
-// 80% of traffic → 20 products (0.2% of catalog)
-// 95% of traffic → 200 products (2% of catalog)
-// 99% of traffic → 1,000 products (10% of catalog)
-```
-
-This distribution ensures:
-
-- **Hot products** are always cached and fresh
-- **Warm products** benefit from high cache hit rates
-- **Cold products** are pre-warmed to minimize cache misses
-- **Not-found requests** are cached to prevent repeated lookups
-
-## Running the Benchmark
-
-To reproduce these results:
-
-```bash
-go test -bench=BenchmarkProductSearch -benchtime=1x
-```
-
-> ℹ️ **Note:** Results may vary based on hardware, Go version, and system load. The benchmark is designed to be deterministic and reproducible within a given environment.
+Numbers only mean something when compared on the same machine.
+
+## Environment and method
+
+| | macOS | Linux |
+|---|---|---|
+| Machine | Apple M3 Pro, 12 cores | Docker Desktop's Linux VM on the same Mac, 12 CPUs, 7.75 GiB |
+| OS | macOS 27.0.1, darwin/arm64 | linux/arm64 |
+| Go | 1.27.1 | 1.26.9 |
+
+The Linux numbers come from a VM on a laptop, not from a server. The machine was shared with other work (load average around 10), so v1 and v2 test binaries were run alternately, 10 rounds of `-benchtime 200ms` each, and compared with benchstat (medians below). Parallel benchmarks have wide spreads (up to ±50%); only differences well above that mean anything.
+
+## Results: v1 → v2
+
+Time per operation, median. v1 is the last v1 code (after `github.com/pkg/errors` was dropped), its benchmarks renamed to v2's.
+
+| Benchmark | What it measures | Linux v1 | Linux v2 | macOS v1 | macOS v2 | Allocs v1 → v2 |
+|---|---|---|---|---|---|---|
+| `Get/hit/map/serial` | fresh hit, in-memory layer | 17.8ns | 86.3ns | 17.7ns | 58.7ns | 0 → 0 |
+| `Get/hit/map/parallel` | the same from 12 goroutines | 2.5ns | 11.3ns | 2.4ns | 11.4ns | 0 → 0 |
+| `Get/hit/otter/parallel` | fresh hit, memory layer (v1: ristretto, v2: otter) | 126ns | 28.2ns | 105ns | 23.6ns | 0 → 0 |
+| `Get/notfound-hit` | hit on a fresh not-found entry | 552ns | 86.0ns | 500ns | 57.9ns | 12 → 0 |
+| `Get/stale-hit` | stale hit, starting a background refresh | 105ns | 74.0ns | 88.4ns | 70.7ns | 2 → 1 |
+| `Get/miss` | full fetch: claim, source, backfill | 2.82µs | 2.13µs | 2.78µs | 2.06µs | 26 → 21 |
+| `Get/miss/x-sync-baseline` | `sync.Map` + `x/sync/singleflight`, for scale | 274ns | 160ns | 263ns | 142ns | 7 → 4 |
+| `Get/hit/l2` | first layer misses, second layer hits, backfill | 2.61µs | 3.90µs | 2.61µs | 3.92µs | 23 → 24 |
+| `GetMany/hit/n=100/GetMany` | 100 keys, all hits | 11.6µs | 12.2µs | 10.1µs | 11.0µs | 14 → 14 |
+| `GetMany/hit/n=100/loop-Get` | the same keys, `Get` in a loop | 2.40µs | 8.80µs | 2.40µs | 6.40µs | 0 → 0 |
+| `GetMany/half-miss/n=100/GetMany` | 100 keys, half not in the source, nothing cached for them | 66.8µs | 55.2µs | 56.5µs | 43.2µs | 598 → 210 |
+| `GetMany/half-miss/n=100/loop-Get` | the same keys, `Get` in a loop | 155µs | 108µs | 159µs | 105µs | 1500 → 900 |
+| `HotKeyStampede` | 64 concurrent misses of one key; source calls per round = 1 in both | 85.7µs | 66.3µs | 65.9µs | 50.3µs | 546 → 151 |
+| `SetDel/spread` | parallel `Set`/`Del` over 1024 keys, with a reader | 339ns | 267ns | 371ns | 244ns | 4 → 4 |
+| `SetDel/same-stripe` | the same, all keys in one stripe | 370ns | 528ns | 283ns | 351ns | 6 → 7 |
+| `ZipfMixed/map` | parallel Zipf reads over 10,000 keys, 10% not in the source | 262ns | 224ns | 182ns | 149ns | 4 → 2 |
+| `ZipfMixed/otter` | the same over otter (v2 only) | | 230ns | | 194ns | 2 |
+
+## What the numbers say
+
+- **A hit costs more in v2, and most of it is reading the clock.** Every hit checks the entry's freshness, which needs the time: `time.Now()` alone costs about 30ns on macOS and 38ns in the Linux VM. v1's hit benchmark stored plain values with no freshness check; v1 users of `Entry[T]` paid for the clock too. The rest (finding the key's stripe, copying the entry) is about 25ns.
+- **Not-found hits are nearly free now**: a not-found entry is a state of the entry in the layer, read once, and `ErrNotFound` is returned as is (no wrapping, no allocation). v1 read a second backend and formatted an error.
+- **Misses and fetches are cheaper** (−25%, 21 allocations instead of 26); a stampede of 64 readers still calls the source once.
+- **`GetMany` pays off only with misses or a remote layer.** On an in-memory layer with every key a hit it costs about 110 to 120ns per key, against 64 to 88ns for a loop of `Get`; with misses it is 17 to 30% faster than v1 and fetches once. Against Redis or a database, one round trip for the batch instead of one per key is what matters.
+- **otter's single-key serial benchmark is not representative**: reading one key over and over from one goroutine keeps waking otter's maintenance goroutine, so `Get/hit/otter/serial` is about 165 to 200ns. Spread over many keys and goroutines (`Get/hit/otter/parallel`, `ZipfMixed/otter`) it is 4 to 5 times faster than v1's ristretto layer.
+- **Writes to keys in one stripe are slower than v1** (+24 to +43%): such writes queue for the stripe's lock, and each write draws a random number for the jitter. Writes spread over stripes are 20 to 35% faster.
+- `Get/hit/l2` is 50% slower than v1. Its time is mostly a goroutine hand-off (the fetch runs in its own goroutine so that callers can leave); the CPU spent inside cachex is small.
