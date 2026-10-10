@@ -120,6 +120,6 @@ flowchart LR
 | [GLOSSARY.md](../GLOSSARY.md) | 术语表 |
 | [adr/](adr/) | 架构决策记录 |
 | [todo.md](todo.md) | 发现了但还没做的事 |
-| [faq.md](faq.md) | 常见问题 |
+| [faq_ZH.md](faq_ZH.md) | 常见问题（英文版见 [faq.md](faq.md)） |
 | [research/](research/README.md) | 实测与调研报告 |
 | [../BENCHMARK.md](../BENCHMARK.md) | 性能基准（中英双语） |

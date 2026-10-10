@@ -1,5 +1,7 @@
 # 常见问题
 
+[English](faq.md) | 中文
+
 每个问题先给结论，再给依据。设计细节以 [design.md](design.md) 及其分篇为准。
 
 ## 使用
@@ -93,7 +95,7 @@ TTL 是**不主动写入**时旧数据的存活上限。`Set`/`Del` 是你主动
 - 一次大批量回填会在回填期间占住它所有 key 的分片（1000 个 key 约 22%），这些分片上的写入要排队；
 - 读永远不等。
 
-批量远超 1000 个 key 时，用 `WithGetManyChunkSize` 让每段各自回填、只占自己的分片。调小后端的 `ChunkSize` 没有这个效果。见 [design/write-order.md](design/write-order.md#慢操作会拖慢多大范围)。
+批量远超 1000 个 key 时，用 `WithGetManyChunkSize` 让每段各自回填、只占自己的分片；各段是并发的，要限制同时占住的分片，还要调小 `WithGetManyFetchConcurrency`。调小后端的 `ChunkSize` 没有这个效果。见 [design/write-order.md](design/write-order.md#慢操作会拖慢多大范围)。
 
 ### 多个实例部署时，还保证写入顺序吗？
 

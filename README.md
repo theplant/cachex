@@ -523,10 +523,10 @@ user, err := userCache.Get(ctx, "user:123")
 
 ## Documentation
 
-Design notes for maintainers and readers who want the details, in Chinese only:
+Design notes for maintainers and readers who want the details; all in Chinese except the FAQ, which has both languages:
 
 - [Design overview](docs/design.md) (Chinese): the model, the architecture, and one page per mechanism: read path, singleflight, write order and striped locks, batch reads, backends, consistency across instances
-- [FAQ](docs/faq.md) (Chinese)
+- [FAQ](docs/faq.md)
 - [Glossary](GLOSSARY.md) (Chinese, with the English terms used in code)
 - [Architecture decision records](docs/adr/) (Chinese)
 - [Measurements](docs/research/README.md) (Chinese) and their re-runnable scripts in `tools/bench/`
