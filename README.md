@@ -521,40 +521,16 @@ user, err := userCache.Get(ctx, "user:123")
 >
 > 📊 **Throughput Amplification** = Application QPS / Theoretical DB Capacity, where Theoretical DB Capacity = Conn Pool / (Latency / 1000ms).
 
-## FAQ
+## Documentation
 
-### Q: When should I use `Entry[T]` vs custom staleness?
+Design notes for maintainers and readers who want the details, in Chinese only:
 
-**A:** Use `Entry[T]` with `EntryWithTTL` for simple time-based expiration. Use custom staleness checkers when you need domain-specific logic (e.g., checking a `version` field).
-
-### Q: How does cache stampede protection work?
-
-**A:** Cachex uses a two-layer defense based on the philosophy of **concurrent exploration + result convergence**:
-
-1. **Singleflight with Concurrency Control** (Primary):
-
-   - **Exploration phase**: When cache misses, `WithFetchConcurrency` allows N concurrent fetches to maximize throughput
-   - **Default (N=1)**: Full deduplication - only one fetch, others wait (99%+ redundancy elimination)
-   - **N > 1**: Moderate redundancy - requests distributed across N slots for higher throughput
-
-2. **DoubleCheck** (Supplementary):
-   - Handles the window where Request B reads the cache (miss) just before Request A's fetch writes it, but claims the key only after A's fetch finished: B re-reads instead of fetching again
-   - Works **across all singleflight slots**, enabling fast convergence after first successful fetch
-   - The saving grows with how long a cache read takes to come back and how hot the key is. Measured with a key requested 20 times per ms, expiring every 20 ms, a 5 ms upstream and a cache answering in 1 ms: 18 upstream calls with it, 30 without; with an in-memory cache, no difference
-   - Default `DoubleCheckAuto` re-checks only when this `Client` wrote the key's stripe since the request read the cache, so cold keys and keys that do not exist skip the useless re-read (measured over 8000 cold keys: 1.004 cache reads per `Get`, against 2 with `DoubleCheckEnabled`)
-   - Configure with `WithDoubleCheck(DoubleCheckEnabled/Disabled/Auto)`; `DoubleCheckEnabled` also catches values other processes wrote to a shared cache
-
-### Q: What's the difference between fresh and stale TTL?
-
-**A:** Fresh TTL defines how long data is considered fresh. Stale TTL defines an **additional** period during which data can be served as stale (with async refresh). Total lifetime = `freshTTL + staleTTL`.
-
-### Q: Should I cache all database queries?
-
-**A:** No. Cache frequently accessed, relatively static data. Avoid caching:
-
-- Data that changes frequently (< 1s freshness requirement)
-- User-specific data with high cardinality
-- Large objects that don't fit in memory efficiently
+- [Design overview](docs/design.md) (Chinese): the model, the architecture, and one page per mechanism: read path, singleflight, write order and striped locks, batch reads, backends, consistency across instances
+- [FAQ](docs/faq.md) (Chinese)
+- [Glossary](GLOSSARY.md) (Chinese, with the English terms used in code)
+- [Architecture decision records](docs/adr/) (Chinese)
+- [Measurements](docs/research/README.md) (Chinese) and their re-runnable scripts in `tools/bench/`
+- [To do](docs/todo.md) (Chinese)
 
 ## License
 
