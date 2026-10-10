@@ -60,17 +60,23 @@ type Config[T any] struct {
 	Logger *slog.Logger
 }
 
-// Backend is a GORM-backed cachex.Backend.
+// Backend is a GORM-backed cachex.Backend: its entries are encoded by
+// cachex.Encoded, with Config.Codec and Config.Logger.
 type Backend[T any] struct {
+	cachex.Backend[T]
+	bytes *byteBackend
+}
+
+var _ cachex.Backend[any] = (*Backend[any])(nil)
+
+type byteBackend struct {
 	db        *gorm.DB
 	table     string
 	prefix    string
 	chunkSize int
-	codec     cachex.Codec[T]
-	logger    *slog.Logger
 }
 
-var _ cachex.Backend[any] = (*Backend[any])(nil)
+var _ cachex.ByteBackend = (*byteBackend)(nil)
 
 type row struct {
 	Key       string    `gorm:"not null;primaryKey;size:255"`
@@ -87,15 +93,9 @@ func New[T any](cfg Config[T]) *Backend[T] {
 	if cfg.TableName == "" {
 		panic("gormcachex: TableName is required")
 	}
-	b := &Backend[T]{db: cfg.DB, table: cfg.TableName, prefix: cfg.KeyPrefix, codec: cfg.Codec, logger: cfg.Logger}
-	b.chunkSize = min(cmp.Or(max(cfg.ChunkSize, 0), DefaultChunkSize), maxChunkSize)
-	if b.codec == nil {
-		b.codec = cachex.DefaultCodec[T]()
-	}
-	if b.logger == nil {
-		b.logger = slog.Default()
-	}
-	return b
+	b := &byteBackend{db: cfg.DB, table: cfg.TableName, prefix: cfg.KeyPrefix,
+		chunkSize: min(cmp.Or(max(cfg.ChunkSize, 0), DefaultChunkSize), maxChunkSize)}
+	return &Backend[T]{Backend: cachex.Encoded(b, cfg.Codec, cfg.Logger), bytes: b}
 }
 
 type txKey struct{}
@@ -114,7 +114,7 @@ func TxFrom(ctx context.Context) *gorm.DB {
 }
 
 // conn is where ctx's statements run: its transaction, if it may join it.
-func (b *Backend[T]) conn(ctx context.Context) (db *gorm.DB, inTx bool) {
+func (b *byteBackend) conn(ctx context.Context) (db *gorm.DB, inTx bool) {
 	if tx := TxFrom(ctx); tx != nil && !cachex.IsShared(ctx) {
 		return tx.WithContext(ctx), true
 	}
@@ -144,7 +144,9 @@ func anys(keys []string) []any {
 // an existing table whose key column uses another collation, with the
 // statement that converts it. It runs on Config.DB, never in a transaction
 // WithTx put in ctx: on MySQL, DDL would commit it.
-func (b *Backend[T]) Migrate(ctx context.Context) error {
+func (b *Backend[T]) Migrate(ctx context.Context) error { return b.bytes.migrate(ctx) }
+
+func (b *byteBackend) migrate(ctx context.Context) error {
 	db := b.db.WithContext(ctx).Table(b.table)
 	if db.Name() == "mysql" {
 		if db.Migrator().HasTable(b.table) {
@@ -185,7 +187,7 @@ func checkMySQLVersion(version string) error {
 	return nil
 }
 
-func (b *Backend[T]) checkMySQLKeyCollation(db *gorm.DB) error {
+func (b *byteBackend) checkMySQLKeyCollation(db *gorm.DB) error {
 	var collation sql.NullString
 	if err := db.Raw("SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
 		b.table, "key").Scan(&collation).Error; err != nil {
@@ -201,7 +203,7 @@ func (b *Backend[T]) checkMySQLKeyCollation(db *gorm.DB) error {
 // write runs a statement, retrying it if the database aborts it as a deadlock
 // victim, unless it runs in the caller's transaction, which the deadlock has
 // already rolled back as a whole.
-func (b *Backend[T]) write(ctx context.Context, f func(db *gorm.DB) error) error {
+func (b *byteBackend) write(ctx context.Context, f func(db *gorm.DB) error) error {
 	db, inTx := b.conn(ctx)
 	if inTx {
 		return f(db)
@@ -233,23 +235,24 @@ func isDeadlock(err error) bool {
 	return strings.Contains(err.Error(), "Error 1213 (40001)")
 }
 
-func (b *Backend[T]) Get(ctx context.Context, key string) (cachex.Entry[T], bool, error) {
-	m, err := b.GetMany(ctx, []string{key})
-	if err != nil {
-		return cachex.Entry[T]{}, false, errOf(err, key)
-	}
-	e, ok := m[key]
-	return e, ok, nil
+func (b *byteBackend) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	m, errs := b.getMany(ctx, []string{key})
+	data, ok := m[key]
+	return data, ok, errs[key]
 }
 
-// GetMany reads keys with `WHERE key IN (...)` queries of up to ChunkSize keys.
-// Only the row stored under exactly a requested key is returned, even if the
-// key column compares keys loosely.
-func (b *Backend[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[T], error) {
-	out := make(map[string]cachex.Entry[T], len(keys))
+func (b *byteBackend) GetMany(ctx context.Context, keys []string) (map[string][]byte, error) {
+	m, errs := b.getMany(ctx, keys)
+	return m, cachex.NewBatchError(errs)
+}
+
+// getMany reads keys with `WHERE key IN (...)` queries of up to ChunkSize
+// keys. Only the row stored under exactly a requested key is returned, even if
+// the key column compares keys loosely.
+func (b *byteBackend) getMany(ctx context.Context, keys []string) (map[string][]byte, map[string]error) {
+	out := make(map[string][]byte, len(keys))
 	errs := map[string]error{}
 	db, _ := b.conn(ctx)
-	var bad []string
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
 		prefixed := make([]string, len(chunk))
 		for i, key := range chunk {
@@ -268,51 +271,34 @@ func (b *Backend[T]) GetMany(ctx context.Context, keys []string) (map[string]cac
 			byKey[r.Key] = r.Value
 		}
 		for i, key := range chunk {
-			data, ok := byKey[prefixed[i]]
-			if !ok {
-				continue
+			if data, ok := byKey[prefixed[i]]; ok {
+				out[key] = data
 			}
-			e, err := cachex.DecodeEntry(b.codec, data)
-			if err != nil {
-				b.logger.WarnContext(ctx, "gormcachex: dropped an entry that does not decode", "key", key, "error", err)
-				bad = append(bad, key)
-				continue
-			}
-			out[key] = e
 		}
 	}
-	if len(bad) > 0 {
-		_ = b.DelMany(ctx, bad)
-	}
-	return out, batchError(errs)
+	return out, errs
 }
 
-func (b *Backend[T]) Set(ctx context.Context, key string, e cachex.Entry[T]) error {
-	return errOf(b.SetMany(ctx, map[string]cachex.Entry[T]{key: e}), key)
+func (b *byteBackend) Set(ctx context.Context, key string, data []byte, expiresAt time.Time) error {
+	return b.setMany(ctx, map[string]cachex.ByteEntry{key: {Data: data, ExpiresAt: expiresAt}})[key]
 }
 
-// SetMany upserts entries with multi-row statements of up to ChunkSize rows,
-// in key order; an entry already expired deletes its key instead.
-func (b *Backend[T]) SetMany(ctx context.Context, entries map[string]cachex.Entry[T]) error {
+func (b *byteBackend) SetMany(ctx context.Context, entries map[string]cachex.ByteEntry) error {
+	return cachex.NewBatchError(b.setMany(ctx, entries))
+}
+
+// setMany upserts entries with multi-row statements of up to ChunkSize rows,
+// in key order.
+func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.ByteEntry) map[string]error {
 	errs := map[string]error{}
 	now := time.Now()
 	type pending struct {
 		key string
 		row row
 	}
-	var rows []pending
-	var expired []string
+	rows := make([]pending, 0, len(entries))
 	for key, e := range entries {
-		if !e.ExpiresAt.After(now) {
-			expired = append(expired, key)
-			continue
-		}
-		data, err := cachex.EncodeEntry(b.codec, e)
-		if err != nil {
-			errs[key] = err
-			continue
-		}
-		rows = append(rows, pending{key, row{Key: b.prefix + key, Value: data, ExpiresAt: e.ExpiresAt, UpdatedAt: now}})
+		rows = append(rows, pending{key, row{Key: b.prefix + key, Value: e.Data, ExpiresAt: e.ExpiresAt, UpdatedAt: now}})
 	}
 	// one row order for every writer, or overlapping batches lock rows in
 	// opposite orders and deadlock
@@ -330,23 +316,20 @@ func (b *Backend[T]) SetMany(ctx context.Context, entries map[string]cachex.Entr
 			}
 		}
 	}
-	if err := b.DelMany(ctx, expired); err != nil {
-		for _, key := range expired {
-			if kerr := errOf(err, key); kerr != nil {
-				errs[key] = kerr
-			}
-		}
-	}
-	return batchError(errs)
+	return errs
 }
 
-func (b *Backend[T]) Del(ctx context.Context, key string) error {
-	return errOf(b.DelMany(ctx, []string{key}), key)
+func (b *byteBackend) Del(ctx context.Context, key string) error {
+	return b.delMany(ctx, []string{key})[key]
 }
 
-// DelMany deletes keys with `WHERE key IN (...)` statements of up to
+func (b *byteBackend) DelMany(ctx context.Context, keys []string) error {
+	return cachex.NewBatchError(b.delMany(ctx, keys))
+}
+
+// delMany deletes keys with `WHERE key IN (...)` statements of up to
 // ChunkSize keys, locking rows in key order.
-func (b *Backend[T]) DelMany(ctx context.Context, keys []string) error {
+func (b *byteBackend) delMany(ctx context.Context, keys []string) map[string]error {
 	keys = slices.Sorted(slices.Values(keys))
 	errs := map[string]error{}
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
@@ -373,21 +356,5 @@ func (b *Backend[T]) DelMany(ctx context.Context, keys []string) error {
 			}
 		}
 	}
-	return batchError(errs)
-}
-
-func batchError(errs map[string]error) error {
-	if len(errs) == 0 {
-		return nil
-	}
-	return &cachex.BatchError{Errors: errs}
-}
-
-// errOf is the error a batch call reported for key: its own entry if err is
-// a *cachex.BatchError, otherwise err itself.
-func errOf(err error, key string) error {
-	if be, ok := err.(*cachex.BatchError); ok { //nolint:errorlint // returned unwrapped above
-		return be.Errors[key]
-	}
-	return err
+	return errs
 }

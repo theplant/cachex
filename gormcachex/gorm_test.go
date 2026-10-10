@@ -1,11 +1,9 @@
 package gormcachex
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/url"
 	"regexp"
 	"sync/atomic"
@@ -65,6 +63,12 @@ func TestContract(t *testing.T) {
 	})
 }
 
+func TestByteBackend(t *testing.T) {
+	cachextest.TestByteBackend(t, func(t *testing.T) cachex.ByteBackend {
+		return newBackend(t, Config[string]{KeyPrefix: "p:", ChunkSize: 3}).bytes
+	})
+}
+
 func TestTransactions(t *testing.T) {
 	ctx := context.Background()
 
@@ -108,9 +112,9 @@ func TestTransactions(t *testing.T) {
 		_, err := c.Get(WithTx(ctx, tx), "k")
 		require.NoError(t, err)
 		require.True(t, cachex.IsShared(sharedCtx), "the Cache marks a fetch's ctx")
-		_, inTx := b.conn(sharedCtx)
+		_, inTx := b.bytes.conn(sharedCtx)
 		assert.False(t, inTx, "and the backend does not join the caller's transaction with it")
-		_, inTx = b.conn(WithTx(ctx, tx))
+		_, inTx = b.bytes.conn(WithTx(ctx, tx))
 		assert.True(t, inTx)
 	})
 }
@@ -157,31 +161,6 @@ func TestOnlyTheRowOfExactlyTheKeyIsServed(t *testing.T) {
 	e, ok, err := b.Get(ctx, "ABC")
 	require.NoError(t, err)
 	assert.False(t, ok && e.Value == "lower", "ABC never reads abc's value: the upsert rewrites the key column")
-}
-
-func TestAnExpiredEntryIsNotStored(t *testing.T) {
-	ctx := context.Background()
-	b := newBackend(t, Config[string]{})
-	require.NoError(t, b.Set(ctx, "k", entry("v")))
-	require.NoError(t, b.Set(ctx, "k", cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(-time.Second)}))
-	_, ok, err := b.Get(ctx, "k")
-	require.NoError(t, err)
-	assert.False(t, ok)
-}
-
-func TestAnEntryThatDoesNotDecodeIsAMiss(t *testing.T) {
-	ctx := context.Background()
-	db := newSQLite(t)
-	var log bytes.Buffer
-	b := newBackend(t, Config[string]{DB: db, Logger: slog.New(slog.NewTextHandler(&log, nil))})
-	require.NoError(t, db.Exec("INSERT INTO cache (`key`, `value`, `expires_at`, `updated_at`) VALUES ('k', X'7b7d', ?, ?)", time.Now().Add(time.Hour), time.Now()).Error)
-	_, ok, err := b.Get(ctx, "k")
-	require.NoError(t, err)
-	assert.False(t, ok)
-	assert.Contains(t, log.String(), "dropped an entry that does not decode")
-	var n int64
-	require.NoError(t, db.Table("cache").Count(&n).Error)
-	assert.Zero(t, n, "and dropped it")
 }
 
 // sqlStateError mimics a pgx/lib/pq error.

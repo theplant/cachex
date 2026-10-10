@@ -65,6 +65,14 @@ func TestOnRealDatabases(t *testing.T) {
 
 			t.Run("contract", func(t *testing.T) {
 				cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] { return newB(t) }, strs)
+				cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[item] {
+					return New[item](Config[item]{DB: db, TableName: newB(t).bytes.table})
+				}, items)
+				cachextest.TestByteBackend(t, func(t *testing.T) cachex.ByteBackend {
+					b := newB(t).bytes
+					b.chunkSize = 3
+					return b
+				})
 			})
 
 			t.Run("a batch larger than one statement", func(t *testing.T) {
