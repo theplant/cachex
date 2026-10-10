@@ -1,537 +1,166 @@
-# Cachex
+# cachex
 
-> A high-performance, feature-rich Go caching library with generics, layered caching, and serve-stale mechanism.
+> A multi-layer read-through cache for Go: concurrent misses of a key are fetched once, writes reach every layer in one order, and every layer keeps its own freshness.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/theplant/cachex.svg)](https://pkg.go.dev/github.com/theplant/cachex)
-[![Go Report Card](https://goreportcard.com/badge/github.com/theplant/cachex)](https://goreportcard.com/report/github.com/theplant/cachex)
+[![Go Reference](https://pkg.go.dev/badge/github.com/theplant/cachex/v2.svg)](https://pkg.go.dev/github.com/theplant/cachex/v2)
 [![License](https://img.shields.io/github/license/theplant/cachex)](LICENSE)
 
-[English](README.md) | [中文文档](README_ZH.md)
+English | [中文](README_ZH.md)
 
-## Features
+A `Cache` reads its layers top down (memory, then Redis, then a database table, say) and asks the source only when no layer has a usable entry. Upgrading from v1? See [MIGRATION.md](MIGRATION.md).
 
-- **🛡️ Cache Stampede Protection** - Singleflight + DoubleCheck mechanisms eliminate redundant fetches, preventing traffic surge when hot keys expire
-- **🚫 Cache Penetration Defense** - Not-Found caching mechanism prevents malicious queries from overwhelming the database
-- **🔄 Serve-Stale** - Serves stale data while asynchronously refreshing, ensuring high availability and low latency
-- **🎪 Layered Caching** - Flexible multi-level caching (L1 Memory + L2 Redis), Client can also be used as upstream
-- **📦 Batch Reads** - `GetMany` reads many keys at once and fetches all misses together (one upstream call if the upstream implements `BatchUpstream`), keeping singleflight, DoubleCheck, Not-Found caching and serve-stale
-- **🚀 High Performance** - Sub-microsecond latency, 79x~1729x throughput amplification, zero error rate
-- **🎯 Type-Safe** - Go generics provide compile-time type safety, avoiding runtime type errors
-- **⏱️ Flexible TTL** - Independent fresh and stale TTL configuration for precise data lifecycle control
-- **🔧 Extensible** - Clean interface design makes it easy to implement custom cache backends
-
-## Quick Start
-
-### Installation
+## Install
 
 ```bash
-go get github.com/theplant/cachex
+go get github.com/theplant/cachex/v2
 ```
 
-### Basic Example
+## Quick start
+
+One in-memory layer over a source:
 
 ```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "time"
-
-    "github.com/theplant/cachex"
-)
-
-type Product struct {
-    ID    string
-    Name  string
-    Price int64
+mem, err := ottercachex.New[*Product](ottercachex.Config[*Product]{MaximumSize: 100_000})
+if err != nil {
+    log.Fatal(err)
 }
 
-func main() {
-    // Create data cache
-    cacheConfig := cachex.DefaultRistrettoCacheConfig[*cachex.Entry[*Product]]()
-    cacheConfig.TTL = 30 * time.Second // 5s fresh + 25s stale
-    cache, _ := cachex.NewRistrettoCache(cacheConfig)
-    defer cache.Close()
-
-    // Create not-found cache
-    notFoundConfig := cachex.DefaultRistrettoCacheConfig[time.Time]()
-    notFoundConfig.TTL = 6 * time.Second // 1s fresh + 5s stale
-    notFoundCache, _ := cachex.NewRistrettoCache(notFoundConfig)
-    defer notFoundCache.Close()
-
-    // Define upstream data source
-    upstream := cachex.UpstreamFunc[*cachex.Entry[*Product]](
-        func(ctx context.Context, key string) (*cachex.Entry[*Product], error) {
-            // Fetch from database or API
-            // Return &cachex.ErrKeyNotFound{} for non-existent keys
-            product := &Product{ID: key, Name: "Product " + key, Price: 9900}
-            return &cachex.Entry[*Product]{
-                Data:     product,
-                CachedAt: time.Now(),
-            }, nil
-        },
-    )
-
-    // Create client with all features enabled
-    client := cachex.NewClient(
-        cache,
-        upstream,
-        cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second), // 5s fresh, 25s stale
-        cachex.NotFoundWithTTL[*cachex.Entry[*Product]](notFoundCache, 1*time.Second, 5*time.Second),
-        cachex.WithServeStale[*cachex.Entry[*Product]](true),
-    )
-
-    // Use the cache
-    ctx := context.Background()
-    entry, _ := client.Get(ctx, "product-123")
-    fmt.Printf("Product: %+v\n", entry.Data)
-}
-```
-
-## Architecture
-
-```mermaid
-sequenceDiagram
-    participant App as Application
-    participant Client as cachex.Client
-    participant Cache as BackendCache
-    participant NFCache as NotFoundCache
-    participant SF as Singleflight
-    participant Upstream
-
-    App->>Client: Get(key)
-    Client->>Cache: Get(key)
-
-    alt Cache Hit + Fresh
-        Cache-->>Client: value (fresh)
-        Client-->>App: Return value
-    else Cache Hit + Stale (serveStale=true)
-        Cache-->>Client: value (stale)
-        Client-->>App: Return stale value
-        Client->>SF: Async refresh
-        SF->>Upstream: Fetch(key)
-        Upstream-->>SF: new value
-        SF->>NFCache: Del(key)
-        SF->>Cache: Set(key, value)
-    else Cache Hit + Stale (serveStale=false) or Rotten
-        Cache-->>Client: value (stale/rotten)
-        Note over Client: Skip NotFoundCache, fetch directly<br/>(backend has data)
-        Client->>SF: Fetch(key)
-        SF->>Upstream: Fetch(key)
-        Upstream-->>SF: value
-        SF->>NFCache: Del(key)
-        SF->>Cache: Set(key, value)
-        SF-->>Client: value
-        Client-->>App: Return value
-    else Cache Miss
-        Cache-->>Client: miss
-        Client->>NFCache: Check NotFoundCache (if configured)
-        alt NotFound Hit + Fresh
-            NFCache-->>Client: not found (fresh)
-            Client-->>App: Return ErrKeyNotFound
-        else NotFound Hit + Stale (serveStale=true)
-            NFCache-->>Client: not found (stale)
-            Client-->>App: Return ErrKeyNotFound (stale)
-            Client->>SF: Async recheck
-            SF->>Upstream: Fetch(key)
-            alt Key Still Not Found
-                Upstream-->>SF: ErrKeyNotFound
-                SF->>Cache: Del(key)
-                SF->>NFCache: Set(key, timestamp)
-            else Key Now Exists
-                Upstream-->>SF: value
-                SF->>NFCache: Del(key)
-                SF->>Cache: Set(key, value)
-            end
-        else NotFound Hit + Stale (serveStale=false) or Rotten or Miss
-            NFCache-->>Client: stale/rotten/miss
-            Client->>SF: Fetch(key)
-            SF->>Upstream: Fetch(key)
-            alt Key Exists
-                Upstream-->>SF: value
-                SF->>NFCache: Del(key)
-                SF->>Cache: Set(key, value)
-                SF-->>Client: value
-                Client-->>App: Return value
-            else Key Not Found
-                Upstream-->>SF: ErrKeyNotFound
-                SF->>Cache: Del(key)
-                SF->>NFCache: Set(key, timestamp)
-                SF-->>Client: ErrKeyNotFound
-                Client-->>App: Return ErrKeyNotFound
-            end
-        end
-    end
-```
-
-### Core Components
-
-- **Client** - Orchestrates caching logic, TTL, and refresh strategies (Client itself implements Cache interface and can also be used as upstream)
-- **BackendCache** - Storage layer (Ristretto, Redis, GORM, or custom), also serves as Upstream interface
-- **NotFoundCache** - Dedicated cache for non-existent keys to prevent cache penetration
-- **Upstream** - Data source (database, API, another Client, or custom)
-- **Singleflight** - Deduplicates concurrent requests for the same key (primary defense against cache stampede)
-- **DoubleCheck** - After claiming a fetch, re-checks backend and notFoundCache to catch a value another request just wrote, instead of fetching it again
-- **Entry** - Wrapper with timestamp for time-based staleness checks
-
-## Cache Backends
-
-### Ristretto (In-Memory)
-
-High-performance, TinyLFU-based in-memory cache.
-
-```go
-config := cachex.DefaultRistrettoCacheConfig[*Product]()
-config.TTL = 30 * time.Second
-cache, err := cachex.NewRistrettoCache(config)
-defer cache.Close()
-```
-
-### Redis
-
-Distributed cache with customizable serialization.
-
-```go
-cache := cachex.NewRedisCache[*Product](&cachex.RedisCacheConfig{
-    Client:    redisClient,
-    KeyPrefix: "product:",     // key prefix
-    TTL:       30*time.Second,
-})
-```
-
-### GORM (Database)
-
-Use your database as a cache layer (useful for persistence).
-
-```go
-cache := cachex.NewGORMCache[*Product](&cachex.GORMCacheConfig{
-    DB:        db,
-    TableName: "cache_products",
-})
-// Create the table if needed
-if err := cache.Migrate(ctx); err != nil {
-    // handle error
-}
-```
-
-Cache keys are case-sensitive, so the `key` column should compare them exactly. PostgreSQL and SQLite do by default, and on MySQL (8.0.17 or later) `Migrate` creates the table with `utf8mb4_0900_bin`, which compares case and trailing spaces exactly. Before creating it, `Migrate` checks the server version and returns an error naming it on an older MySQL or on MariaDB, which lack that collation. When the table already exists, `Migrate` checks that its `key` column uses `utf8mb4_0900_bin` and otherwise returns an error; a table created with MySQL's defaults is case- and accent-insensitive (`*_ci`), so convert it first with `ALTER TABLE cache_products CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`. Only each database's default isolation level is supported.
-
-Concurrent batch writes (from several instances' `GetMany` write-backs) lock rows in one order, so they do not deadlock each other; a write the database still aborts as a deadlock victim (MySQL's gap locks can) is retried a few times. Inside a transaction passed with `WithGORMTx` it is not retried, since the deadlock has rolled that whole transaction back; the error is returned.
-
-### Custom Cache
-
-Implement the `Cache[T]` interface:
-
-```go
-type Cache[T any] interface {
-    Get(ctx context.Context, key string) (T, error)
-    Set(ctx context.Context, key string, value T) error
-    Del(ctx context.Context, key string) error
-}
-```
-
-**Important**: When a key does not exist, the `Get` method must return a `*cachex.ErrKeyNotFound` error (for example `&cachex.ErrKeyNotFound{}`, optionally wrapped), so the Client can correctly distinguish between cache misses and other error conditions. Use `cachex.IsErrKeyNotFound(err)` to check for it.
-
-`Set` takes no TTL: expiry is decided by the Client (`WithStale` / `EntryWithTTL`), and backends that support a hard TTL take it in their config (`RistrettoCacheConfig.TTL`, `RedisCacheConfig.TTL`).
-
-Optionally implement `BatchCache[T]` as well, so `Client.GetMany` reads and writes your backend in one call per batch instead of key by key (see [Batch Reads](#batch-reads)):
-
-```go
-type BatchCache[T any] interface {
-    Cache[T]
-    // Missing keys are absent from the map; do not report them as ErrKeyNotFound.
-    // Errors follow BatchUpstream below: any error other than an unwrapped
-    // *cachex.BatchError fails every key (it is not read as all misses).
-    GetMany(ctx context.Context, keys []string) (map[string]T, error)
-    // Best effort: apply every key you can and list the keys that failed in a
-    // *cachex.BatchError returned as is; any other error means it is unknown
-    // which keys were applied.
-    SetMany(ctx context.Context, values map[string]T) error
-    DelMany(ctx context.Context, keys []string) error
-}
-```
-
-## Advanced Features
-
-### Layered Caching
-
-Combine multiple cache layers for optimal performance. Client implements both `Cache[T]` and `Upstream[T]` interfaces, allowing it to be used directly as upstream for the next layer:
-
-```go
-// L2: Redis cache with database upstream
-l2Cache := cachex.NewRedisCache[*cachex.Entry[*Product]](&cachex.RedisCacheConfig{
-    Client:    redisClient,
-    KeyPrefix: "product:",
-    TTL:       10 * time.Minute,
+source := cachex.SourceFunc[*Product](func(ctx context.Context, id string) (*Product, error) {
+    p, err := loadProduct(ctx, id) // your database query
+    if errors.Is(err, gorm.ErrRecordNotFound) {
+        return nil, cachex.ErrNotFound // "does not exist" is ErrNotFound
+    }
+    return p, err
 })
 
-dbUpstream := cachex.UpstreamFunc[*cachex.Entry[*Product]](
-    func(ctx context.Context, key string) (*cachex.Entry[*Product], error) {
-        product, err := fetchFromDB(ctx, key)
-        if err != nil {
-            return nil, err
-        }
-        return &cachex.Entry[*Product]{
-            Data:     product,
-            CachedAt: time.Now(),
-        }, nil
-    },
-)
+products := cachex.New(source, []cachex.Layer[*Product]{
+    cachex.NewLayer[*Product](mem, cachex.TTL(time.Minute, 10*time.Minute)),
+})
+defer products.Close()
 
-l2Client := cachex.NewClient(
-    l2Cache,
-    dbUpstream,
-    cachex.EntryWithTTL[*Product](1*time.Minute, 9*time.Minute),
-)
-
-// L1: In-memory cache with L2 client as upstream
-// Client can be used directly as upstream for the next layer
-l1Cache, _ := cachex.NewRistrettoCache(
-    cachex.DefaultRistrettoCacheConfig[*cachex.Entry[*Product]](),
-)
-defer l1Cache.Close()
-
-l1Client := cachex.NewClient(
-    l1Cache,
-    l2Client, // Client implements Upstream[T], use directly
-    cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second),
-    cachex.WithServeStale[*cachex.Entry[*Product]](true),
-)
-
-// Read: L1 miss → L2 → Database (if L2 also misses)
-product, _ := l1Client.Get(ctx, "product-123")
-```
-
-#### Write Propagation
-
-When you use a `Client` as the upstream for another `Client`, write operations (`Set`/`Del`) automatically propagate through all cache layers, stopping naturally when upstream doesn't implement `Cache[T]`:
-
-```
-L1 Cache → L2 Cache → L3 Cache → Database
-   ✅        ✅         ✅          ❌ (auto-stop)
-```
-
-The propagation works through **type-based detection**: if upstream implements `Cache[T]` interface, writes propagate; if upstream doesn't implement `Cache[T]` (e.g. `UpstreamFunc` for data sources), propagation stops.
-
-**Pattern Support:**
-
-This design naturally supports both caching patterns:
-
-- **Write-Through Pattern (Multi-Level Caches):**
-
-  ```go
-  // All cache layers stay in sync
-  l1Client.Set(ctx, key, value)  // writes ... → L2 → L1, bottom layer first (stops at data source)
-  ```
-
-- **Cache-Aside Pattern (Cache + Database):**
-  ```go
-  // Update database first, then cache
-  db.Update(user)
-  l1Client.Set(ctx, userID, user)  // Only updates cache layers, not DB
-  ```
-
-The key insight: **cache writes propagate through `Cache[T]` chains but stop when upstream doesn't implement `Cache[T]`**, making it safe and correct for both patterns.
-
-**Write order and consistency:**
-
-- `Set`/`Del` write the **upstream first**, then this layer, so a new value never shows up in an upper layer before the layer below has it: a `Set` becomes visible in this layer only after the write below has succeeded. The flip side is a short window while the write runs: until this layer's own write lands, a concurrent reader of this layer still sees its **old** value (after a `Del`, the deleted one), even though the layer below has already changed. Once `Set`/`Del` returns, the window is closed: a read that starts afterwards never gets a value fetched before the write (it does not join an older in-flight fetch, it starts a new one).
-- If the upstream write fails, its state is unknown (it may have been applied with only the reply lost), so this layer **drops** its entry for the key (and any cached Not-Found) and returns the error; the next read goes down. A failed `Del` likewise drops this layer's entry but caches no Not-Found.
-- If the upstream write succeeds but this layer's own write fails, `Set`/`Del` still return the error, yet the change below is **kept** (nothing is rolled back): an error does not mean nothing was written. This layer drops its entry and cached Not-Found for the key, so the next read goes down and sees the change.
-- Concurrent `Set`/`Del` of one key through the same `Client` are applied one at a time, in the same order on every layer. A `Set`/`Del` that has to wait (for another write to its stripe, or a read writing back to this layer) gives up when its ctx is done and returns the ctx error: it writes nothing upstream, and, like any failed write, drops this layer's entry for the key as soon as the stripe is free. One that does not have to wait is applied even if its ctx is already done. So an invalidating `Del` after the request was canceled always clears this layer, at worst a moment after it returns. Once a write has started, the cleanup after a failure (dropping this layer's entry) runs even if ctx is done, for at most `WithFetchTimeout`.
-- A read that fetched a value **before** a concurrent `Set`/`Del` still returns what it fetched, but never writes it back over the newer value: each `Client` hashes keys into 1,024 stripes, each with a write lock and a write generation, and `Get`, `GetMany` and the serve-stale refresh check the key's stripe generation while holding its lock for reading, so a backfill either lands before a `Set`/`Del` (which then overwrites it) or is skipped. A backfill is also skipped while a write to the stripe is in progress, so reads never wait on writes. Keys that share a stripe share this state: their writes run one at a time, and a write to one key can skip a backfill of another. The cost is at most an extra cache miss, or a write waiting on a write to an unrelated key, or on a read writing back to this layer: a large `GetMany` holds the stripes of all its keys (about 22% of them for 1,000 keys, 91% for 10,000) while the backend writes them back, so a `Set`/`Del` of any key in those stripes waits that long, and gives up if its ctx ends first. With `WithGetManyChunkSize(n)`, each chunk writes back on its own and holds only its keys' stripes; a smaller backend `ChunkSize` does not help, as the stripes are held for the whole `SetMany`.
-- These guarantees hold **within one process**: the stripes live in one `Client`'s memory and know nothing of other instances. With several instances sharing a lower layer (e.g. Redis):
-  - a write made on one instance does not reach the memory layers of the others, which keep their old value until it expires. Give memory layers a TTL no longer than the staleness you can accept; to invalidate them sooner, broadcast the change from your own code (e.g. Redis Pub/Sub);
-  - an instance that read the old value from the source just before another instance wrote it can still put that old value into the shared layer after the write, where it stays until it expires. This race is rare (the read and the write must overlap within milliseconds) but the stale value lives as long as the shared layer's TTL, so give that layer a TTL you can live with too.
-
-### Not-Found Caching
-
-Prevent repeated lookups for non-existent keys:
-
-```go
-notFoundCache, _ := cachex.NewRistrettoCache(
-    cachex.DefaultRistrettoCacheConfig[time.Time](),
-)
-defer notFoundCache.Close()
-
-client := cachex.NewClient(
-    dataCache,
-    upstream,
-    cachex.EntryWithTTL[*Product](5*time.Second, 25*time.Second),
-    cachex.NotFoundWithTTL[*cachex.Entry[*Product]](
-        notFoundCache,
-        1*time.Second,  // fresh TTL
-        5*time.Second,  // stale TTL
-    ),
-)
-```
-
-### Batch Reads
-
-`Client.GetMany` reads many keys at once with the same semantics as calling `Get` for each key, but in batches:
-
-```go
-products, err := client.GetMany(ctx, []string{"p1", "p2", "p3"})
-// products holds only the keys that exist; missing keys are absent
-```
-
-To let the upstream answer a batch in one call, implement `BatchUpstream[T]` on it (it should still implement `Upstream[T]` for `Get`):
-
-```go
-type BatchUpstream[T any] interface {
-    // Keys absent from the map do not exist (like ErrKeyNotFound for Get).
-    // A non-nil error fails the whole batch, unless it is a *cachex.BatchError
-    // returned as is (not wrapped), which fails only the keys it lists.
-    // A whole-batch error fails every key, even if it wraps an ErrKeyNotFound:
-    // errors.Is/As still see it, but IsErrKeyNotFound reports false.
-    GetMany(ctx context.Context, keys []string) (map[string]T, error)
+p, err := products.Get(ctx, "42")
+switch {
+case errors.Is(err, cachex.ErrNotFound):
+    // no such product
+case err != nil:
+    // a layer or the source failed
 }
+```
 
-type productSource struct{ db *gorm.DB }
+`TTL(fresh, stale)`: for a minute the entry is returned as is; for ten more minutes it is still returned at once while a background refresh fetches it again; after that it is not served.
 
-func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*cachex.Entry[*Product], error) {
-    var rows []*Product // for very large batches, query in chunks to stay under the bound-parameter limit
+## Two layers
+
+Memory in front of Redis, both in front of the database. Each layer has its own TTLs; an entry copied from Redis into memory keeps the time the source answered, so its age is not reset:
+
+```go
+mem, _ := ottercachex.New[*Product](ottercachex.Config[*Product]{MaximumSize: 100_000})
+shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:"})
+
+products := cachex.New(source, []cachex.Layer[*Product]{
+    cachex.NewLayer[*Product](mem,
+        cachex.TTL(30*time.Second, time.Minute),
+        cachex.NotFoundTTL(5*time.Second, 0)), // remember "does not exist" for 5s
+    cachex.NewLayer[*Product](shared,
+        cachex.TTL(5*time.Minute, time.Hour),
+        cachex.NotFoundTTL(30*time.Second, 0)),
+}, cachex.WithFetchTimeout(3*time.Second))
+```
+
+Values that expire on their own, such as tokens, get a per-value cap with `WithMaxAge`; it works on types you cannot add methods to:
+
+```go
+tokens := cachex.New(source, []cachex.Layer[*oauth2.Token]{
+    cachex.NewLayer(mem, cachex.TTL(time.Hour, 0)),
+}, cachex.WithMaxAge(func(t *oauth2.Token) time.Duration {
+    return time.Until(t.Expiry) - time.Minute // never serve a token about to expire
+}))
+```
+
+## Writes
+
+Change the source first, then write through the same `Cache`:
+
+```go
+if err := db.WithContext(ctx).Save(p).Error; err != nil { // 1. the source
+    return err
+}
+return products.Set(ctx, p.ID, p) // 2. every layer, bottom up
+```
+
+`Set` writes every layer, bottom up; `Del` drops the key from every layer, so the next read asks the source. Neither writes the source. A read that started before the write cannot put the old value back after it. `SetMany` and `DelMany` do the same for many keys.
+
+## Batch reads
+
+`GetMany` reads many keys with one call per layer. If the source also implements `BatchSource`, the misses are fetched in one call too:
+
+```go
+// GetMany makes productSource a cachex.BatchSource: a key it does not return
+// does not exist.
+func (s productSource) GetMany(ctx context.Context, ids []string) (map[string]*Product, error) {
+    var rows []*Product
     if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
-        return nil, err
+        return nil, err // every key failed
     }
-    now := time.Now()
-    out := make(map[string]*cachex.Entry[*Product], len(rows))
+    out := make(map[string]*Product, len(rows))
     for _, p := range rows {
-        out[p.ID] = &cachex.Entry[*Product]{Data: p, CachedAt: now}
+        out[p.ID] = p
     }
-    return out, nil // ids not found are simply absent
+    return out, nil
 }
 
-// Get is still required (Upstream[T]); it can reuse GetMany.
-func (s productSource) Get(ctx context.Context, id string) (*cachex.Entry[*Product], error) {
-    entries, err := s.GetMany(ctx, []string{id})
-    if err != nil {
-        return nil, err
-    }
-    if e, ok := entries[id]; ok {
-        return e, nil
-    }
-    return nil, &cachex.ErrKeyNotFound{}
+found, err := products.GetMany(ctx, []string{"1", "2", "3"})
+var be *cachex.BatchError
+if errors.As(err, &be) {
+    // be.Errors lists the keys that failed; found holds every other key
 }
-
-client := cachex.NewClient(cache, productSource{db: db} /* , options as in Quick Start */)
 ```
 
-How `GetMany` works:
+## Options
 
-1. **Backend**: one batch read (`BatchCache[T]`, otherwise key by key). Each value read is handled by staleness: a fresh value goes into the result; a stale one goes into the result too (with `WithServeStale`), and those keys are refreshed together in the background; rotten values and misses go on to the next steps, and what those find goes into the same result. The whole result is returned at once.
-2. **Not-Found cache**: misses are checked against it, exactly like `Get`.
-3. **Singleflight**: every key that needs the upstream is claimed in the **same** singleflight `Get` uses. Keys already being fetched by a `Get` or another `GetMany` are waited for, not fetched again; so a `Get` and a `GetMany` (or two overlapping `GetMany`s) fetch a shared key only once. `WithFetchConcurrency` applies per key as usual.
-4. **DoubleCheck**: the claimed keys are re-checked against the backend and Not-Found cache, by the same rules as `Get` (in the default `DoubleCheckAuto`, only the keys whose stripe this `Client` wrote since the lookup).
-5. **Upstream**: if the upstream implements `BatchUpstream[T]`, the remaining keys are fetched with **one** `GetMany` call, or, with `WithGetManyChunkSize(n)`, with calls of at most `n` keys run concurrently (useful when the upstream limits its batch size). Each call has one `WithFetchTimeout` (over a lower `Client`, as long as that `Client`'s own fetches may take, e.g. a queue of per-key fetch timeouts). The keys of one call are answered together, as soon as it returns: a concurrent `Get` of one of them joins the call and waits for it. Otherwise each key is fetched exactly as `Get` would (its own double-check, fetch timeout and write-back, and handed to its waiters as soon as it arrives), at most `WithGetManyFetchConcurrency` (default 16) at a time. The same option bounds the concurrent chunk calls above, so it reads as "upstream requests one `GetMany` has in flight" (`WithFetchConcurrency`, by contrast, bounds the fetches of one key). A key is claimed only when its turn comes, so a concurrent `Get` of a key still queued here does not wait for the queue, and a canceled `GetMany` starts no more keys.
-6. **Write back**: found values go to the backend, missing keys to the Not-Found cache. With a `BatchUpstream` this is one `SetMany`/`DelMany` per batch (when the backend supports it); without one, each key is written back on its own, like `Get`. Either way this only touches this layer, never the upstream.
-
-`Client` implements `BatchUpstream[T]` itself, so in a layered setup a batch travels down as one call per layer: `l1Client.GetMany` → L1 batch read → `l2Client.GetMany` → L2 batch read → one database query.
-
-**Errors**: the returned map always holds every key that succeeded. If some keys failed (backend, upstream or context errors), the error is a `*cachex.BatchError` whose `Errors` map lists them by key; `errors.Is`/`errors.As` see through it to the per-key errors. A per-key error is always a real failure, never a not-found: keys that do not exist are just absent from the map.
-
-`Get` and `GetMany` report the same three outcomes, each in the shape its return allows:
-
-| Outcome | `Get` | `GetMany` |
+| Option | Default | What |
 |---|---|---|
-| found (the value may itself be `nil`) | `(value, nil)` | in the map |
-| does not exist | `cachex.IsErrKeyNotFound(err)` | absent from the map and from the `BatchError` |
-| failed | any other error | listed in the `BatchError` |
+| `TTL(fresh, stale)` (layer) | required | How long an entry is fresh, then how long it is still served while refreshed |
+| `NotFoundTTL(fresh, stale)` (layer) | `0, 0`: not recorded | The same for "does not exist" |
+| `Jitter(ratio)` (layer) | `0.1` | Shortens each entry's fresh period by up to this share, so entries written together do not expire together |
+| `WithMaxAge(func(T) time.Duration)` | none | Caps how long a value is kept, in every layer |
+| `WithFetchTimeout(d)` | 60s | Bounds each call a fetch makes: a lower layer read, a source call, a backfill |
+| `WithFetchesPerKey(n)` | 1 | How many fetches of one key may run at once; 1 merges every concurrent miss |
+| `WithGetManyConcurrency(n)` | 16 | How many source requests one `GetMany` has in flight |
+| `WithGetManyChunkSize(n)` | 0: one call | Splits a `BatchSource` call into chunks of at most n keys |
+| `WithDoubleCheck(mode)` | `DoubleCheckAuto` | When a request that claimed a fetch re-reads the first layer first |
+| `WithLogger(l)` | `slog.Default()` | Logs failures that do not fail a call (a backfill, a background refresh) |
+| `WithNow(f)` | `time.Now` | The clock; `cachextest.Clock` is a manual one for tests |
 
-A cached value can be `nil` (a nil pointer, for example) and is still a hit, so test presence with `v, ok := products[id]`, not with `products[id] == nil`.
+## Backends
 
-```go
-products, err := client.GetMany(ctx, ids)
-var batchErr *cachex.BatchError
-if errors.As(err, &batchErr) {
-    for id, err := range batchErr.Errors {
-        log.Printf("product %s failed: %v", id, err)
-    }
-}
-// products is usable either way
-```
-
-These built-in backends implement `BatchCache[T]`: `RistrettoCache`, `SyncMap`, `RedisCache` (pipelines of `GET`/`SET`/`DEL`, which also work on Redis Cluster) and `GORMCache` (`WHERE key IN (...)` and multi-row upserts). Both split a large call into pipelines or statements of `ChunkSize` keys (default 1000, set in their config; `GORMCache` caps it at 10000 to stay under the bound parameter limits), sent one after another, and write best effort: a failed chunk is reported by key and the others are still written. `BigCache` and the `Transform` wrappers do not, so `GetMany` reads and writes them key by key (wrapping a `RedisCache` in `Transform` means one round trip per key).
-
-Fetching 100 missing keys through an upstream that costs 1ms per call (`BenchmarkGetManyVsGet`):
-
-| | upstream calls | time |
+| Package | Stores | Notes |
 |---|---|---|
-| `GetMany` | 1 | ~1.2ms |
-| loop of `Get` | 100 | ~115ms |
+| `ottercachex` | values in memory | `MaximumSize` (entries) or `MaximumWeight` with `Weigher` is required; each entry expires at its own time |
+| `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
+| `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys |
+| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL needs 8.0.17+ and a `utf8mb4_0900_bin` key column; tested at each database's default isolation level only |
+| `cachextest` | values in memory, unbounded | For tests only, with `Clock` and `TestBackend`, a contract test for your own backends |
 
-### Custom Staleness Logic
+Your own store implements `Backend[T]`, or `SingleBackend[T]` wrapped with `cachex.Batched`. A store of bytes encodes entries with `cachex.EncodeEntry`/`DecodeEntry` and a `Codec`.
 
-Define custom staleness checks:
+## Must know
 
-```go
-client := cachex.NewClient(
-    cache,
-    upstream,
-    cachex.WithStale[*Product](func(p *Product) cachex.State {
-        age := time.Since(p.UpdatedAt)
-        if age < 5*time.Second {
-            return cachex.StateFresh
-        }
-        if age < 5*time.Second + 25*time.Second {
-            return cachex.StateStale
-        }
-        return cachex.StateRotten
-    }),
-    cachex.WithServeStale[*Product](true),
-)
-```
-
-### Type Transformation
-
-Transform between different cache types:
-
-```go
-// Cache stores JSON strings
-stringCache := cachex.NewRedisCache[string](&cachex.RedisCacheConfig{
-    Client:    client,
-    KeyPrefix: "user:",
-    TTL:       time.Hour,
-})
-
-// Transform to User objects
-userCache := cachex.StringJSONTransform[*User](stringCache)
-
-// Use as Cache[*User]
-user, err := userCache.Get(ctx, "user:123")
-```
-
-## Performance
-
-> See [BENCHMARK.md](BENCHMARK.md) for detailed results.
-
-### Key Metrics (10K products, Pareto traffic distribution, **cold start**)
-
-| Scenario       | Concurrency | Application QPS | Cache Hit Rate |   P50 |   P99 | DB Conn Pool | DB QPS | DB Utilization | Amplification | Errors |
-| :------------- | ----------: | --------------: | -------------: | ----: | ----: | -----------: | -----: | -------------: | ------------: | -----: |
-| High Perf DB   |         600 |         504,989 |         99.81% | 291ns | 3.3µs |          100 |  982.5 |          88.4% |        514.0x |     0% |
-| Cloud DB       |         100 |          55,222 |         99.61% | 833ns |  12µs |           20 |  213.8 |          90.9% |        235.0x |     0% |
-| Shared DB      |         100 |           7,306 |         98.59% | 791ns | 831ms |           13 |  103.0 |          99.0% |         70.2x |     0% |
-| Constrained DB |         100 |             695 |         94.01% | 1.3µs | 2.04s |            8 |   41.6 |          98.8% |         16.7x |     0% |
-
-> 💡 **Cold Start Performance**: Cachex achieves **94%+ cache hit rate** even during cold start without pre-warming. With cache pre-warming, throughput can increase dramatically (99%+ hit rate → minimal DB load).
->
-> 🔥 **Test Environment Simulation**: All benchmark scenarios use realistic database connection pool simulation (semaphore-based), accurately simulating real-world database behavior.
->
-> 📊 **Throughput Amplification** = Application QPS / Theoretical DB Capacity, where Theoretical DB Capacity = Conn Pool / (Latency / 1000ms).
+- **"Does not exist" is `ErrNotFound`.** Test it with `errors.Is`. A cached nil is a value, not a miss.
+- **`GetMany` has three outcomes per key:** in the map (found), absent from the map and from the error (does not exist), or listed in the `*BatchError` (failed).
+- **Change the source first, then write through the same `Cache`.** The order guarantee holds within one `Cache` in one process.
+- **Across instances, the TTLs are the only bound.** Another instance's memory layer keeps an old value until its entry turns rotten; set each layer's TTLs to how long old data is acceptable.
+- **In-memory backends return the stored value itself.** Do not modify a value you got from `ottercachex` or `cachextest`.
+- **When the value type changes incompatibly, change `KeyPrefix`.** JSON decodes leniently: a renamed field reads back as a zero value instead of failing.
+- **Call `Close` before closing the backends.** It waits for the fetches and refreshes in progress.
 
 ## Documentation
 
-Design notes for maintainers and readers who want the details; all in Chinese except the FAQ, which has both languages:
-
-- [Design overview](docs/design.md) (Chinese): the model, the architecture, and one page per mechanism: read path, singleflight, write order and striped locks, batch reads, backends, consistency across instances
-- [FAQ](docs/faq.md)
-- [Glossary](GLOSSARY.md) (Chinese, with the English terms used in code)
-- [Architecture decision records](docs/adr/) (Chinese)
-- [Measurements](docs/research/README.md) (Chinese) and their re-runnable scripts in `tools/bench/`
-- [To do](docs/todo.md) (Chinese)
+- [FAQ](docs/faq.md) ([中文](docs/faq_ZH.md))
+- [Migrating from v1](MIGRATION.md)
+- [Benchmarks](BENCHMARK.md)
+- Design notes, in Chinese: [design overview](docs/design.md), [glossary](GLOSSARY.md), [decisions (ADRs)](docs/adr/)
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+[MIT](LICENSE)
