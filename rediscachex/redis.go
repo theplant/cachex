@@ -21,7 +21,7 @@ import (
 // DefaultChunkSize is how many keys one pipeline carries by default.
 const DefaultChunkSize = 1000
 
-// Config configures a Backend.
+// Config configures a backend.
 type Config[T any] struct {
 	// Client is the Redis client. Required.
 	Client redis.UniversalClient
@@ -38,64 +38,46 @@ type Config[T any] struct {
 	Logger *slog.Logger
 }
 
-// Backend is a Redis-backed cachex.Backend.
-type Backend[T any] struct {
-	client    redis.UniversalClient
-	prefix    string
-	chunkSize int
-	codec     cachex.Codec[T]
-	logger    *slog.Logger
-}
-
-var _ cachex.Backend[any] = (*Backend[any])(nil)
-
-// New returns a Backend on cfg.Client.
-func New[T any](cfg Config[T]) *Backend[T] {
+// New returns a backend on cfg.Client, its entries encoded by cachex.Encoded
+// with cfg.Codec and cfg.Logger.
+func New[T any](cfg Config[T]) cachex.Backend[T] {
 	if cfg.Client == nil {
 		panic("rediscachex: Client is required")
 	}
-	b := &Backend[T]{client: cfg.Client, prefix: cfg.KeyPrefix, chunkSize: cfg.ChunkSize, codec: cfg.Codec, logger: cfg.Logger}
+	b := &byteBackend{client: cfg.Client, prefix: cfg.KeyPrefix, chunkSize: cfg.ChunkSize}
 	if b.chunkSize <= 0 {
 		b.chunkSize = DefaultChunkSize
 	}
-	if b.codec == nil {
-		b.codec = cachex.DefaultCodec[T]()
-	}
-	if b.logger == nil {
-		b.logger = slog.Default()
-	}
-	return b
+	return cachex.Encoded(b, cfg.Codec, cfg.Logger)
 }
 
-// decode reads a GET reply; data that does not decode is dropped and read as
-// a miss (it was written by something else, or before the type changed).
-// cmd.Bytes() shares the reply's memory rather than copying it; the cmd is
-// discarded afterwards.
-func (b *Backend[T]) decode(ctx context.Context, key string, cmd *redis.StringCmd) (cachex.Entry[T], bool) {
-	data, _ := cmd.Bytes()
-	e, err := cachex.DecodeEntry(b.codec, data)
+type byteBackend struct {
+	client    redis.UniversalClient
+	prefix    string
+	chunkSize int
+}
+
+var _ cachex.ByteBackend = (*byteBackend)(nil)
+
+// ttl is how long to keep data expiring at expiresAt: at least a millisecond,
+// as go-redis takes a negative TTL as "keep the current one".
+func ttl(expiresAt time.Time) time.Duration { return max(time.Until(expiresAt), time.Millisecond) }
+
+// Get reads with GET; Bytes() shares the reply's memory rather than copying
+// it, and the command is discarded afterwards.
+func (b *byteBackend) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	data, err := b.client.Get(ctx, b.prefix+key).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, false, nil
+	}
 	if err != nil {
-		b.logger.WarnContext(ctx, "rediscachex: dropped an entry that does not decode", "key", key, "error", err)
-		_ = b.client.Del(ctx, b.prefix+key).Err()
-		return cachex.Entry[T]{}, false
+		return nil, false, fmt.Errorf("rediscachex: get %q: %w", key, err)
 	}
-	return e, true
+	return data, true, nil
 }
 
-func (b *Backend[T]) Get(ctx context.Context, key string) (cachex.Entry[T], bool, error) {
-	cmd := b.client.Get(ctx, b.prefix+key)
-	if err := cmd.Err(); err != nil {
-		if errors.Is(err, redis.Nil) {
-			return cachex.Entry[T]{}, false, nil
-		}
-		return cachex.Entry[T]{}, false, fmt.Errorf("rediscachex: get %q: %w", key, err)
-	}
-	e, ok := b.decode(ctx, key, cmd)
-	return e, ok, nil
-}
-
-func (b *Backend[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[T], error) {
-	out := make(map[string]cachex.Entry[T], len(keys))
+func (b *byteBackend) GetMany(ctx context.Context, keys []string) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(keys))
 	errs := map[string]error{}
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
 		pipe := b.client.Pipeline()
@@ -105,70 +87,52 @@ func (b *Backend[T]) GetMany(ctx context.Context, keys []string) (map[string]cac
 		}
 		execPipe(ctx, pipe)
 		for i, key := range chunk {
-			switch err := cmds[i].Err(); {
+			switch data, err := cmds[i].Bytes(); {
 			case errors.Is(err, redis.Nil):
 			case err != nil:
 				errs[key] = fmt.Errorf("rediscachex: get %q: %w", key, err)
 			default:
-				if e, ok := b.decode(ctx, key, cmds[i]); ok {
-					out[key] = e
-				}
+				out[key] = data
 			}
 		}
 	}
-	return out, batchError(errs)
+	return out, cachex.NewBatchError(errs)
 }
 
-func (b *Backend[T]) Set(ctx context.Context, key string, e cachex.Entry[T]) error {
-	return b.SetMany(ctx, map[string]cachex.Entry[T]{key: e})
+func (b *byteBackend) Set(ctx context.Context, key string, data []byte, expiresAt time.Time) error {
+	if err := b.client.Set(ctx, b.prefix+key, data, ttl(expiresAt)).Err(); err != nil {
+		return fmt.Errorf("rediscachex: set %q: %w", key, err)
+	}
+	return nil
 }
 
-// SetMany stores entries with a TTL up to their ExpiresAt; an entry already
-// expired deletes the key instead.
-func (b *Backend[T]) SetMany(ctx context.Context, entries map[string]cachex.Entry[T]) error {
+// SetMany stores entries with a TTL up to their ExpiresAt.
+func (b *byteBackend) SetMany(ctx context.Context, entries map[string]cachex.ByteEntry) error {
 	errs := map[string]error{}
-	now := time.Now()
 	for chunk := range slices.Chunk(slices.Collect(maps.Keys(entries)), b.chunkSize) {
 		pipe := b.client.Pipeline()
-		sent := make([]string, 0, len(chunk))
-		cmds := make([]redis.Cmder, 0, len(chunk))
-		for _, key := range chunk {
-			e := entries[key]
-			ttl := e.ExpiresAt.Sub(now)
-			if ttl <= 0 {
-				cmds = append(cmds, pipe.Del(ctx, b.prefix+key))
-				sent = append(sent, key)
-				continue
-			}
-			data, err := cachex.EncodeEntry(b.codec, e)
-			if err != nil {
-				errs[key] = err
-				continue
-			}
-			cmds = append(cmds, pipe.Set(ctx, b.prefix+key, data, ttl))
-			sent = append(sent, key)
-		}
-		if len(cmds) == 0 {
-			continue
+		cmds := make([]*redis.StatusCmd, len(chunk))
+		for i, key := range chunk {
+			cmds[i] = pipe.Set(ctx, b.prefix+key, entries[key].Data, ttl(entries[key].ExpiresAt))
 		}
 		execPipe(ctx, pipe)
 		for i, cmd := range cmds {
 			if err := cmd.Err(); err != nil {
-				errs[sent[i]] = fmt.Errorf("rediscachex: set %q: %w", sent[i], err)
+				errs[chunk[i]] = fmt.Errorf("rediscachex: set %q: %w", chunk[i], err)
 			}
 		}
 	}
-	return batchError(errs)
+	return cachex.NewBatchError(errs)
 }
 
-func (b *Backend[T]) Del(ctx context.Context, key string) error {
+func (b *byteBackend) Del(ctx context.Context, key string) error {
 	if err := b.client.Del(ctx, b.prefix+key).Err(); err != nil {
 		return fmt.Errorf("rediscachex: delete %q: %w", key, err)
 	}
 	return nil
 }
 
-func (b *Backend[T]) DelMany(ctx context.Context, keys []string) error {
+func (b *byteBackend) DelMany(ctx context.Context, keys []string) error {
 	errs := map[string]error{}
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
 		pipe := b.client.Pipeline()
@@ -183,7 +147,7 @@ func (b *Backend[T]) DelMany(ctx context.Context, keys []string) error {
 			}
 		}
 	}
-	return batchError(errs)
+	return cachex.NewBatchError(errs)
 }
 
 // execPipe runs a pipeline so that every command carries its own outcome.
@@ -202,11 +166,4 @@ func execPipe(ctx context.Context, pipe redis.Pipeliner) {
 			cmd.SetErr(err)
 		}
 	}
-}
-
-func batchError(errs map[string]error) error {
-	if len(errs) == 0 {
-		return nil
-	}
-	return &cachex.BatchError{Errors: errs}
 }

@@ -1,10 +1,7 @@
-package rediscachex_test
+package rediscachex
 
 import (
-	"bytes"
 	"context"
-	"fmt"
-	"log/slog"
 	"testing"
 	"time"
 
@@ -15,7 +12,6 @@ import (
 
 	"github.com/theplant/cachex/v2"
 	"github.com/theplant/cachex/v2/cachextest"
-	"github.com/theplant/cachex/v2/rediscachex"
 )
 
 func newRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
@@ -29,24 +25,31 @@ func newRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
 func TestContract(t *testing.T) {
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 		_, client := newRedis(t)
-		return rediscachex.New[string](rediscachex.Config[string]{Client: client, KeyPrefix: "p:"})
+		return New[string](Config[string]{Client: client, KeyPrefix: "p:"})
 	}, []string{"v", "", "héllo, 世界", "\x00\xff"})
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[item] {
 		_, client := newRedis(t)
-		return rediscachex.New[item](rediscachex.Config[item]{Client: client, KeyPrefix: "p:"})
+		return New[item](Config[item]{Client: client, KeyPrefix: "p:"})
 	}, []item{{ID: 1, Tags: []string{"a"}}, {}, {ID: 2}})
 	t.Run("in chunks", func(t *testing.T) {
 		cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 			_, client := newRedis(t)
-			return rediscachex.New[string](rediscachex.Config[string]{Client: client, ChunkSize: 2})
+			return New[string](Config[string]{Client: client, ChunkSize: 2})
 		}, []string{"v", "", "w"})
+	})
+}
+
+func TestByteBackend(t *testing.T) {
+	cachextest.TestByteBackend(t, func(t *testing.T) cachex.ByteBackend {
+		_, client := newRedis(t)
+		return &byteBackend{client: client, prefix: "p:", chunkSize: 3}
 	})
 }
 
 func TestEntriesExpireAtTheirExpiresAt(t *testing.T) {
 	ctx := context.Background()
 	mr, client := newRedis(t)
-	b := rediscachex.New[string](rediscachex.Config[string]{Client: client, KeyPrefix: "p:"})
+	b := New[string](Config[string]{Client: client, KeyPrefix: "p:"})
 	now := time.Now()
 	require.NoError(t, b.SetMany(ctx, map[string]cachex.Entry[string]{
 		"short": {Value: "v", ExpiresAt: now.Add(time.Minute)},
@@ -62,70 +65,28 @@ func TestEntriesExpireAtTheirExpiresAt(t *testing.T) {
 	assert.True(t, ok)
 }
 
-func TestAnExpiredEntryIsNotStored(t *testing.T) {
-	ctx := context.Background()
-	mr, client := newRedis(t)
-	b := rediscachex.New[string](rediscachex.Config[string]{Client: client})
-	require.NoError(t, b.Set(ctx, "k", cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}))
-	require.NoError(t, b.Set(ctx, "k", cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(-time.Second)}))
-	assert.False(t, mr.Exists("k"), "and it replaces what was there")
-}
-
 func TestAnUnreachableRedisFailsEveryKey(t *testing.T) {
 	ctx := context.Background()
 	mr, client := newRedis(t)
-	b := rediscachex.New[string](rediscachex.Config[string]{Client: client, ChunkSize: 2})
+	b := New[string](Config[string]{Client: client, ChunkSize: 2})
 	mr.Close()
-	_, _, err := b.Get(ctx, "a")
-	require.Error(t, err)
+	var be *cachex.BatchError
+	for name, err := range map[string]error{
+		"Get": func() error { _, _, err := b.Get(ctx, "a"); return err }(),
+		"Set": b.Set(ctx, "a", cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}),
+		"Del": b.Del(ctx, "a"),
+	} {
+		require.Error(t, err, name)
+		assert.NotErrorAs(t, err, &be, "%s: a single key fails with a plain error", name)
+	}
 	m, err := b.GetMany(ctx, []string{"a", "b", "c"})
 	assert.Empty(t, m)
-	var be *cachex.BatchError
 	require.ErrorAs(t, err, &be, "not read as misses")
 	assert.Len(t, be.Errors, 3)
 	err = b.SetMany(ctx, map[string]cachex.Entry[string]{"a": {Value: "v", ExpiresAt: time.Now().Add(time.Hour)}})
 	require.ErrorAs(t, err, &be)
 	err = b.DelMany(ctx, []string{"a"})
 	require.ErrorAs(t, err, &be)
-}
-
-func TestAnEntryThatDoesNotDecodeIsAMiss(t *testing.T) {
-	ctx := context.Background()
-	mr, client := newRedis(t)
-	var log bytes.Buffer
-	b := rediscachex.New[string](rediscachex.Config[string]{Client: client, Logger: slog.New(slog.NewTextHandler(&log, nil))})
-	require.NoError(t, mr.Set("k", "written by v1"))
-	_, ok, err := b.Get(ctx, "k")
-	require.NoError(t, err)
-	assert.False(t, ok)
-	assert.Contains(t, log.String(), "dropped an entry that does not decode")
-	assert.False(t, mr.Exists("k"))
-
-	require.NoError(t, mr.Set("k", "written by v1"))
-	m, err := b.GetMany(ctx, []string{"k"})
-	require.NoError(t, err)
-	assert.Empty(t, m)
-}
-
-func TestManyKeysAcrossChunks(t *testing.T) {
-	ctx := context.Background()
-	_, client := newRedis(t)
-	b := rediscachex.New[string](rediscachex.Config[string]{Client: client, ChunkSize: 3})
-	entries := map[string]cachex.Entry[string]{}
-	var keys []string
-	for i := range 10 {
-		k := fmt.Sprint(i)
-		entries[k] = cachex.Entry[string]{Value: "v" + k, ExpiresAt: time.Now().Add(time.Hour)}
-		keys = append(keys, k)
-	}
-	require.NoError(t, b.SetMany(ctx, entries))
-	m, err := b.GetMany(ctx, keys)
-	require.NoError(t, err)
-	assert.Len(t, m, 10)
-	require.NoError(t, b.DelMany(ctx, keys))
-	m, err = b.GetMany(ctx, keys)
-	require.NoError(t, err)
-	assert.Empty(t, m)
 }
 
 type item struct {
