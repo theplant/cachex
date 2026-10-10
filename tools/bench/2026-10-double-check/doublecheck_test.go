@@ -18,37 +18,38 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/theplant/cachex/v2"
+	"github.com/theplant/cachex/v2/cachextest"
 )
 
 // slowBackend answers like a remote cache: it reads, then the reply takes
 // delay to come back (the window the double-check is about).
 type slowBackend struct {
-	*cachex.SyncMap[*cachex.Entry[string]]
+	*cachextest.Map[string]
 	delay time.Duration
 	reads atomic.Int64
 }
 
-func (s *slowBackend) Get(ctx context.Context, key string) (*cachex.Entry[string], error) {
+func (s *slowBackend) Get(ctx context.Context, key string) (cachex.Entry[string], bool, error) {
 	s.reads.Add(1)
-	v, err := s.SyncMap.Get(ctx, key)
+	e, ok, err := s.Map.Get(ctx, key)
 	time.Sleep(s.delay)
-	return v, err
+	return e, ok, err
 }
 
 // run sends 20 requests per ms for 400 ms; hot uses one key that expires
 // every 20 ms, otherwise every request asks for a new (cold) key.
-func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (upstreamCalls int64, readsPerGet float64) {
+func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (sourceCalls int64, readsPerGet float64) {
 	ctx := context.Background()
-	backend := &slowBackend{SyncMap: cachex.NewSyncMap[*cachex.Entry[string]](), delay: delay}
+	backend := &slowBackend{Map: cachextest.NewMap[string](), delay: delay}
 	var calls atomic.Int64
-	up := cachex.UpstreamFunc[*cachex.Entry[string]](func(context.Context, string) (*cachex.Entry[string], error) {
+	src := cachex.SourceFunc[string](func(context.Context, string) (string, error) {
 		calls.Add(1)
 		time.Sleep(5 * time.Millisecond)
-		return &cachex.Entry[string]{Data: "v", CachedAt: cachex.NowFunc()}, nil
+		return "v", nil
 	})
-	cli := cachex.NewClient[*cachex.Entry[string]](backend, up,
-		cachex.EntryWithTTL[string](20*time.Millisecond, 0),
-		cachex.WithDoubleCheck[*cachex.Entry[string]](mode))
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](backend, cachex.TTL(20*time.Millisecond, 0), cachex.Jitter(0)),
+	}, cachex.WithDoubleCheck(mode))
 
 	var n atomic.Int64
 	var wg sync.WaitGroup
@@ -59,13 +60,14 @@ func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (upstreamCa
 				key = fmt.Sprintf("cold-%d-%d", ms, j)
 			}
 			wg.Go(func() {
-				_, _ = cli.Get(ctx, key)
+				_, _ = c.Get(ctx, key)
 				n.Add(1)
 			})
 		}
 		time.Sleep(time.Millisecond)
 	}
 	wg.Wait()
+	_ = c.Close()
 	return calls.Load(), float64(backend.reads.Load()) / float64(n.Load())
 }
 
@@ -103,7 +105,7 @@ func TestDoubleCheckValue(t *testing.T) {
 				cLo, cMid, cHi := spread(calls)
 				rLo, rMid, rHi := spread(reads)
 				callsMid[id], readsMid[id] = cMid, rMid
-				t.Logf("%-28s backend=%-6v %-9s upstream calls %3d [%d..%d]   backend reads per Get %.3f [%.3f..%.3f]",
+				t.Logf("%-28s backend=%-6v %-9s source calls %3d [%d..%d]   backend reads per Get %.3f [%.3f..%.3f]",
 					scenario, delay, m.name, cMid, cLo, cHi, rMid, rLo, rHi)
 			}
 		}

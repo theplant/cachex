@@ -315,8 +315,8 @@ func BenchmarkSetDel(b *testing.B) {
 }
 
 // BenchmarkZipfMixed reads keys drawn from a Zipf distribution over 10,000
-// keys; every 10th key does not exist (and no not-found TTL records that), so
-// those reads miss each time.
+// keys from many goroutines; every 10th key does not exist (and no not-found
+// TTL records that), so those reads miss each time.
 func BenchmarkZipfMixed(b *testing.B) {
 	const n = 10000
 	ctx := context.Background()
@@ -325,19 +325,27 @@ func BenchmarkZipfMixed(b *testing.B) {
 	for i := 0; i < n; i += 10 {
 		missing[keys[i]] = true
 	}
-	c := cachex.New[string](benchSource{missing: func(k string) bool { return missing[k] }}, []cachex.Layer[string]{layer(cachextest.NewMap[string]())})
-	if _, err := c.GetMany(ctx, keys); err != nil {
+	o, err := ottercachex.New[string](ottercachex.Config[string]{MaximumSize: 2 * n})
+	if err != nil {
 		b.Fatal(err)
 	}
-	var seed atomic.Uint64
-	b.ReportAllocs()
-	b.RunParallel(func(pb *testing.PB) {
-		z := rand.NewZipf(rand.New(rand.NewPCG(seed.Add(1), 0)), 1.1, 1, n-1)
-		for pb.Next() {
-			if _, err := c.Get(ctx, keys[z.Uint64()]); err != nil && err != cachex.ErrNotFound { //nolint:errorlint // the sentinel itself
-				b.Error(err)
-				return
+	for name, backend := range map[string]cachex.Backend[string]{"map": cachextest.NewMap[string](), "otter": o} {
+		b.Run(name, func(b *testing.B) {
+			c := cachex.New[string](benchSource{missing: func(k string) bool { return missing[k] }}, []cachex.Layer[string]{layer(backend)})
+			if _, err := c.GetMany(ctx, keys); err != nil {
+				b.Fatal(err)
 			}
-		}
-	})
+			var seed atomic.Uint64
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				z := rand.NewZipf(rand.New(rand.NewPCG(seed.Add(1), 0)), 1.1, 1, n-1)
+				for pb.Next() {
+					if _, err := c.Get(ctx, keys[z.Uint64()]); err != nil && err != cachex.ErrNotFound { //nolint:errorlint // the sentinel itself
+						b.Error(err)
+						return
+					}
+				}
+			})
+		})
+	}
 }

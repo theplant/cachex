@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -112,7 +111,6 @@ func TestEntryEncoding(t *testing.T) {
 type singleMap struct {
 	*cachextest.Map[string]
 	failKey string
-	mu      sync.Mutex
 }
 
 func (s *singleMap) Get(ctx context.Context, key string) (cachex.Entry[string], bool, error) {

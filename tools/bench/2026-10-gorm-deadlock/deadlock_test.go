@@ -1,6 +1,6 @@
 //go:build bench
 
-// Compares ways to keep concurrent GORMCache batch writes from deadlocking, on
+// Compares ways to keep concurrent gormcachex batch writes from deadlocking, on
 // MySQL 8.4 and PostgreSQL 16 in testcontainers (Docker required). See
 // docs/research/2026-10-gorm-deadlock.md.
 //
@@ -13,7 +13,6 @@ package bench
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -30,7 +29,7 @@ import (
 	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/theplant/cachex/v2"
-	"gorm.io/datatypes"
+	"github.com/theplant/cachex/v2/gormcachex"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -38,12 +37,21 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// row matches the table GORMCache.Migrate creates, for the strategies that
-// write it with raw GORM (what GORMCache did before the fix).
+// row matches the table gormcachex's Migrate creates, for the strategies that
+// write it with raw GORM (what the backend did before the fix).
 type row struct {
 	Key       string `gorm:"primaryKey"`
-	Value     datatypes.JSON
+	Value     []byte
+	ExpiresAt time.Time
 	UpdatedAt time.Time
+}
+
+func entries(values map[string]string) map[string]cachex.Entry[string] {
+	out := make(map[string]cachex.Entry[string], len(values))
+	for k, v := range values {
+		out[k] = cachex.Entry[string]{Value: v, ExpiresAt: time.Now().Add(time.Hour)}
+	}
+	return out
 }
 
 func isDeadlock(err error) bool {
@@ -67,31 +75,30 @@ const (
 type strategy struct {
 	name   string
 	expect expectation
-	set    func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, values map[string]string) error
-	del    func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, keys []string) error
+	set    func(ctx context.Context, db *gorm.DB, c *gormcachex.Backend[string], table string, values map[string]string) error
+	del    func(ctx context.Context, db *gorm.DB, c *gormcachex.Backend[string], table string, keys []string) error
 }
 
 var keyCol = clause.Column{Name: "key"}
 
-func rawSet(sorted bool) func(context.Context, *gorm.DB, *cachex.GORMCache[string], string, map[string]string) error {
-	return func(ctx context.Context, db *gorm.DB, _ *cachex.GORMCache[string], table string, values map[string]string) error {
+func rawSet(sorted bool) func(context.Context, *gorm.DB, *gormcachex.Backend[string], string, map[string]string) error {
+	return func(ctx context.Context, db *gorm.DB, _ *gormcachex.Backend[string], table string, values map[string]string) error {
 		rows := make([]row, 0, len(values))
 		for k, v := range values { // Go map order: random
-			data, _ := json.Marshal(v)
-			rows = append(rows, row{Key: k, Value: data, UpdatedAt: time.Now()})
+			rows = append(rows, row{Key: k, Value: []byte(v), ExpiresAt: time.Now().Add(time.Hour), UpdatedAt: time.Now()})
 		}
 		if sorted {
 			slices.SortFunc(rows, func(a, b row) int { return cmp.Compare(a.Key, b.Key) })
 		}
 		return db.WithContext(ctx).Table(table).Clauses(clause.OnConflict{
 			Columns:   []clause.Column{keyCol},
-			DoUpdates: clause.AssignmentColumns([]string{"key", "value", "updated_at"}),
+			DoUpdates: clause.AssignmentColumns([]string{"value", "expires_at", "updated_at"}),
 		}).Create(&rows).Error
 	}
 }
 
-func rawDel(ordered bool) func(context.Context, *gorm.DB, *cachex.GORMCache[string], string, []string) error {
-	return func(ctx context.Context, db *gorm.DB, _ *cachex.GORMCache[string], table string, keys []string) error {
+func rawDel(ordered bool) func(context.Context, *gorm.DB, *gormcachex.Backend[string], string, []string) error {
+	return func(ctx context.Context, db *gorm.DB, _ *gormcachex.Backend[string], table string, keys []string) error {
 		in := clause.IN{Column: keyCol, Values: anys(keys)}
 		if !ordered || db.Name() != "postgres" {
 			return db.WithContext(ctx).Table(table).Where(in).Delete(nil).Error
@@ -132,7 +139,7 @@ func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(ctx cont
 			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "bench:"+table).Error; err != nil {
 				return err
 			}
-			return locked(func() error { return f(cachex.WithGORMTx(ctx, tx)) })
+			return locked(func() error { return f(gormcachex.WithTx(ctx, tx)) })
 		})
 	}
 	return db.WithContext(ctx).Connection(func(conn *gorm.DB) error {
@@ -141,7 +148,7 @@ func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(ctx cont
 		}
 		defer conn.Exec("SELECT RELEASE_LOCK(?)", "bench:"+table)
 		return conn.Transaction(func(tx *gorm.DB) error {
-			return locked(func() error { return f(cachex.WithGORMTx(ctx, tx)) })
+			return locked(func() error { return f(gormcachex.WithTx(ctx, tx)) })
 		})
 	})
 }
@@ -149,18 +156,18 @@ func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(ctx cont
 var strategies = []strategy{
 	{name: "unordered", expect: expectDeadlocks, set: rawSet(false), del: rawDel(false)},
 	{name: "ordered", expect: expectNoneOnPG, set: rawSet(true), del: rawDel(true)},
-	{name: "ordered+retry (GORMCache)", expect: expectNoFailures,
-		set: func(ctx context.Context, _ *gorm.DB, c *cachex.GORMCache[string], _ string, v map[string]string) error {
-			return c.SetMany(ctx, v)
+	{name: "ordered+retry (gormcachex)", expect: expectNoFailures,
+		set: func(ctx context.Context, _ *gorm.DB, c *gormcachex.Backend[string], _ string, v map[string]string) error {
+			return c.SetMany(ctx, entries(v))
 		},
-		del: func(ctx context.Context, _ *gorm.DB, c *cachex.GORMCache[string], _ string, k []string) error {
+		del: func(ctx context.Context, _ *gorm.DB, c *gormcachex.Backend[string], _ string, k []string) error {
 			return c.DelMany(ctx, k)
 		}},
 	{name: "table lock", expect: expectNoFailuresSerial,
-		set: func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, v map[string]string) error {
-			return tableLocked(ctx, db, table, func(ctx context.Context) error { return c.SetMany(ctx, v) })
+		set: func(ctx context.Context, db *gorm.DB, c *gormcachex.Backend[string], table string, v map[string]string) error {
+			return tableLocked(ctx, db, table, func(ctx context.Context) error { return c.SetMany(ctx, entries(v)) })
 		},
-		del: func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, k []string) error {
+		del: func(ctx context.Context, db *gorm.DB, c *gormcachex.Backend[string], table string, k []string) error {
 			return tableLocked(ctx, db, table, func(ctx context.Context) error { return c.DelMany(ctx, k) })
 		}},
 }
@@ -207,7 +214,7 @@ func TestDeadlockStrategies(t *testing.T) {
 		for i, st := range strategies {
 			table := fmt.Sprintf("bench_deadlock_%d", i)
 			require.NoError(t, db.Exec("DROP TABLE IF EXISTS "+table).Error)
-			c := cachex.NewGORMCache[string](&cachex.GORMCacheConfig{DB: db, TableName: table})
+			c := gormcachex.New[string](gormcachex.Config[string]{DB: db, TableName: table})
 			require.NoError(t, c.Migrate(ctx))
 
 			var deadlocks, failures, ops atomic.Int64
