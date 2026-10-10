@@ -54,7 +54,9 @@ type flightKey struct {
 
 这不会让写入之后的读拿到旧结果：写入会摘除（`Drop`）这个 key 的在途回源，之后的读找不到它，只能重新回源；被摘掉的回源的回填也因为写入代数变了而跳过（见 [write-order.md](write-order.md#摘除在途回源)）。
 
-二次检查在第一层找到的结果没有要回填的层，发布后立即注销；出错的结果（`claimed.fail`）不回填，也是发布后立即注销。回源 goroutine 结束时（`claimed.run`），会把它负责的在途回源都注销一遍，保证 panic 或 Goexit 时也不会留下登记。
+二次检查在第一层找到的结果没有要回填的层，发布后立即注销；出错的结果、以及批量数据源用 `ErrNotFound` 报告的不存在（`claimed.publish`）不回填，也是发布后立即注销。
+
+在途回源的结果是 `(T, error)`：不存在就是 `ErrNotFound` 本身，所有失败都包过一层（`readError`、`cachex: get %q from source: ...`），所以 `GetMany` 和刷新按同一性（`err == ErrNotFound`）认出不存在，一个只是包着 `ErrNotFound` 的层错误仍然是失败。数据源的错误只在 `askSourceOne`、`askSourceChunk` 分类一次。回源 goroutine 结束时（`claimed.run`），会把它负责的在途回源都注销一遍，保证 panic 或 Goexit 时也不会留下登记。
 
 代价是：`Get` 返回时，各层不一定已经写好这个值；紧接着直接读后端可能读不到。`Close` 会等回填完成。
 
@@ -169,7 +171,7 @@ sequenceDiagram
 
 ## 后台刷新
 
-返回陈旧值时发起的后台刷新，按 key 去重靠的就是认领：刷新在发起它的请求里当场认领 `flightKey{key, refresh: true}`，认领到才启动，认领不到说明这个 key 已经有刷新在进行，直接跳过，不等它。所以同一个 key 同一时刻只有一次刷新，和 `WithFetchesPerKey` 无关。认领之前先登记到 `Close` 要等的后台工作里；`Close` 之后不再认领，也就不再发起刷新。刷新用共享 ctx（见[回源用的 ctx](#回源用的-ctx)）；失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。
+返回陈旧值时发起的后台刷新，按 key 去重靠的就是认领：刷新在发起它的请求里当场认领 `flightKey{key, refresh: true}`，认领到才启动，认领不到说明这个 key 已经有刷新在进行，直接跳过，不等它。所以同一个 key 同一时刻只有一次刷新，和 `WithFetchesPerKey` 无关。认领到之后才登记到 `Close` 要等的后台工作里；`Close` 之后认领到的刷新不启动，当场发布一个错误并注销（没有人等刷新，发布只是为了让它离开登记）。刷新用共享 ctx（见[回源用的 ctx](#回源用的-ctx)）；失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。
 
 刷新也走这套登记，但认领的是自己的在途回源（`flightKey.refresh` 为真）：它不加入普通回源，普通读取也不加入它。原因是刷新时下层的陈旧条目不算数，而普通回源会接受下层的陈旧条目；刷新加入普通回源，可能拿着一个陈旧条目就结束了，根本没问数据源。代价是同一个 key 的普通回源和刷新可以同时进行，最多多问一次数据源。写入摘除时两种都摘。见 [ADR 0016](../adr/0016-refresh-has-its-own-flights.md)。
 

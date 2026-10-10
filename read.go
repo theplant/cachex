@@ -41,16 +41,11 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 	fk := c.flightKey(key, false)
 	f, leader := c.flights.Claim(fk)
 	if leader {
-		p := c.claim([]string{key}, []flightKey{fk}, []*flight.Flight[Entry[T]]{f}, []uint64{seen}, false)
+		p := c.claim([]string{key}, []flightKey{fk}, []*flight.Flight[T]{f}, []uint64{seen}, false)
 		fctx := sharedCtx(ctx)
 		c.background(func() { c.resolve(fctx, p) })
 	}
-	e, err := c.await(ctx, key, f)
-	if err != nil {
-		var zero T
-		return zero, err
-	}
-	return e.result()
+	return c.await(ctx, key, f)
 }
 
 // GetMany returns the values of keys that exist, with the semantics of calling
@@ -104,19 +99,19 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 	for i, r := range c.fetchMany(ctx, missKeys, missSeen) {
 		key := missKeys[i]
 		switch {
-		case r.err != nil:
+		case r.err == nil:
+			out[key] = r.value
+		case r.err != ErrNotFound: //nolint:errorlint // a flight's not-found is ErrNotFound itself, see claimed
 			errs[key] = r.err
-		case !r.entry.NotFound:
-			out[key] = r.entry.Value
 		}
 	}
 	return out, batchError(errs)
 }
 
-// result is what a fetch answered for a key: an entry (a value or a
-// not-found), or an error.
+// result is what a fetch answered for a key, as its flight holds it (see
+// claimed).
 type result[T any] struct {
-	entry Entry[T]
+	value T
 	err   error
 }
 
@@ -128,10 +123,10 @@ func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64) 
 	if len(keys) == 0 {
 		return nil
 	}
-	flights := make([]*flight.Flight[Entry[T]], len(keys))
+	flights := make([]*flight.Flight[T], len(keys))
 	var ownKeys []string
 	var ownFKs []flightKey
-	var ownFlights []*flight.Flight[Entry[T]]
+	var ownFlights []*flight.Flight[T]
 	var ownSeen []uint64
 	for i, key := range keys {
 		fk := c.flightKey(key, false)
@@ -150,13 +145,13 @@ func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64) 
 	}
 	results := make([]result[T], len(keys))
 	for i, f := range flights {
-		results[i].entry, results[i].err = c.await(ctx, keys[i], f)
+		results[i].value, results[i].err = c.await(ctx, keys[i], f)
 	}
 	return results
 }
 
 // await waits for f, the flight of key, or for ctx.
-func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[Entry[T]]) (Entry[T], error) {
+func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (T, error) {
 	select {
 	case <-f.Done():
 		return f.Result()
@@ -166,7 +161,8 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[Entry
 	case <-f.Done():
 		return f.Result()
 	default:
-		return Entry[T]{}, fmt.Errorf("cachex: context done while fetching %q: %w", key, ctx.Err())
+		var zero T
+		return zero, fmt.Errorf("cachex: context done while fetching %q: %w", key, ctx.Err())
 	}
 }
 
@@ -197,24 +193,28 @@ func (c *Cache[T]) dropFlights(key string) {
 // known and before it is backfilled; the flight stays registered until the
 // backfill is done, so a read that comes meanwhile joins it instead of
 // fetching again. run makes sure a fetch that panics or calls runtime.Goexit
-// still answers every waiter, with an error.
+// still answers every waiter, with an error. A flight's result is a value, or
+// ErrNotFound itself for a key that does not exist, or a failure, which is
+// always wrapped: so a not-found is told by identity, and an error that only
+// wraps ErrNotFound (a layer's, say) stays a failure. The source's errors are
+// classified in askSourceOne and askSourceChunk, nowhere else.
 type claimed[T any] struct {
 	c       *Cache[T]
 	keys    []string
 	fks     []flightKey
-	flights []*flight.Flight[Entry[T]]
+	flights []*flight.Flight[T]
 	seen    []uint64 // stripe epochs from before the caller read the first layer
 	gens    []uint64 // write generations from before the fetch read below it
 	refresh bool     // stale entries below do not count
 }
 
-func (c *Cache[T]) claim(keys []string, fks []flightKey, flights []*flight.Flight[Entry[T]], seen []uint64, refresh bool) *claimed[T] {
+func (c *Cache[T]) claim(keys []string, fks []flightKey, flights []*flight.Flight[T], seen []uint64, refresh bool) *claimed[T] {
 	return &claimed[T]{c: c, keys: keys, fks: fks, flights: flights, seen: seen, gens: make([]uint64, len(keys)), refresh: refresh}
 }
 
-// publish answers flight i with e or err, which is not backfilled.
-func (p *claimed[T]) publish(i int, e Entry[T], err error) {
-	p.c.flights.Publish(p.flights[i], e, err)
+// publish answers flight i with value or err, which is not backfilled.
+func (p *claimed[T]) publish(i int, value T, err error) {
+	p.c.flights.Publish(p.flights[i], value, err)
 	p.c.flights.Forget(p.fks[i], p.flights[i])
 }
 
@@ -223,7 +223,8 @@ func (p *claimed[T]) publish(i int, e Entry[T], err error) {
 // into the layers above origin, and only then unregisters the flights.
 func (p *claimed[T]) settle(ctx context.Context, origin int, idxs []int, entries []Entry[T]) {
 	for j, i := range idxs {
-		p.c.flights.Publish(p.flights[i], entries[j], nil)
+		value, err := entries[j].result()
+		p.c.flights.Publish(p.flights[i], value, err)
 	}
 	if origin > 0 {
 		if len(idxs) == 1 {
@@ -254,9 +255,10 @@ func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
 		} else if !returned {
 			err = errors.New("cachex: fetch exited without returning (runtime.Goexit)")
 		}
+		var zero T
 		for _, i := range idxs {
 			if err != nil {
-				p.c.flights.Publish(p.flights[i], Entry[T]{}, err) // does nothing if answered
+				p.c.flights.Publish(p.flights[i], zero, err) // does nothing if answered
 			}
 			p.c.flights.Forget(p.fks[i], p.flights[i])
 		}
@@ -359,7 +361,8 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], idxs []int) []i
 			key := p.keys[i]
 			e, ok, err := found(key)
 			if err != nil {
-				p.publish(i, Entry[T]{}, readError(key, li, err))
+				var zero T
+				p.publish(i, zero, readError(key, li, err))
 				continue
 			}
 			if ok {
@@ -429,7 +432,8 @@ func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], i int) {
 		var zero T
 		p.settle(sctx, len(c.layers), []int{i}, []Entry[T]{c.answer(zero, true)})
 	default:
-		p.publish(i, Entry[T]{}, fmt.Errorf("cachex: get %q from source: %w", key, err))
+		var zero T
+		p.publish(i, zero, fmt.Errorf("cachex: get %q from source: %w", key, err))
 	}
 }
 
@@ -444,10 +448,12 @@ func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], idxs []int
 		switch kerr := errForKey(err, key); {
 		case errors.Is(kerr, ErrNotFound):
 			// a misuse (see BatchSource): not found, but not cached
-			p.publish(i, Entry[T]{NotFound: true}, nil)
+			var zero T
+			p.publish(i, zero, ErrNotFound)
 			continue
 		case kerr != nil:
-			p.publish(i, Entry[T]{}, fmt.Errorf("cachex: get %q from source: %w", key, kerr))
+			var zero T
+			p.publish(i, zero, fmt.Errorf("cachex: get %q from source: %w", key, kerr))
 			continue
 		}
 		value, ok := values[key]
@@ -498,13 +504,9 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 // and skips the others. seen, if not nil, is each key's stripe epoch from
 // before the caller read the first layer.
 func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
-	done, ok := c.track() // before claiming: a claimed flight must be resolved
-	if !ok {              // closed: no more refreshes
-		return
-	}
 	var own []string
 	var ownFKs []flightKey
-	var ownFlights []*flight.Flight[Entry[T]]
+	var ownFlights []*flight.Flight[T]
 	var ownSeen []uint64
 	for i, key := range keys {
 		fk := c.flightKey(key, true)
@@ -520,20 +522,30 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 		}
 	}
 	if len(own) == 0 {
-		done()
 		return
 	}
-	ctx, p := sharedCtx(ctx), c.claim(own, ownFKs, ownFlights, ownSeen, true)
+	p := c.claim(own, ownFKs, ownFlights, ownSeen, true)
+	done, ok := c.track()
+	if !ok { // closed: no more refreshes; nobody waits for a refresh flight
+		var zero T
+		for i := range own {
+			p.publish(i, zero, errClosed)
+		}
+		return
+	}
+	ctx = sharedCtx(ctx)
 	go func() {
 		defer done()
 		c.resolve(ctx, p)
 		for i, f := range ownFlights {
-			if _, err := f.Result(); err != nil {
+			if _, err := f.Result(); err != nil && err != ErrNotFound { //nolint:errorlint // see claimed
 				c.opts.logger.ErrorContext(ctx, "cachex: background refresh failed", "key", own[i], "error", err)
 			}
 		}
 	}()
 }
+
+var errClosed = errors.New("cachex: closed")
 
 // readLayer reads keys idxs from b, and returns what it found for a key:
 // one Get for one key, which spares the common single-key miss a map.
