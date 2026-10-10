@@ -48,7 +48,7 @@ type Cache[T any] struct {
 	opts        options
 	maxAge      func(T) time.Duration
 
-	flights    flight.Group[flightKey, T]
+	flights    flight.Group[flightKey, Entry[T]]
 	stripes    *stripe.Set
 	refreshing sync.Map // keys being refreshed in the background
 

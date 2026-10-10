@@ -72,7 +72,9 @@ func (f SourceFunc[T]) Get(ctx context.Context, key string) (T, error) { return 
 // BatchSource is a Source that can answer many keys in one call; GetMany uses
 // it when the source implements it. A key the source does not have is absent
 // from the map (not an error). A *BatchError returned as is fails only the
-// keys it lists; any other error fails every key.
+// keys it lists; any other error fails every key. An error that wraps
+// ErrNotFound (for a key, or for the call) reads its keys as not found but
+// caches nothing, so each read asks again: leave missing keys out instead.
 type BatchSource[T any] interface {
 	GetMany(ctx context.Context, keys []string) (map[string]T, error)
 }
