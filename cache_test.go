@@ -3,6 +3,7 @@ package cachex_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -130,6 +131,35 @@ func TestGetFailsWhenALayerCannotBeRead(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 	cachex.Settle(c)
 	assert.Zero(t, src.calls.Load(), "a broken layer does not send every read to the source")
+}
+
+func TestALayerErrorIsAFailureEvenIfItWrapsErrNotFound(t *testing.T) {
+	ctx := context.Background()
+	confused := fmt.Errorf("backend: %w", cachex.ErrNotFound)
+	for _, broken := range []int{0, 1} {
+		t.Run(fmt.Sprint("layer ", broken), func(t *testing.T) {
+			src := newSource(map[string]string{"a": "1", "b": "1"})
+			layers := []cachex.Backend[string]{cachextest.NewMap[string](), cachextest.NewMap[string]()}
+			f := newFaulty(layers[broken])
+			f.failOn("get", confused)
+			layers[broken] = f
+			c := cachex.New[string](src, []cachex.Layer[string]{
+				cachex.NewLayer(layers[0], cachex.TTL(time.Minute, 0)),
+				cachex.NewLayer(layers[1], cachex.TTL(time.Minute, 0)),
+			})
+			_, err := c.Get(ctx, "a")
+			require.Error(t, err)
+			assert.NotErrorIs(t, err, cachex.ErrNotFound, "Get")
+			m, err := c.GetMany(ctx, []string{"a", "b"})
+			assert.Empty(t, m)
+			var be *cachex.BatchError
+			require.ErrorAs(t, err, &be, "GetMany")
+			assert.Len(t, be.Errors, 2)
+			for key, kerr := range be.Errors {
+				assert.NotErrorIs(t, kerr, cachex.ErrNotFound, key)
+			}
+		})
+	}
 }
 
 func TestGetWithoutLayersAsksTheSource(t *testing.T) {

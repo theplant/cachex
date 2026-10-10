@@ -26,7 +26,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 		e, ok, err := c.layers[0].backend.Get(ctx, key)
 		if err != nil {
 			var zero T
-			return zero, fmt.Errorf("cachex: get %q from layer 0: %w", key, err)
+			return zero, readError(key, 0, err)
 		}
 		if ok {
 			switch e.state(c.opts.now()) {
@@ -73,7 +73,7 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 		missKeys, missSeen = nil, nil
 		for i, key := range keys {
 			if kerr := errForKey(err, key); kerr != nil {
-				errs[key] = fmt.Errorf("cachex: get %q from layer 0: %w", key, kerr)
+				errs[key] = readError(key, 0, kerr)
 				continue
 			}
 			if e, ok := es[key]; ok {
@@ -356,7 +356,7 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], idxs []int) []i
 			key := p.keys[i]
 			e, ok, err := found(key)
 			if err != nil {
-				p.fail(i, fmt.Errorf("cachex: get %q from layer %d: %w", key, li, err))
+				p.fail(i, readError(key, li, err))
 				continue
 			}
 			if ok {
@@ -542,6 +542,27 @@ func readLayer[T any](ctx context.Context, b Backend[T], keys []string, idxs []i
 		e, ok := es[key]
 		return e, ok, nil
 	}
+}
+
+// readError is a failure to read key from layer li. A backend reports a
+// missing key with false, never with an error, so its error is a failure even
+// if it wraps ErrNotFound: errors.Is does not find ErrNotFound in a readError.
+func readError(key string, li int, err error) error {
+	return &layerError{msg: fmt.Sprintf("cachex: get %q from layer %d: %v", key, li, err), err: err}
+}
+
+type layerError struct {
+	msg string
+	err error
+}
+
+func (e *layerError) Error() string { return e.msg }
+
+func (e *layerError) Unwrap() error {
+	if errors.Is(e.err, ErrNotFound) {
+		return nil
+	}
+	return e.err
 }
 
 func keysAt(keys []string, idxs []int) []string {
