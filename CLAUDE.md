@@ -48,7 +48,7 @@ go test -tags bench -v -run <Test> ./tools/bench/<目录>/   # 复跑实测
 这些地方最容易被「顺手优化」改坏：
 
 - **写入先写下层、再写上层，从不写数据源；某一层失败，就删掉它和它上面各层的条目。** 不要改成从上往下写。见 [ADR 0002](docs/adr/0002-upstream-first-writes.md)。
-- **回填必须持分片读锁、核对写入代数，写入之后还要摘除在途回源。** 少任何一步，旧值都可能盖过写入。见 [ADR 0003](docs/adr/0003-striped-backfill-guard.md)。
+- **回填必须持分片读锁、核对写入代数，写入之后还要摘除在途回源。** 少任何一步，旧值都可能盖过写入。回源先发布结果、回填完成后才注销在途回源，这期间来的读取加入它，不会再回源。见 [ADR 0003](docs/adr/0003-striped-backfill-guard.md)。
 - **每个在途回源恰好发布一次结果**，panic 和 Goexit 也不例外。不要让等待方去等一个永远不会来的结果。见 [ADR 0006](docs/adr/0006-goexit-publishes-an-error.md)。
 - **回源用的 ctx 不带领头请求的取消，并标记为共享（`cachex.IsShared`）**，后端不能用它里面属于某个调用方的状态（比如 `gormcachex` 的事务）。核心包不认识任何后端。见 [ADR 0007](docs/adr/0007-detached-fetch-context.md)、[ADR 0013](docs/adr/0013-batch-backends-in-subpackages.md)。
 - **批量读里，不存在不是错误**，缺席的 key 就是不存在；整批失败的错误不能被当成「全部不存在」。见 [ADR 0004](docs/adr/0004-batch-result-shape.md)。

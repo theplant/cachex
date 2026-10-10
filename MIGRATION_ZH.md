@@ -66,6 +66,8 @@ import "github.com/theplant/cachex/v2"
 
 **`GetMany` 一开始就认领全部 key。** 数据源不是 `BatchSource` 时，并发的 `Get` 碰上一次大 `GetMany` 里排着队的 key，要等它排到。*怎么做：* 用在 `GetMany` 里的数据源实现 `BatchSource`。
 
-**`Close` 会等回源和后台刷新结束。** *怎么做：* 先调用它，再关闭后端。
+**`Close` 会等回源、回源的回填和后台刷新结束。** *怎么做：* 先调用它，再关闭后端。
+
+**读取在回填之前返回。** 回源先把结果交给调用方，再写进上面的层；这期间来的读取直接拿到同一个结果，不会再回源。所以 `Get` 刚返回时，层里可能还没有这个值。*怎么做：* 一般不用管；测试里要在读完之后马上检查后端的，先调用 `Close`。
 
 **基准测试的数字变了。** v1 的 `BENCHMARK.md` 测的是一个被 sleep 主导的模拟；见新的 [BENCHMARK_ZH.md](BENCHMARK_ZH.md)。
