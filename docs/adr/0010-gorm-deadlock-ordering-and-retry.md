@@ -1,6 +1,6 @@
-# GORM 并发写的死锁：统一加锁顺序加有限重试，不锁表
+# gormcachex 并发写的死锁：统一加锁顺序加有限重试，不锁表
 
-多个实例同时回填有重叠的 key 时，`SetMany` 按 Go map 的随机顺序插入行，两条语句会以相反的顺序锁行，造成死锁。PostgreSQL 上还有第二个来源：`DELETE` 按索引顺序加锁，而索引顺序跟着列的排序规则走（官方镜像默认是 `en_US.utf8`），和字节序不一致。我们的做法是：`SetMany` 插入前按 key 的字节序排序；PostgreSQL 的 `DelMany` 先用 `ORDER BY key COLLATE "C" FOR UPDATE` 按字节序锁好行，再删除；剩下的少量死锁（MySQL 的间隙锁，InnoDB 要求应用重试）会重试，最多执行 5 次（即重试 4 次），在调用方自己的事务里则不重试。
+多个实例同时回填有重叠的 key 时，`SetMany` 按 Go map 的随机顺序插入行，两条语句会以相反的顺序锁行，造成死锁。PostgreSQL 上还有第二个来源：`DELETE` 按索引顺序加锁，而索引顺序跟着列的排序规则走（官方镜像默认是 `en_US.utf8`），和字节序不一致。我们的做法是：`SetMany` 插入前按 key 的字节序排序；`DelMany` 同样先排序，PostgreSQL 上再用 `ORDER BY key COLLATE "C" FOR UPDATE` 按字节序锁好行，再删除；剩下的少量死锁（MySQL 的间隙锁，InnoDB 要求应用重试）会重试，最多执行 5 次（即重试 4 次），在调用方自己的事务里则不重试。
 
 ## 实测
 

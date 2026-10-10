@@ -4,7 +4,7 @@
 
 ## 一句话
 
-cachex 是一个泛型的多层缓存客户端：每一层未命中时向上游取值，把同一个 key 的并发请求合并成一次回源，用新鲜/陈旧/腐烂三态和不存在缓存处理过期与不存在的 key，并保证写入在各层按同一顺序生效、回源不会把旧值回填到写入之后。
+cachex 是一个泛型的多层读穿缓存：一个缓存（`Cache[T]`）从上到下读它的各层，都没有可用条目时才问数据源；同一个 key 的并发未命中只回源一次，结果回填进上面那些没命中的层；条目按新鲜、陈旧、腐烂三态过期，「不存在」也作为条目记下；写入从最下层写到最上层，并保证回源不会把旧值回填到写入之后。
 
 ## 为什么需要它
 
@@ -12,105 +12,123 @@ cachex 是一个泛型的多层缓存客户端：每一层未命中时向上游�
 
 | 问题 | 现象 | 机制 |
 |---|---|---|
-| 缓存击穿 | 热点 key 过期的瞬间，大量请求同时打到数据源 | [合并回源](design/singleflight.md)（singleflight）+ [二次检查](design/read-path.md#二次检查) |
-| 缓存穿透 | 查询根本不存在的 key，每次都打到数据源 | [不存在缓存](design/read-path.md#不存在缓存) |
+| 缓存击穿 | 热点 key 过期的瞬间，大量请求同时打到数据源 | [合并回源](design/singleflight.md) + [二次检查](design/read-path.md#二次检查) |
+| 缓存穿透 | 查询根本不存在的 key，每次都打到数据源 | [不存在记录](design/read-path.md#不存在记录) |
+| 缓存雪崩 | 同时写入的大量条目在同一时刻一起过期 | [抖动](design/read-path.md#条目的寿命) |
 | 过期时的等待 | 条目一过期，读请求就要同步等回源 | [返回陈旧值](design/read-path.md#返回陈旧值) |
 | 旧值回填 | 写入刚完成，一个更早开始的回源把旧值写了回去 | [写入顺序与分片锁](design/write-order.md) |
 | 多次往返 | 一次要读几百个 key，逐个回源太慢 | [批量读](design/batch.md) |
 
-缓存雪崩（大量 key 同时过期）目前没有专门机制，见 [todo](todo.md) 第一条。
-
 ## 核心模型
 
 ```go
-type Upstream[T any] interface { Get(ctx, key) (T, error) }          // 能取值的东西
-type Cache[T any] interface { Upstream[T]; Set(...); Del(...) }        // 能存值的东西
-type BatchUpstream[T any] interface { GetMany(ctx, keys) (map[string]T, error) } // 可选：能一次取多个
-type BatchCache[T any] interface { Cache[T]; BatchUpstream[T]; SetMany(...); DelMany(...) } // 可选
+type Entry[T any] struct {           // 条目：后端里为一个 key 存的东西
+    Value      T
+    NotFound   bool                  // 不存在记录
+    CachedAt   time.Time             // 数据源回答的时间
+    FreshUntil time.Time             // 之后变陈旧
+    ExpiresAt  time.Time             // 之后腐烂；后端用它做原生过期
+}
+
+type Backend[T any] interface {      // 后端：一层的存储，单 key 和批量方法都要有
+    Get(ctx, key) (Entry[T], bool, error)
+    GetMany(ctx, keys) (map[string]Entry[T], error)
+    Set / SetMany / Del / DelMany
+}
+
+type Source[T any] interface { Get(ctx, key) (T, error) }                         // 数据源，不存在返回 ErrNotFound
+type BatchSource[T any] interface { GetMany(ctx, keys) (map[string]T, error) }    // 可选：一次回答多个 key
+
+func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T]
+func NewLayer[T any](backend Backend[T], opts ...LayerOption) Layer[T]
 ```
 
-- **一层 = 一个 `Client` + 它的后端（`Cache`）+ 它的上游（`Upstream`）**。
-- `Client` 自己实现了 `Cache` 和 `BatchUpstream`，所以一个 `Client` 可以做另一个 `Client` 的上游，层就这样串起来。
-- 上游如果也是 `Cache`，写入会继续往下传；到了不是 `Cache` 的上游（数据源）就停止。
+- **一个 `Cache` 管所有层**：`layers[0]` 最快、最先读，最后才是数据源。一个 key 只有一个在途回源、一套分片锁，见 [ADR 0012](adr/0012-one-cache-over-layers.md)。
+- **条目由 `Cache` 计算**：用户类型只出现在 `T` 里；每层的新鲜期、陈旧期、不存在记录的寿命在 `NewLayer` 上配置，后端只负责存。
+- **后端拆在子包里**：`ottercachex`（内存）、`bigcachex`（按字节存的内存）、`rediscachex`、`gormcachex`；测试用的 `cachextest`。见 [backends.md](design/backends.md)。
 
 ## 架构总览
 
-下面两张图都以「内存层 → Redis 层 → 数据库」这条三段链路为例。
+下面两张图都以「内存层 → Redis 层 → 数据库」为例。
 
-**读取的数据流**：每条边都是双向的，去程是请求，回程是值、「不存在」或回填。
+**读取的数据流**：实线是一次未命中走过的路，虚线是回填。
 
 ```mermaid
 flowchart LR
     caller([调用方])
-    L1[内存层 Client]
-    B1[(内存层后端<br/>Ristretto)]
-    N1[(内存层<br/>不存在缓存)]
-    L2[Redis 层 Client]
-    B2[(Redis 层后端<br/>Redis)]
-    N2[(Redis 层<br/>不存在缓存)]
+    C[Cache]
+    L0[(层 0<br/>ottercachex)]
+    L1[(层 1<br/>rediscachex)]
     SRC[(数据源<br/>数据库)]
 
-    caller <-->|"Get / GetMany"| L1
-    L1 <-->|"读 / 回填"| B1
-    L1 <-->|"读 / 回填"| N1
-    L1 <-->|"回源：调用 Redis 层的 Get / GetMany"| L2
-    L2 <-->|"读 / 回填"| B2
-    L2 <-->|"读 / 回填"| N2
-    L2 <-->|"回源"| SRC
+    caller -->|"Get / GetMany"| C
+    C -->|"1 读层 0，未命中"| L0
+    C -->|"2 认领回源，读层 1"| L1
+    C -->|"3 层 1 也没有：问数据源"| SRC
+    C -.->|"4 回填层 1"| L1
+    C -.->|"5 回填层 0"| L0
 ```
 
-**写入的数据流**：编号就是先后顺序。
+**写入的数据流**：编号就是先后顺序，数据源不写。
 
 ```mermaid
 flowchart LR
     caller([调用方])
-    L1[内存层 Client]
-    B1[(内存层后端)]
-    L2[Redis 层 Client]
-    B2[(Redis 层后端)]
+    C[Cache]
+    L0[(层 0)]
+    L1[(层 1)]
     SRC[(数据源)]
 
-    caller -->|"1 Set / Del"| L1
-    L1 -->|"2 先写上游"| L2
-    L2 -->|"3 写本层"| B2
-    L2 -.-x|"数据源不是 Cache，不写"| SRC
-    L1 -->|"4 再写本层"| B1
+    caller -->|"0 先改数据源"| SRC
+    caller -->|"Set / Del"| C
+    C -->|"1 拿分片写锁"| C
+    C -->|"2 先写下层"| L1
+    C -->|"3 再写上层"| L0
 ```
 
-每一层内部的处理顺序都相同：
+一次读取的处理顺序：
 
-1. **查后端**，按新鲜度决定直接返回、返回陈旧值并后台刷新，还是继续往下走（[读取路径](design/read-path.md)）。
-2. **未命中时查不存在缓存**，确认「已知不存在」就直接返回。
-3. **合并回源**：同一个 key 只让一个请求去上游，其他请求等它的结果（[合并回源](design/singleflight.md)）。
-4. **二次检查**之后**回源**，再**回填**本层；回填受分片锁保护，不会落在写入之后（[写入顺序](design/write-order.md)）。
+1. **读第一层**，新鲜就返回；陈旧就返回并后台刷新；腐烂或没有就往下走（[读取路径](design/read-path.md)）。
+2. **合并回源**：同一个 key 只让一个请求往下走，其他请求等它的结果（[合并回源](design/singleflight.md)）。
+3. 领头请求**二次检查**第一层，再**依次读下面各层**，都没有可用条目才**问数据源**。
+4. 在分片读锁下把结果**回填**进上面那些层，然后发布给所有等待方；回填不会落在写入之后（[写入顺序](design/write-order.md)）。
 
 ## 配置项
 
-`NewClient(backend, upstream, opts...)` 的选项：
+`New(source, layers, opts...)` 的选项：
 
 | 选项 | 默认 | 作用 | 详见 |
 |---|---|---|---|
-| `WithStale(fn)` / `EntryWithTTL(fresh, stale)` | 一律新鲜（过期交给后端自己的 TTL） | 判断一个值是新鲜、陈旧还是腐烂 | [read-path.md](design/read-path.md#新鲜度) |
-| `WithNotFound(cache, fn)` / `NotFoundWithTTL(cache, fresh, stale)` | 不启用 | 不存在缓存 | [read-path.md](design/read-path.md#不存在缓存) |
-| `WithServeStale(bool)` | 关闭 | 返回陈旧值，并在后台刷新 | [read-path.md](design/read-path.md#返回陈旧值) |
+| `WithFetchTimeout(d)` | `DefaultFetchTimeout` = 60 秒 | 回源时每一次调用的超时：二次检查、读一层、问一次数据源（连同之后的回填）、写入失败后的失效 | [singleflight.md](design/singleflight.md#回源用的-ctx) |
+| `WithFetchesPerKey(n)` | `DefaultFetchesPerKey` = 1 | 同一个 key 同时最多几个在途回源 | [singleflight.md](design/singleflight.md#每个-key-的回源数) |
+| `WithGetManyConcurrency(n)` | `DefaultGetManyConcurrency` = 16 | 一次 `GetMany` 同时向数据源发出的请求数 | [batch.md](design/batch.md#回源怎么发) |
+| `WithGetManyChunkSize(n)` | 0（不分段） | 发往批量数据源的每次调用最多多少个 key | [batch.md](design/batch.md#回源怎么发) |
+| `WithMaxAge(func(T) time.Duration)` | 不限 | 按值给条目定寿命上限，在回源时调用一次；`T` 必须和 `Cache` 的一致，否则 `New` panic | [read-path.md](design/read-path.md#条目的寿命) |
 | `WithDoubleCheck(mode)` | `DoubleCheckAuto` | 二次检查 | [read-path.md](design/read-path.md#二次检查) |
-| `WithFetchTimeout(d)` | `DefaultFetchTimeout` = 60 秒 | 一次回源的超时；二次检查、写入失败后的清理也用它限时 | [singleflight.md](design/singleflight.md#回源用的-ctx) |
-| `WithFetchConcurrency(n)` | `DefaultFetchConcurrency` = 1 | 同一个 key 的回源槽位数 | [singleflight.md](design/singleflight.md#回源槽位) |
-| `WithGetManyFetchConcurrency(n)` | `DefaultGetManyFetchConcurrency` = 16 | 一次 `GetMany` 同时向上游发出的请求数 | [batch.md](design/batch.md#回源怎么发) |
-| `WithGetManyChunkSize(n)` | 0（不分段） | 发往批量上游的每次调用最多多少个 key | [batch.md](design/batch.md#回源怎么发) |
-| `WithLogger(l)` | `slog.Default()` | 日志 | — |
+| `WithNow(f)` | `time.Now` | 时钟 | — |
+| `WithLogger(l)` | `slog.Default()` | 不影响调用结果的失败（回填失败、后台刷新失败、失效失败）记在这里 | — |
 
-`WithFetchTimeout`、`WithFetchConcurrency`、`WithGetManyFetchConcurrency` 必须大于 0，`WithGetManyChunkSize` 不能为负，否则 `NewClient` 会 panic。后端自己的配置（TTL、`ChunkSize`、`KeyPrefix` 等）见 [backends.md](design/backends.md)。
+`NewLayer(backend, opts...)` 的选项：
+
+| 选项 | 默认 | 作用 |
+|---|---|---|
+| `TTL(fresh, stale)` | 必填，`fresh` 必须大于 0 | 值的新鲜期和之后的陈旧期 |
+| `NotFoundTTL(fresh, stale)` | 0（这一层不记不存在） | 不存在记录的新鲜期和陈旧期 |
+| `Jitter(ratio)` | `DefaultJitter` = 0.1 | 把新鲜期随机缩短最多这个比例，取值 `[0, 1)` |
+
+非法的取值（超时、回源数、并发数不大于 0，分段为负，TTL 为负，抖动超出范围）都会让 `New` 或 `NewLayer` panic。
+
+`Close()` 等待它之前启动的回源和后台刷新（包括它们的回填）结束，之后不再发起后台刷新；它不关闭后端，关闭之后读写照常可用。所以关闭后端之前先调用 `Close`。
 
 ## 分篇
 
 | 文档 | 内容 |
 |---|---|
-| [design/read-path.md](design/read-path.md) | 一次 `Get` 的完整流程：新鲜度三态、不存在缓存、返回陈旧值、二次检查 |
-| [design/singleflight.md](design/singleflight.md) | 合并回源：认领与发布、回源 ctx、panic 与 Goexit、回源槽位 |
-| [design/write-order.md](design/write-order.md) | 写入顺序：先写上游、分片锁、写入代数、回填保护、摘除在途回源 |
+| [design/read-path.md](design/read-path.md) | 一次 `Get` 的完整流程：条目的寿命、三态、不存在记录、返回陈旧值、二次检查、回填 |
+| [design/singleflight.md](design/singleflight.md) | 合并回源：认领与发布、回源 ctx、panic 与 Goexit、每个 key 的回源数 |
+| [design/write-order.md](design/write-order.md) | 写入顺序：先写下层、分片锁、写入代数、回填保护、摘除在途回源 |
 | [design/batch.md](design/batch.md) | 批量读：流程、分段与并发、错误模型和三种结果 |
-| [design/backends.md](design/backends.md) | 各后端的实现要点：Ristretto、SyncMap、Redis、GORM、BigCache、Transform |
+| [design/backends.md](design/backends.md) | 后端接口、编解码、各子包的实现要点 |
 | [design/consistency.md](design/consistency.md) | 一致性：单进程内保证什么、多实例的边界、TTL 的作用 |
 
 ## 其他文档
