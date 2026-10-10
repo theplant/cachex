@@ -199,6 +199,26 @@ func TestByteBackend(t *testing.T, newBackend func(t *testing.T) cachex.ByteBack
 		}
 	})
 
+	t.Run("the bytes passed in and handed out are the caller's", func(t *testing.T) {
+		b := newBackend(t)
+		data := []byte("abc")
+		require.NoError(t, b.Set(ctx, "one", data, later))
+		require.NoError(t, b.SetMany(ctx, map[string]cachex.ByteEntry{"many": {Data: data, ExpiresAt: later}}))
+		data[0] = 'x'
+		for _, key := range []string{"one", "many"} {
+			got, ok := get(t, b, key)
+			require.True(t, ok)
+			assert.Equal(t, "abc", string(got), "%s: changing what was passed to Set changed what is stored", key)
+			got[0] = 'y'
+			m, err := b.GetMany(ctx, []string{key})
+			require.NoError(t, err)
+			assert.Equal(t, "abc", string(m[key]), "%s: changing what Get returned changed what is stored", key)
+			m[key][0] = 'z'
+			got, _ = get(t, b, key)
+			assert.Equal(t, "abc", string(got), "%s: changing what GetMany returned changed what is stored", key)
+		}
+	})
+
 	t.Run("keys compare exactly", func(t *testing.T) {
 		b := newBackend(t)
 		keys := []string{"abc", "ABC", "Abc", "a", "a ", "é", "e"}

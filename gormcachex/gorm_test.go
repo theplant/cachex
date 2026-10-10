@@ -188,3 +188,27 @@ var (
 	strs  = []string{"v", "", "héllo, 世界", "\x00\xff"}
 	items = []item{{ID: 1, Tags: []string{"a"}}, {}, {ID: 2}}
 )
+
+func TestAClosedDatabaseFailsEveryKey(t *testing.T) {
+	ctx := context.Background()
+	db := newSQLite(t)
+	b := newBackend(t, Config[string]{DB: db})
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	require.NoError(t, sqlDB.Close())
+	var be *cachex.BatchError
+	for name, err := range map[string]error{
+		"Get": func() error { _, _, err := b.Get(ctx, "a"); return err }(),
+		"Set": b.Set(ctx, "a", entry("v")),
+		"Del": b.Del(ctx, "a"),
+	} {
+		require.Error(t, err, name)
+		assert.NotErrorAs(t, err, &be, "%s: a single key fails with a plain error", name)
+	}
+	m, err := b.GetMany(ctx, []string{"a", "b", "c"})
+	assert.Empty(t, m)
+	require.ErrorAs(t, err, &be, "not read as misses")
+	assert.Len(t, be.Errors, 3)
+	require.ErrorAs(t, b.SetMany(ctx, map[string]cachex.Entry[string]{"a": entry("v")}), &be)
+	require.ErrorAs(t, b.DelMany(ctx, []string{"a"}), &be)
+}

@@ -210,7 +210,7 @@ func TestLayers(t *testing.T) {
 		s.clock, now = newClock()
 		s.c = cachex.New(s.src, []cachex.Layer[string]{
 			cachex.NewLayer(s.l1, append([]cachex.LayerOption{cachex.Jitter(0)}, l1...)...),
-			cachex.NewLayer[string](&countingGets{Backend: s.l2, n: s.l2Reads}, append([]cachex.LayerOption{cachex.Jitter(0)}, l2...)...),
+			cachex.NewLayer(counting(s.l2, "get", s.l2Reads), append([]cachex.LayerOption{cachex.Jitter(0)}, l2...)...),
 		}, now)
 		return s
 	}
@@ -481,30 +481,11 @@ func TestCloseWaitsForTheFetchesInProgress(t *testing.T) {
 	assert.Equal(t, 1, mem.Len(), "the backfill is done before Close returns")
 }
 
-// blockingFill wraps a backend: Set and SetMany wait for release once entered.
-type blockingFill struct {
-	cachex.Backend[string]
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (b *blockingFill) Set(ctx context.Context, key string, e cachex.Entry[string]) error {
-	b.entered <- struct{}{}
-	<-b.release
-	return b.Backend.Set(ctx, key, e)
-}
-
-func (b *blockingFill) SetMany(ctx context.Context, entries map[string]cachex.Entry[string]) error {
-	b.entered <- struct{}{}
-	<-b.release
-	return b.Backend.SetMany(ctx, entries)
-}
-
 func TestAReadDoesNotWaitForTheBackfill(t *testing.T) {
 	ctx := context.Background()
 	src := newSource(map[string]string{"a": "1"})
-	mem := &blockingFill{Backend: cachextest.NewMap[string](), entered: make(chan struct{}, 1), release: make(chan struct{})}
-	c := cachex.New(src, oneLayer(mem))
+	mem := newBlocker("")
+	c := cachex.New(src, oneLayer(mem.wrap(cachextest.NewMap[string]())))
 
 	v, err := c.Get(ctx, "a") // returns while the backfill waits
 	require.NoError(t, err)

@@ -212,33 +212,40 @@ func TestDoubleCheck(t *testing.T) {
 	assert.EqualValues(t, 2, run(t, cachex.DoubleCheckDisabled))
 }
 
+func TestADoubleCheckOfManyKeysReReadsThemInOneCall(t *testing.T) {
+	ctx := context.Background()
+	src := newBatchSource(map[string]string{"a": "src", "b": "src", "c": "src"})
+	mem := cachextest.NewMap[string]()
+	var gets atomic.Int64
+	layer := hook(mem, func(op string, keys []string, many bool) {
+		if op != "get" || gets.Add(1) != 2 {
+			return
+		}
+		assert.True(t, many, "the re-read of %v is one call", keys)
+		// another process filled a and b between the read and the re-read
+		for _, key := range []string{"a", "b"} {
+			require.NoError(t, mem.Set(ctx, key, cachex.Entry[string]{Value: "other", FreshUntil: time.Now().Add(time.Hour), ExpiresAt: time.Now().Add(time.Hour)}))
+		}
+	})
+	c := cachex.New[string](src, oneLayer(layer), cachex.WithDoubleCheck(cachex.DoubleCheckEnabled))
+	m, err := c.GetMany(ctx, []string{"a", "b", "c"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"a": "other", "b": "other", "c": "src"}, m)
+	assert.Empty(t, src.batchCalls())
+	assert.EqualValues(t, 1, src.calls.Load(), "only c is left for the source")
+}
+
 func TestDoubleCheckAutoSkipsTheReReadWhenNothingWasWritten(t *testing.T) {
 	src := newSource(map[string]string{"a": "1"})
 	var reads atomic.Int64
-	mem := &countingGets{Backend: cachextest.NewMap[string](), n: &reads}
-	c := cachex.New(src, oneLayer(mem))
+	c := cachex.New(src, oneLayer(counting(cachextest.NewMap[string](), "get", &reads)))
 	_, err := c.Get(context.Background(), "a")
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, reads.Load(), "a cold miss reads the layer once")
 
-	c = cachex.New(src, oneLayer(&countingGets{Backend: cachextest.NewMap[string](), n: &reads}), cachex.WithDoubleCheck(cachex.DoubleCheckEnabled))
+	c = cachex.New(src, oneLayer(counting(cachextest.NewMap[string](), "get", &reads)), cachex.WithDoubleCheck(cachex.DoubleCheckEnabled))
 	reads.Store(0)
 	_, err = c.Get(context.Background(), "a")
 	require.NoError(t, err)
 	assert.EqualValues(t, 2, reads.Load(), "enabled always re-reads")
-}
-
-type countingGets struct {
-	cachex.Backend[string]
-	n *atomic.Int64
-}
-
-func (c *countingGets) Get(ctx context.Context, key string) (cachex.Entry[string], bool, error) {
-	c.n.Add(1)
-	return c.Backend.Get(ctx, key)
-}
-
-func (c *countingGets) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[string], error) {
-	c.n.Add(1)
-	return c.Backend.GetMany(ctx, keys)
 }

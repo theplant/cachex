@@ -60,38 +60,11 @@ func TestAGetManyBackfillSkipsTheKeysWrittenDuringItsFetch(t *testing.T) {
 	assert.Equal(t, "1", e.Value, "b was not written: it is backfilled")
 }
 
-// blockingKey wraps a backend: writing key waits for release once entered.
-type blockingKey struct {
-	cachex.Backend[string]
-	key     string
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (b *blockingKey) wait(key string) {
-	if key == b.key {
-		b.entered <- struct{}{}
-		<-b.release
-	}
-}
-
-func (b *blockingKey) Set(ctx context.Context, key string, e cachex.Entry[string]) error {
-	b.wait(key)
-	return b.Backend.Set(ctx, key, e)
-}
-
-func (b *blockingKey) SetMany(ctx context.Context, entries map[string]cachex.Entry[string]) error {
-	for key := range entries {
-		b.wait(key)
-	}
-	return b.Backend.SetMany(ctx, entries)
-}
-
 func TestABackfillDoesNotWaitForAWriteInProgress(t *testing.T) {
 	ctx := context.Background()
 	mem := cachextest.NewMap[string]()
-	bk := &blockingKey{Backend: mem, key: "a", entered: make(chan struct{}, 1), release: make(chan struct{})}
-	c := cachex.New(newSource(map[string]string{"a": "1"}), oneLayer(bk))
+	bk := newBlocker("a")
+	c := cachex.New(newSource(map[string]string{"a": "1"}), oneLayer(bk.wrap(mem)))
 
 	written := make(chan error)
 	go func() { written <- c.Set(ctx, "a", "new") }()
@@ -110,23 +83,12 @@ func TestABackfillDoesNotWaitForAWriteInProgress(t *testing.T) {
 	assert.Equal(t, "new", e.Value)
 }
 
-// countingDels wraps a backend and counts DelMany calls.
-type countingDels struct {
-	cachex.Backend[string]
-	n atomic.Int64
-}
-
-func (c *countingDels) DelMany(ctx context.Context, keys []string) error {
-	c.n.Add(1)
-	return c.Backend.DelMany(ctx, keys)
-}
-
 func TestASetManyThatGivesUpInvalidatesEveryKey(t *testing.T) {
 	ctx := context.Background()
 	mem := cachextest.NewMap[string]()
-	cd := &countingDels{Backend: mem}
-	bk := &blockingKey{Backend: cd, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	c := cachex.New(newSource(nil), oneLayer(bk))
+	var dels atomic.Int64
+	bk := newBlocker("-") // a key never written, until it is set below
+	c := cachex.New(newSource(nil), oneLayer(bk.wrap(counting(mem, "del", &dels))))
 	keys := keysInStripeOrder(c, 3) // the batch takes keys[0], keys[1], then waits on keys[2]
 	for _, key := range keys {
 		require.NoError(t, mem.Set(ctx, key, cachex.Entry[string]{Value: "old", ExpiresAt: time.Now().Add(time.Hour)}))
@@ -145,21 +107,12 @@ func TestASetManyThatGivesUpInvalidatesEveryKey(t *testing.T) {
 		_, ok := stored(t, mem, key)
 		assert.False(t, ok, "%s: the caller may have changed the source already", key)
 	}
-	assert.EqualValues(t, 1, cd.n.Load(), "the stripes it held are invalidated in one call per layer")
+	assert.EqualValues(t, 1, dels.Load(), "the stripes it held are invalidated in one call per layer")
 
 	close(bk.release)
 	require.NoError(t, <-first)
 	require.Eventually(t, func() bool { return mem.Len() == 0 }, time.Second, time.Millisecond,
 		"the stripe it gave up on is invalidated once free")
-}
-
-// panicky wraps a backend: reads panic.
-type panicky struct{ cachex.Backend[string] }
-
-func (panicky) Get(context.Context, string) (cachex.Entry[string], bool, error) { panic("kaboom") }
-
-func (panicky) GetMany(context.Context, []string) (map[string]cachex.Entry[string], error) {
-	panic("kaboom")
 }
 
 func TestPanicsInBatchFetchesAnswerEveryWaiter(t *testing.T) {
@@ -184,7 +137,11 @@ func TestPanicsInBatchFetchesAnswerEveryWaiter(t *testing.T) {
 		src := newSource(map[string]string{"a": "1", "b": "1"})
 		c := cachex.New[string](src, []cachex.Layer[string]{
 			cachex.NewLayer(cachextest.NewMap[string](), cachex.TTL(time.Minute, 0)),
-			cachex.NewLayer[string](panicky{cachextest.NewMap[string]()}, cachex.TTL(time.Minute, 0)),
+			cachex.NewLayer[string](hook(cachextest.NewMap[string](), func(op string, _ []string, _ bool) {
+				if op == "get" {
+					panic("kaboom")
+				}
+			}), cachex.TTL(time.Minute, 0)),
 		}, (&logs{}).option())
 		var wg sync.WaitGroup
 		for range 5 {
@@ -210,9 +167,8 @@ func TestAFirstLayerHitDoesNotAllocate(t *testing.T) {
 	assert.Zero(t, allocs)
 }
 
-// gatedGet wraps a backend: its first Get or GetMany waits for release.
+// gatedGet holds the first read of a backend until release.
 type gatedGet struct {
-	cachex.Backend[string]
 	first   atomic.Bool
 	entered chan struct{}
 	release chan struct{}
@@ -225,14 +181,12 @@ func (g *gatedGet) gate() {
 	}
 }
 
-func (g *gatedGet) Get(ctx context.Context, key string) (cachex.Entry[string], bool, error) {
-	g.gate()
-	return g.Backend.Get(ctx, key)
-}
-
-func (g *gatedGet) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[string], error) {
-	g.gate()
-	return g.Backend.GetMany(ctx, keys)
+func (g *gatedGet) wrap(b cachex.Backend[string]) cachex.Backend[string] {
+	return hook(b, func(op string, _ []string, _ bool) {
+		if op == "get" {
+			g.gate()
+		}
+	})
 }
 
 func TestARefreshDoesNotJoinAFetchThatAcceptsAStaleEntry(t *testing.T) {
@@ -240,10 +194,10 @@ func TestARefreshDoesNotJoinAFetchThatAcceptsAStaleEntry(t *testing.T) {
 	clock, now := newClock()
 	src := newSource(map[string]string{"a": "new"})
 	m0, m1 := cachextest.NewMap[string](), cachextest.NewMap[string]()
-	g1 := &gatedGet{Backend: m1, entered: make(chan struct{}), release: make(chan struct{})}
+	g1 := &gatedGet{entered: make(chan struct{}), release: make(chan struct{})}
 	c := cachex.New[string](src, []cachex.Layer[string]{
 		cachex.NewLayer(m0, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
-		cachex.NewLayer[string](g1, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
+		cachex.NewLayer[string](g1.wrap(m1), cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
 	}, now)
 	staleEntry := cachex.Entry[string]{Value: "old", CachedAt: epoch, FreshUntil: epoch.Add(time.Minute), ExpiresAt: epoch.Add(time.Hour)}
 	require.NoError(t, m1.Set(ctx, "a", staleEntry))

@@ -22,7 +22,15 @@ func TestGetMany(t *testing.T) {
 	t.Run("hits, misses and absent keys in one result", func(t *testing.T) {
 		src := newBatchSource(map[string]string{"a": "1", "b": "2", "c": "3"})
 		mem := cachextest.NewMap[string]()
-		keysRead := &keysOfGetMany{Backend: mem}
+		var mu sync.Mutex
+		var batches [][]string
+		keysRead := hook(mem, func(op string, keys []string, many bool) {
+			if op == "get" && many {
+				mu.Lock()
+				defer mu.Unlock()
+				batches = append(batches, keys)
+			}
+		})
 		c := cachex.New[string](src, oneLayer(keysRead))
 		_, err := c.Get(ctx, "a")
 		require.NoError(t, err)
@@ -34,7 +42,7 @@ func TestGetMany(t *testing.T) {
 		require.Len(t, src.batchCalls(), 1)
 		assert.ElementsMatch(t, []string{"b", "c", "x"}, src.batchCalls()[0], "one call for the misses, each once")
 		assert.Equal(t, 3, mem.Len())
-		assert.Equal(t, []string{"a", "b", "c", "x"}, keysRead.first(), "the layer is asked each key once")
+		assert.Equal(t, []string{"a", "b", "c", "x"}, batches[0], "the layer is asked each key once")
 	})
 
 	t.Run("no keys", func(t *testing.T) {
@@ -129,7 +137,8 @@ func TestGetMany(t *testing.T) {
 	t.Run("lower layers are read in one call each", func(t *testing.T) {
 		src := newBatchSource(map[string]string{"a": "1", "b": "2", "c": "3"})
 		var reads atomic.Int64
-		l2 := &countingGets{Backend: cachextest.NewMap[string](), n: &reads}
+		m2 := cachextest.NewMap[string]()
+		l2 := counting(m2, "get", &reads)
 		c := cachex.New[string](src, []cachex.Layer[string]{
 			cachex.NewLayer(cachextest.NewMap[string](), cachex.TTL(time.Minute, 0)),
 			cachex.NewLayer(l2, cachex.TTL(time.Hour, 0)),
@@ -238,25 +247,3 @@ func TestBatchErrorMessage(t *testing.T) {
 	assert.Equal(t, "cachex: 4 keys failed; a: boom; b: boom; c: boom; and 1 more", err.Error())
 }
 
-// keysOfGetMany wraps a backend and records the keys of its GetMany calls.
-type keysOfGetMany struct {
-	cachex.Backend[string]
-	mu    sync.Mutex
-	calls [][]string
-}
-
-func (k *keysOfGetMany) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[string], error) {
-	k.mu.Lock()
-	k.calls = append(k.calls, append([]string(nil), keys...))
-	k.mu.Unlock()
-	return k.Backend.GetMany(ctx, keys)
-}
-
-func (k *keysOfGetMany) first() []string {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if len(k.calls) == 0 {
-		return nil
-	}
-	return k.calls[0]
-}

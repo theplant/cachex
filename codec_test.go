@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func (p *point) UnmarshalBinary(b []byte) error {
 func roundTrip[T any](t *testing.T, codec cachex.Codec[T], e cachex.Entry[T]) cachex.Entry[T] {
 	t.Helper()
 	ctx := context.Background()
-	b := cachex.Encoded(newByteMap(), codec, nil)
+	b := cachex.Encoded(newByteMap(), codec, slog.New(slog.DiscardHandler))
 	require.NoError(t, b.Set(ctx, "k", e))
 	got, ok, err := b.Get(ctx, "k")
 	require.NoError(t, err)
@@ -113,7 +114,7 @@ func TestEntryEncoding(t *testing.T) {
 		for _, data := range [][]byte{nil, {9}, {1, 0, 1, 2}, long(2, 0), long(1, 2), append(long(1, 1), 'x')} {
 			m := newByteMap()
 			require.NoError(t, m.Set(ctx, "k", data, later))
-			_, ok, err := cachex.Encoded[string](m, nil, nil).Get(ctx, "k")
+			_, ok, err := cachex.Encoded[string](m, nil, slog.New(slog.DiscardHandler)).Get(ctx, "k")
 			require.NoError(t, err)
 			assert.False(t, ok, "%v", data)
 		}

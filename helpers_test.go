@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -125,15 +126,76 @@ func (s *batchSource) batchCalls() [][]string {
 	return append([][]string(nil), s.batches...)
 }
 
+// hooked wraps a Backend: hook runs before every call, with its operation
+// ("get", "set" or "del"), its keys, and whether it is a Many call; an error
+// from hook fails the call. Single and Many calls share the hook, so a test
+// does not depend on which of them the Cache makes.
+type hooked[T any] struct {
+	cachex.Backend[T]
+	hook func(op string, keys []string, many bool) error
+}
+
+func (h *hooked[T]) Get(ctx context.Context, key string) (cachex.Entry[T], bool, error) {
+	if err := h.hook("get", []string{key}, false); err != nil {
+		return cachex.Entry[T]{}, false, err
+	}
+	return h.Backend.Get(ctx, key)
+}
+
+func (h *hooked[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[T], error) {
+	if err := h.hook("get", keys, true); err != nil {
+		return nil, err
+	}
+	return h.Backend.GetMany(ctx, keys)
+}
+
+func (h *hooked[T]) Set(ctx context.Context, key string, e cachex.Entry[T]) error {
+	if err := h.hook("set", []string{key}, false); err != nil {
+		return err
+	}
+	return h.Backend.Set(ctx, key, e)
+}
+
+func (h *hooked[T]) SetMany(ctx context.Context, entries map[string]cachex.Entry[T]) error {
+	if err := h.hook("set", slices.Collect(maps.Keys(entries)), true); err != nil {
+		return err
+	}
+	return h.Backend.SetMany(ctx, entries)
+}
+
+func (h *hooked[T]) Del(ctx context.Context, key string) error {
+	if err := h.hook("del", []string{key}, false); err != nil {
+		return err
+	}
+	return h.Backend.Del(ctx, key)
+}
+
+func (h *hooked[T]) DelMany(ctx context.Context, keys []string) error {
+	if err := h.hook("del", keys, true); err != nil {
+		return err
+	}
+	return h.Backend.DelMany(ctx, keys)
+}
+
+// hook wraps b with f, for hooks that never fail a call.
+func hook[T any](b cachex.Backend[T], f func(op string, keys []string, many bool)) *hooked[T] {
+	return &hooked[T]{Backend: b, hook: func(op string, keys []string, many bool) error {
+		f(op, keys, many)
+		return nil
+	}}
+}
+
 // faulty wraps a Backend: an error set for an operation fails it.
 type faulty[T any] struct {
-	cachex.Backend[T]
+	*hooked[T]
 	mu   sync.Mutex
 	errs map[string]error // by operation: "get", "set", "del"
 }
 
 func newFaulty[T any](b cachex.Backend[T]) *faulty[T] {
-	return &faulty[T]{Backend: b, errs: map[string]error{}}
+	f := &faulty[T]{errs: map[string]error{}}
+	f.hooked = &hooked[T]{Backend: b, hook: func(op string, _ []string, _ bool) error { return f.err(op) }}
+	return f
 }
 
 func (f *faulty[T]) failOn(op string, err error) {
@@ -148,46 +210,35 @@ func (f *faulty[T]) err(op string) error {
 	return f.errs[op]
 }
 
-func (f *faulty[T]) Get(ctx context.Context, key string) (cachex.Entry[T], bool, error) {
-	if err := f.err("get"); err != nil {
-		return cachex.Entry[T]{}, false, err
-	}
-	return f.Backend.Get(ctx, key)
+// blocker holds writes: a write of key (of any key if key is empty) signals
+// entered, then waits for release.
+type blocker struct {
+	key     string
+	entered chan struct{}
+	release chan struct{}
 }
 
-func (f *faulty[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[T], error) {
-	if err := f.err("get"); err != nil {
-		return nil, err
-	}
-	return f.Backend.GetMany(ctx, keys)
+func newBlocker(key string) *blocker {
+	return &blocker{key: key, entered: make(chan struct{}, 1), release: make(chan struct{})}
 }
 
-func (f *faulty[T]) Set(ctx context.Context, key string, e cachex.Entry[T]) error {
-	if err := f.err("set"); err != nil {
-		return err
-	}
-	return f.Backend.Set(ctx, key, e)
+// wrap returns b with its writes held.
+func (bl *blocker) wrap(b cachex.Backend[string]) cachex.Backend[string] {
+	return hook(b, func(op string, keys []string, _ bool) {
+		if op == "set" && (bl.key == "" || slices.Contains(keys, bl.key)) {
+			bl.entered <- struct{}{}
+			<-bl.release
+		}
+	})
 }
 
-func (f *faulty[T]) SetMany(ctx context.Context, entries map[string]cachex.Entry[T]) error {
-	if err := f.err("set"); err != nil {
-		return err
-	}
-	return f.Backend.SetMany(ctx, entries)
-}
-
-func (f *faulty[T]) Del(ctx context.Context, key string) error {
-	if err := f.err("del"); err != nil {
-		return err
-	}
-	return f.Backend.Del(ctx, key)
-}
-
-func (f *faulty[T]) DelMany(ctx context.Context, keys []string) error {
-	if err := f.err("del"); err != nil {
-		return err
-	}
-	return f.Backend.DelMany(ctx, keys)
+// counting wraps b and counts its calls of op.
+func counting(b cachex.Backend[string], op string, n *atomic.Int64) cachex.Backend[string] {
+	return hook(b, func(o string, _ []string, _ bool) {
+		if o == op {
+			n.Add(1)
+		}
+	})
 }
 
 var errBoom = errors.New("boom")

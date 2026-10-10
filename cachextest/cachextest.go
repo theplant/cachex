@@ -1,6 +1,6 @@
 // Package cachextest has helpers for testing code that uses cachex: an
-// in-memory Backend, a manual clock, and a contract test for Backend
-// implementations.
+// in-memory Backend, a manual clock, and the contract tests for Backend and
+// ByteBackend implementations (TestBackend, TestByteBackend).
 package cachextest
 
 import (

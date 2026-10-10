@@ -15,44 +15,6 @@ import (
 	"github.com/theplant/cachex/v2/cachextest"
 )
 
-// recorder wraps a backend and appends "name op key" for every write.
-type recorder struct {
-	cachex.Backend[string]
-	name string
-	mu   *sync.Mutex
-	log  *[]string
-}
-
-func (r *recorder) note(op string, keys ...string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, k := range keys {
-		*r.log = append(*r.log, r.name+" "+op+" "+k)
-	}
-}
-
-func (r *recorder) Set(ctx context.Context, key string, e cachex.Entry[string]) error {
-	r.note("set", key)
-	return r.Backend.Set(ctx, key, e)
-}
-
-func (r *recorder) SetMany(ctx context.Context, entries map[string]cachex.Entry[string]) error {
-	for k := range entries {
-		r.note("set", k)
-	}
-	return r.Backend.SetMany(ctx, entries)
-}
-
-func (r *recorder) Del(ctx context.Context, key string) error {
-	r.note("del", key)
-	return r.Backend.Del(ctx, key)
-}
-
-func (r *recorder) DelMany(ctx context.Context, keys []string) error {
-	r.note("del", keys...)
-	return r.Backend.DelMany(ctx, keys)
-}
-
 type twoLayers struct {
 	src        *source
 	l1, l2     *faulty[string]
@@ -66,8 +28,8 @@ type twoLayers struct {
 func newTwoLayers(t *testing.T) *twoLayers {
 	t.Helper()
 	s := &twoLayers{src: newSource(map[string]string{"a": "1", "b": "1"}), m1: cachextest.NewMap[string](), m2: cachextest.NewMap[string]()}
-	s.l1 = newFaulty[string](&recorder{Backend: s.m1, name: "l1", mu: &s.mu, log: &s.log})
-	s.l2 = newFaulty[string](&recorder{Backend: s.m2, name: "l2", mu: &s.mu, log: &s.log})
+	s.l1 = newFaulty(s.record("l1", s.m1))
+	s.l2 = newFaulty(s.record("l2", s.m2))
 	var now cachex.Option
 	s.clockLayer, now = newClock()
 	s.c = cachex.New(s.src, []cachex.Layer[string]{
@@ -75,6 +37,20 @@ func newTwoLayers(t *testing.T) *twoLayers {
 		cachex.NewLayer(s.l2, cachex.TTL(time.Hour, 0), cachex.Jitter(0)),
 	}, now)
 	return s
+}
+
+// record wraps b and logs "name op key" for every write to it.
+func (s *twoLayers) record(name string, b cachex.Backend[string]) cachex.Backend[string] {
+	return hook(b, func(op string, keys []string, _ bool) {
+		if op == "get" {
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, k := range keys {
+			s.log = append(s.log, name+" "+op+" "+k)
+		}
+	})
 }
 
 func (s *twoLayers) writes() []string {
@@ -206,30 +182,11 @@ func TestAReadAfterAWriteNeverJoinsAFetchStartedBeforeIt(t *testing.T) {
 	assert.Equal(t, "2", v)
 }
 
-// blockingSet wraps a backend: Set of key "a" waits for release.
-type blockingSet struct {
-	cachex.Backend[string]
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (b *blockingSet) Set(ctx context.Context, key string, e cachex.Entry[string]) error {
-	return b.SetMany(ctx, map[string]cachex.Entry[string]{key: e})
-}
-
-func (b *blockingSet) SetMany(ctx context.Context, entries map[string]cachex.Entry[string]) error {
-	if _, ok := entries["a"]; ok {
-		b.entered <- struct{}{}
-		<-b.release
-	}
-	return b.Backend.SetMany(ctx, entries)
-}
-
 func TestAWriteThatGivesUpWaitingStillInvalidates(t *testing.T) {
 	ctx := context.Background()
 	mem := cachextest.NewMap[string]()
-	bs := &blockingSet{Backend: mem, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	c := cachex.New(newSource(nil), oneLayer(bs))
+	bs := newBlocker("a")
+	c := cachex.New(newSource(nil), oneLayer(bs.wrap(mem)))
 
 	first := make(chan error)
 	go func() { first <- c.Set(ctx, "a", "first") }()
@@ -378,8 +335,8 @@ func TestWritesAreNeverUndoneByReads(t *testing.T) {
 		src.onGet = delays
 		m1, m2 := cachextest.NewMap[string](), cachextest.NewMap[string]()
 		c := cachex.New(src, []cachex.Layer[string]{
-			cachex.NewLayer(&jittery{m1}, cachex.TTL(time.Hour, 0), cachex.NotFoundTTL(time.Hour, 0)),
-			cachex.NewLayer(&jittery{m2}, cachex.TTL(time.Hour, 0), cachex.NotFoundTTL(time.Hour, 0)),
+			cachex.NewLayer(jittery(m1), cachex.TTL(time.Hour, 0), cachex.NotFoundTTL(time.Hour, 0)),
+			cachex.NewLayer(jittery(m2), cachex.TTL(time.Hour, 0), cachex.NotFoundTTL(time.Hour, 0)),
 		}, cachex.WithFetchesPerKey(1+r.IntN(3)), cachex.WithGetManyChunkSize(r.IntN(3)))
 		keys := []string{"a", "b", "c"}
 		var rowLocks [3]sync.Mutex
@@ -436,41 +393,21 @@ func TestWritesAreNeverUndoneByReads(t *testing.T) {
 	}
 }
 
-// jittery wraps a backend and sometimes yields before reads and writes, to
-// shake out interleavings.
-type jittery struct{ cachex.Backend[string] }
-
-func yield() {
-	if rand.IntN(3) == 0 {
-		time.Sleep(time.Duration(rand.IntN(100)) * time.Microsecond)
-	}
-}
-
-func (j *jittery) Get(ctx context.Context, key string) (cachex.Entry[string], bool, error) {
-	yield()
-	return j.Backend.Get(ctx, key)
-}
-
-func (j *jittery) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[string], error) {
-	yield()
-	return j.Backend.GetMany(ctx, keys)
-}
-
-func (j *jittery) SetMany(ctx context.Context, entries map[string]cachex.Entry[string]) error {
-	yield()
-	return j.Backend.SetMany(ctx, entries)
-}
-
-func (j *jittery) Set(ctx context.Context, key string, e cachex.Entry[string]) error {
-	yield()
-	return j.Backend.Set(ctx, key, e)
+// jittery wraps a backend and sometimes yields before a call, to shake out
+// interleavings.
+func jittery(b cachex.Backend[string]) cachex.Backend[string] {
+	return hook(b, func(string, []string, bool) {
+		if rand.IntN(3) == 0 {
+			time.Sleep(time.Duration(rand.IntN(100)) * time.Microsecond)
+		}
+	})
 }
 
 func TestCloseWaitsForTheInvalidationOfAWriteThatGaveUp(t *testing.T) {
 	ctx := context.Background()
 	mem := cachextest.NewMap[string]()
-	bs := &blockingSet{Backend: mem, entered: make(chan struct{}, 1), release: make(chan struct{})}
-	c := cachex.New(newSource(nil), oneLayer(bs))
+	bs := newBlocker("a")
+	c := cachex.New(newSource(nil), oneLayer(bs.wrap(mem)))
 	first := make(chan error)
 	go func() { first <- c.Set(ctx, "a", "first") }()
 	<-bs.entered

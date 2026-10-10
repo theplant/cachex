@@ -33,7 +33,7 @@ func (m *byteMap) Get(_ context.Context, key string) ([]byte, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.data[key]
-	return e.Data, ok, nil
+	return bytes.Clone(e.Data), ok, nil
 }
 
 func (m *byteMap) GetMany(ctx context.Context, keys []string) (map[string][]byte, error) {
@@ -57,7 +57,7 @@ func (m *byteMap) Set(_ context.Context, key string, data []byte, expiresAt time
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.data[key] = cachex.ByteEntry{Data: data, ExpiresAt: expiresAt}
+	m.data[key] = cachex.ByteEntry{Data: bytes.Clone(data), ExpiresAt: expiresAt}
 	return nil
 }
 
