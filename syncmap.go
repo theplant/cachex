@@ -2,9 +2,8 @@ package cachex
 
 import (
 	"context"
+	"fmt"
 	"sync"
-
-	"github.com/pkg/errors"
 )
 
 // SyncMap is a cache implementation using sync.Map
@@ -27,7 +26,7 @@ func (s *SyncMap[T]) Get(_ context.Context, key string) (T, error) {
 	var zero T
 	v, ok := s.Load(key)
 	if !ok {
-		return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in syncmap for key: %s", key)
+		return zero, fmt.Errorf("key not found in syncmap for key: %s: %w", key, &ErrKeyNotFound{})
 	}
 	return v.(T), nil
 }

@@ -2,13 +2,14 @@ package cachex
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -324,7 +325,7 @@ func (e sqlStateError) Error() string    { return "ERROR: (SQLSTATE " + string(e
 func (e sqlStateError) SQLState() string { return string(e) }
 
 func TestIsDeadlock(t *testing.T) {
-	assert.True(t, isDeadlock(errors.Wrap(sqlStateError("40P01"), "x")), "PostgreSQL deadlock")
+	assert.True(t, isDeadlock(fmt.Errorf("x: %w", sqlStateError("40P01"))), "PostgreSQL deadlock")
 	assert.True(t, isDeadlock(sqlStateError("40001")), "serialization failure")
 	assert.True(t, isDeadlock(errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")), "MySQL deadlock")
 	assert.False(t, isDeadlock(sqlStateError("23505")))

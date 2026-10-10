@@ -3,7 +3,7 @@ package cachex
 import (
 	"bytes"
 	"context"
-	stderrors "errors"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -652,7 +651,7 @@ func (f failingBatchGet[T]) GetMany(context.Context, []string) (map[string]T, er
 func TestClientGetManyWholeBatchErrors(t *testing.T) {
 	ctx := context.Background()
 	conn := errors.New("conn reset")
-	joined := stderrors.Join(conn, &ErrKeyNotFound{})
+	joined := errors.Join(conn, &ErrKeyNotFound{})
 
 	// requireFailedAll checks every key failed with an error that still is conn
 	// but never reads as not-found.
@@ -757,7 +756,7 @@ func TestClientGetManyWholeBatchErrorInterplay(t *testing.T) {
 				close(entered)
 				<-release
 			}
-			return nil, stderrors.Join(conn, &ErrKeyNotFound{})
+			return nil, errors.Join(conn, &ErrKeyNotFound{})
 		})
 		notFound := NewSyncMap[time.Time]()
 		cli := NewClient(NewSyncMap[string](), up, NotFoundWithTTL[string](notFound, time.Hour, 0))
@@ -1270,7 +1269,7 @@ func TestClientGetManyReviewFixes(t *testing.T) {
 		notFound := NewSyncMap[time.Time]()
 		conn := errors.New("conn reset")
 		up := batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
-			return nil, stderrors.Join(conn, &BatchError{Errors: map[string]error{"a": errors.New("x")}})
+			return nil, errors.Join(conn, &BatchError{Errors: map[string]error{"a": errors.New("x")}})
 		})
 		cli := NewClient(NewSyncMap[string](), up, NotFoundWithTTL[string](notFound, time.Hour, 0))
 
@@ -1373,7 +1372,7 @@ func TestClientGetManyReviewFixes2(t *testing.T) {
 	t.Run("a whole-batch error that contains a not-found is a failure, not a not-found", func(t *testing.T) {
 		notFound := NewSyncMap[time.Time]()
 		up := batchUpstreamFunc[string](func(context.Context, []string) (map[string]string, error) {
-			return nil, stderrors.Join(errors.New("conn reset"), &ErrKeyNotFound{})
+			return nil, errors.Join(errors.New("conn reset"), &ErrKeyNotFound{})
 		})
 		cli := NewClient(NewSyncMap[string](), up, NotFoundWithTTL[string](notFound, time.Hour, 0))
 

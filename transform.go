@@ -3,8 +3,7 @@ package cachex
 import (
 	"context"
 	"encoding/json"
-
-	"github.com/pkg/errors"
+	"fmt"
 )
 
 // transformCache wraps a Cache[A] and provides type transformation to Cache[B]
@@ -31,7 +30,7 @@ func Transform[A, B any](
 func (t *transformCache[A, B]) Set(ctx context.Context, key string, value B) error {
 	encoded, err := t.encode(value)
 	if err != nil {
-		return errors.Wrap(err, "failed to encode value")
+		return fmt.Errorf("failed to encode value: %w", err)
 	}
 	return t.cache.Set(ctx, key, encoded)
 }
@@ -45,7 +44,7 @@ func (t *transformCache[A, B]) Get(ctx context.Context, key string) (B, error) {
 	}
 	decoded, err := t.decode(encoded)
 	if err != nil {
-		return zero, errors.Wrap(err, "failed to decode value")
+		return zero, fmt.Errorf("failed to decode value: %w", err)
 	}
 	return decoded, nil
 }

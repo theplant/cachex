@@ -2,10 +2,10 @@ package cachex
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/dgraph-io/ristretto/v2"
-	"github.com/pkg/errors"
 )
 
 // RistrettoCache is a cache implementation using ristretto
@@ -42,7 +42,7 @@ func DefaultRistrettoCacheConfig[T any]() *RistrettoCacheConfig[T] {
 func NewRistrettoCache[T any](config *RistrettoCacheConfig[T]) (*RistrettoCache[T], error) {
 	cache, err := ristretto.NewCache(config.Config)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create ristretto cache")
+		return nil, fmt.Errorf("failed to create ristretto cache: %w", err)
 	}
 
 	return &RistrettoCache[T]{
@@ -79,7 +79,7 @@ func (r *RistrettoCache[T]) Get(_ context.Context, key string) (T, error) {
 	var zero T
 	value, found := r.cache.Get(key)
 	if !found {
-		return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in ristretto cache for key: %s", key)
+		return zero, fmt.Errorf("key not found in ristretto cache for key: %s: %w", key, &ErrKeyNotFound{})
 	}
 	return value, nil
 }

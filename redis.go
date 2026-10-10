@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -78,11 +79,11 @@ func (r *RedisCache[T]) encode(key string, value T) (any, error) {
 		// Use BinaryMarshaler interface
 		marshaler, ok := any(value).(encoding.BinaryMarshaler)
 		if !ok {
-			return nil, errors.Errorf("value does not implement encoding.BinaryMarshaler for key: %s", key)
+			return nil, fmt.Errorf("value does not implement encoding.BinaryMarshaler for key: %s", key)
 		}
 		data, err := marshaler.MarshalBinary()
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to marshal binary for key: %s", key)
+			return nil, fmt.Errorf("failed to marshal binary for key: %s: %w", key, err)
 		}
 		return data, nil
 	}
@@ -94,7 +95,7 @@ func (r *RedisCache[T]) encode(key string, value T) (any, error) {
 		// For other types: marshal to JSON
 		data, err := json.Marshal(value)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to marshal value for key: %s", key)
+			return nil, fmt.Errorf("failed to marshal value for key: %s: %w", key, err)
 		}
 		return data, nil
 	}
@@ -117,7 +118,7 @@ func (r *RedisCache[T]) decode(key string, cmd *redis.StringCmd) (T, error) {
 	if r.useBinary {
 		if unmarshaler, ok := any(&value).(encoding.BinaryUnmarshaler); ok {
 			if err := unmarshaler.UnmarshalBinary(data); err != nil {
-				return zero, errors.Wrapf(err, "failed to unmarshal binary for key: %s", key)
+				return zero, fmt.Errorf("failed to unmarshal binary for key: %s: %w", key, err)
 			}
 		}
 		return value, nil
@@ -125,7 +126,7 @@ func (r *RedisCache[T]) decode(key string, cmd *redis.StringCmd) (T, error) {
 
 	// For other types: unmarshal from JSON
 	if err := json.Unmarshal(data, &value); err != nil {
-		return zero, errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
+		return zero, fmt.Errorf("failed to unmarshal value for key: %s: %w", key, err)
 	}
 	return value, nil
 }
@@ -138,7 +139,7 @@ func (r *RedisCache[T]) Set(ctx context.Context, key string, value T) error {
 	}
 
 	if err := r.client.Set(ctx, r.prefixedKey(key), data, r.ttl).Err(); err != nil {
-		return errors.Wrapf(err, "failed to set cache entry for key: %s", key)
+		return fmt.Errorf("failed to set cache entry for key: %s: %w", key, err)
 	}
 
 	return nil
@@ -146,9 +147,9 @@ func (r *RedisCache[T]) Set(ctx context.Context, key string, value T) error {
 
 func (r *RedisCache[T]) handleRedisError(err error, key string) error {
 	if errors.Is(err, redis.Nil) {
-		return errors.Wrapf(&ErrKeyNotFound{}, "key not found in redis cache for key: %s", key)
+		return fmt.Errorf("key not found in redis cache for key: %s: %w", key, &ErrKeyNotFound{})
 	}
-	return errors.Wrapf(err, "failed to get cache entry for key: %s", key)
+	return fmt.Errorf("failed to get cache entry for key: %s: %w", key, err)
 }
 
 // Get retrieves a value from the cache
@@ -164,7 +165,7 @@ func (r *RedisCache[T]) Get(ctx context.Context, key string) (T, error) {
 // Del removes a value from the cache
 func (r *RedisCache[T]) Del(ctx context.Context, key string) error {
 	if err := r.client.Del(ctx, r.prefixedKey(key)).Err(); err != nil {
-		return errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
+		return fmt.Errorf("failed to delete cache entry for key: %s: %w", key, err)
 	}
 	return nil
 }
@@ -247,7 +248,7 @@ func (r *RedisCache[T]) SetMany(ctx context.Context, values map[string]T) error 
 		execPipe(ctx, pipe)
 		for i, cmd := range cmds {
 			if err := cmd.Err(); err != nil {
-				keyErrs[sent[i]] = errors.Wrapf(err, "failed to set cache entry for key: %s", sent[i])
+				keyErrs[sent[i]] = fmt.Errorf("failed to set cache entry for key: %s: %w", sent[i], err)
 			}
 		}
 	}
@@ -268,7 +269,7 @@ func (r *RedisCache[T]) DelMany(ctx context.Context, keys []string) error {
 		execPipe(ctx, pipe)
 		for i, cmd := range cmds {
 			if err := cmd.Err(); err != nil {
-				keyErrs[chunk[i]] = errors.Wrapf(err, "failed to delete cache entry for key: %s", chunk[i])
+				keyErrs[chunk[i]] = fmt.Errorf("failed to delete cache entry for key: %s: %w", chunk[i], err)
 			}
 		}
 	}

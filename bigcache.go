@@ -2,9 +2,10 @@ package cachex
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/allegro/bigcache/v3"
-	"github.com/pkg/errors"
 )
 
 // BigCache is a cache implementation using BigCache
@@ -24,7 +25,7 @@ type BigCacheConfig struct {
 func NewBigCache(ctx context.Context, config BigCacheConfig) (*BigCache, error) {
 	cache, err := bigcache.New(ctx, config.Config)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create bigcache")
+		return nil, fmt.Errorf("failed to create bigcache: %w", err)
 	}
 
 	return &BigCache{
@@ -36,7 +37,7 @@ func NewBigCache(ctx context.Context, config BigCacheConfig) (*BigCache, error) 
 func (b *BigCache) Set(_ context.Context, key string, value []byte) error {
 	err := b.cache.Set(key, value)
 	if err != nil {
-		return errors.Wrapf(err, "failed to set value in bigcache for key: %s", key)
+		return fmt.Errorf("failed to set value in bigcache for key: %s: %w", key, err)
 	}
 	return nil
 }
@@ -46,9 +47,9 @@ func (b *BigCache) Get(_ context.Context, key string) ([]byte, error) {
 	data, err := b.cache.Get(key)
 	if err != nil {
 		if errors.Is(err, bigcache.ErrEntryNotFound) {
-			return nil, errors.Wrapf(&ErrKeyNotFound{}, "key not found in bigcache for key: %s", key)
+			return nil, fmt.Errorf("key not found in bigcache for key: %s: %w", key, &ErrKeyNotFound{})
 		}
-		return nil, errors.Wrapf(err, "failed to get value from bigcache for key: %s", key)
+		return nil, fmt.Errorf("failed to get value from bigcache for key: %s: %w", key, err)
 	}
 	return data, nil
 }
@@ -57,7 +58,7 @@ func (b *BigCache) Get(_ context.Context, key string) ([]byte, error) {
 func (b *BigCache) Del(_ context.Context, key string) error {
 	err := b.cache.Delete(key)
 	if err != nil {
-		return errors.Wrapf(err, "failed to delete value from bigcache for key: %s", key)
+		return fmt.Errorf("failed to delete value from bigcache for key: %s: %w", key, err)
 	}
 	return nil
 }
@@ -66,7 +67,7 @@ func (b *BigCache) Del(_ context.Context, key string) error {
 func (b *BigCache) Close() error {
 	err := b.cache.Close()
 	if err != nil {
-		return errors.Wrap(err, "failed to close bigcache")
+		return fmt.Errorf("failed to close bigcache: %w", err)
 	}
 	return nil
 }

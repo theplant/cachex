@@ -5,14 +5,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	stderrors "errors"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -51,7 +50,7 @@ func isDeadlock(err error) bool {
 		return false
 	}
 	var pg interface{ SQLState() string }
-	if stderrors.As(err, &pg) {
+	if errors.As(err, &pg) {
 		return pg.SQLState() == "40P01" || pg.SQLState() == "40001"
 	}
 	return strings.Contains(err.Error(), "Error 1213 (40001)")
@@ -61,7 +60,7 @@ func isDeadlock(err error) bool {
 // or later, the first with the utf8mb4_0900_bin collation Migrate creates
 // tables with. MariaDB has no such collation.
 func checkMySQLVersion(version string) error {
-	fail := errors.Errorf("GORMCache needs MySQL 8.0.17 or later to create its table (utf8mb4_0900_bin collation), found %q", version)
+	fail := fmt.Errorf("GORMCache needs MySQL 8.0.17 or later to create its table (utf8mb4_0900_bin collation), found %q", version)
 	if strings.Contains(version, "MariaDB") {
 		return fail
 	}
@@ -162,7 +161,7 @@ func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 		} else {
 			var version string
 			if err := tx.Raw("SELECT VERSION()").Scan(&version).Error; err != nil {
-				return errors.Wrap(err, "failed to read the MySQL version")
+				return fmt.Errorf("failed to read the MySQL version: %w", err)
 			}
 			if err := checkMySQLVersion(version); err != nil {
 				return err
@@ -172,7 +171,7 @@ func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 		tx = tx.Set("gorm:table_options", "CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin") // MySQL 8.0.17+
 	}
 	if err := tx.AutoMigrate(&cacheEntry{}); err != nil {
-		return errors.Wrapf(err, "failed to migrate cache table for table: %s", g.tableName)
+		return fmt.Errorf("failed to migrate cache table for table: %s: %w", g.tableName, err)
 	}
 	return nil
 }
@@ -184,11 +183,10 @@ func (g *GORMCache[T]) checkMySQLKeyCollation(tx *gorm.DB) error {
 	var collation sql.NullString
 	if err := tx.Raw("SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
 		g.tableName, "key").Scan(&collation).Error; err != nil {
-		return errors.Wrapf(err, "failed to read the key column's collation for table: %s", g.tableName)
+		return fmt.Errorf("failed to read the key column's collation for table: %s: %w", g.tableName, err)
 	}
 	if collation.String != "utf8mb4_0900_bin" {
-		return errors.Errorf("GORMCache needs the key column of table %s to use utf8mb4_0900_bin, found %q; convert it with: ALTER TABLE %s CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin",
-			g.tableName, collation.String, g.tableName)
+		return fmt.Errorf("GORMCache needs the key column of table %s to use utf8mb4_0900_bin, found %q; convert it with: ALTER TABLE %s CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin", g.tableName, collation.String, g.tableName)
 	}
 	return nil
 }
@@ -222,7 +220,7 @@ func GetGORMTx(ctx context.Context) *gorm.DB {
 func (g *GORMCache[T]) Set(ctx context.Context, key string, value T) error {
 	data, err := json.Marshal(value)
 	if err != nil {
-		return errors.Wrapf(err, "failed to marshal value for key: %s", key)
+		return fmt.Errorf("failed to marshal value for key: %s: %w", key, err)
 	}
 
 	entry := cacheEntry{
@@ -233,7 +231,7 @@ func (g *GORMCache[T]) Set(ctx context.Context, key string, value T) error {
 	if err := g.write(ctx, func(tx *gorm.DB) error {
 		return tx.Table(g.tableName).Clauses(upsertEntry).Create(&entry).Error
 	}); err != nil {
-		return errors.Wrapf(err, "failed to set cache entry for key: %s", key)
+		return fmt.Errorf("failed to set cache entry for key: %s: %w", key, err)
 	}
 
 	return nil
@@ -250,19 +248,19 @@ func (g *GORMCache[T]) Get(ctx context.Context, key string) (T, error) {
 		Where(clause.Eq{Column: keyColumn, Value: g.prefixedKey(key)}).
 		First(&entry).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in gorm cache for key: %s", key)
+			return zero, fmt.Errorf("key not found in gorm cache for key: %s: %w", key, &ErrKeyNotFound{})
 		}
-		return zero, errors.Wrapf(err, "failed to get cache entry for key: %s", key)
+		return zero, fmt.Errorf("failed to get cache entry for key: %s: %w", key, err)
 	}
 	if entry.Key != g.prefixedKey(key) {
 		// a key column that is not byte-exact (e.g. MySQL's _ci collations)
 		// matched another key's row
-		return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in gorm cache for key: %s", key)
+		return zero, fmt.Errorf("key not found in gorm cache for key: %s: %w", key, &ErrKeyNotFound{})
 	}
 
 	var value T
 	if err := json.Unmarshal(entry.Value, &value); err != nil {
-		return zero, errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
+		return zero, fmt.Errorf("failed to unmarshal value for key: %s: %w", key, err)
 	}
 
 	return value, nil
@@ -273,7 +271,7 @@ func (g *GORMCache[T]) Del(ctx context.Context, key string) error {
 	if err := g.write(ctx, func(tx *gorm.DB) error {
 		return tx.Table(g.tableName).Where(clause.Eq{Column: keyColumn, Value: g.prefixedKey(key)}).Delete(nil).Error
 	}); err != nil {
-		return errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
+		return fmt.Errorf("failed to delete cache entry for key: %s: %w", key, err)
 	}
 	return nil
 }
@@ -308,7 +306,7 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 			Where(clause.IN{Column: keyColumn, Values: anys(chunk)}).
 			Find(&found).Error; err != nil {
 			for _, key := range keys[start : start+len(chunk)] {
-				keyErrs[key] = errors.Wrapf(err, "failed to get cache entry for key: %s", key)
+				keyErrs[key] = fmt.Errorf("failed to get cache entry for key: %s: %w", key, err)
 			}
 			continue
 		}
@@ -329,7 +327,7 @@ func (g *GORMCache[T]) GetMany(ctx context.Context, keys []string) (map[string]T
 		}
 		var value T
 		if err := json.Unmarshal(entry.Value, &value); err != nil {
-			keyErrs[key] = errors.Wrapf(err, "failed to unmarshal value for key: %s", key)
+			keyErrs[key] = fmt.Errorf("failed to unmarshal value for key: %s: %w", key, err)
 			continue
 		}
 		out[key] = value
@@ -351,7 +349,7 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 	for key, value := range values {
 		data, err := json.Marshal(value)
 		if err != nil {
-			keyErrs[key] = errors.Wrapf(err, "failed to marshal value for key: %s", key)
+			keyErrs[key] = fmt.Errorf("failed to marshal value for key: %s: %w", key, err)
 			continue
 		}
 		rows = append(rows, row{key: key, entry: cacheEntry{Key: g.prefixedKey(key), Value: data}})
@@ -369,7 +367,7 @@ func (g *GORMCache[T]) SetMany(ctx context.Context, values map[string]T) error {
 			return tx.Table(g.tableName).Clauses(upsertEntry).Create(&entries).Error
 		}); err != nil {
 			for _, r := range chunk {
-				keyErrs[r.key] = errors.Wrapf(err, "failed to set cache entry for key: %s", r.key)
+				keyErrs[r.key] = fmt.Errorf("failed to set cache entry for key: %s: %w", r.key, err)
 			}
 		}
 	}
@@ -401,7 +399,7 @@ func (g *GORMCache[T]) DelMany(ctx context.Context, keys []string) error {
 			return tx.Table(g.tableName).Where("? IN (?)", keyColumn, locked).Delete(nil).Error
 		}); err != nil {
 			for _, key := range chunk {
-				keyErrs[key] = errors.Wrapf(err, "failed to delete cache entry for key: %s", key)
+				keyErrs[key] = fmt.Errorf("failed to delete cache entry for key: %s: %w", key, err)
 			}
 		}
 	}

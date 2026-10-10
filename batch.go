@@ -3,14 +3,14 @@ package cachex
 import (
 	"cmp"
 	"context"
-	stderrors "errors"
+	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/theplant/cachex/internal/flight"
 	"github.com/theplant/cachex/internal/stripe"
 )
@@ -63,7 +63,7 @@ func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
 				attr,
 				"panic", r,
 				"stack", string(debug.Stack()))
-			err = errors.Errorf("panic during upstream fetch: %v", r)
+			err = fmt.Errorf("panic during upstream fetch: %v", r)
 		} else if !returned {
 			err = errors.New("upstream fetch exited without returning (runtime.Goexit)")
 		}
@@ -189,7 +189,7 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 	var missing []int
 	for i, key := range keys {
 		if kerr := errForKey(err, key); kerr != nil && !IsErrKeyNotFound(kerr) {
-			res[i].err = errors.Wrapf(kerr, "get from backend failed for key: %s", key)
+			res[i].err = fmt.Errorf("get from backend failed for key: %s: %w", key, kerr)
 			continue
 		}
 		value, ok := values[key]
@@ -235,7 +235,7 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 	for _, i := range missing {
 		key := keys[i]
 		if kerr := errForKey(err, key); kerr != nil && !IsErrKeyNotFound(kerr) {
-			res[i].err = errors.Wrapf(kerr, "get from notFoundCache failed for key: %s", key)
+			res[i].err = fmt.Errorf("get from notFoundCache failed for key: %s: %w", key, kerr)
 			continue
 		}
 		cachedAt, ok := cachedAts[key]
@@ -245,10 +245,10 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 		}
 		switch state := checkNotFoundStale(cachedAt); state {
 		case StateFresh:
-			res[i].err = errors.Wrapf(&ErrKeyNotFound{Cached: true, CacheState: state}, "key not found in cache for key: %s", key)
+			res[i].err = fmt.Errorf("key not found in cache for key: %s: %w", key, &ErrKeyNotFound{Cached: true, CacheState: state})
 		case StateStale:
 			if c.serveStale && !doubleCheck {
-				res[i].err = errors.Wrapf(&ErrKeyNotFound{Cached: true, CacheState: state}, "key not found in cache for key: %s", key)
+				res[i].err = fmt.Errorf("key not found in cache for key: %s: %w", key, &ErrKeyNotFound{Cached: true, CacheState: state})
 				res[i].refresh = true
 			} else {
 				res[i].fetch = true
@@ -296,7 +296,7 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string, seen [
 			value, err := f.Result()
 			results[i] = result[T]{value: value, err: err}
 		default:
-			results[i].err = errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", keys[i])
+			results[i].err = fmt.Errorf("context cancelled during fetch for key: %s: %w", keys[i], ctx.Err())
 		}
 	}
 	return results
@@ -323,7 +323,7 @@ func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string, seen [
 			case <-ctx.Done():
 			}
 		}
-		results[i].err = errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", key)
+		results[i].err = fmt.Errorf("context cancelled during fetch for key: %s: %w", key, ctx.Err())
 	}
 	wg.Wait()
 	return results
@@ -436,11 +436,11 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 	values, err := c.upstream.(BatchUpstream[T]).GetMany(ctx, keys)
 	for i, key := range keys {
 		if kerr := errForKey(err, key); kerr != nil {
-			results[i].err = errors.Wrapf(kerr, "get from upstream failed for key: %s", key)
+			results[i].err = fmt.Errorf("get from upstream failed for key: %s: %w", key, kerr)
 		} else if value, ok := values[key]; ok {
 			results[i].value = value
 		} else {
-			results[i].err = errors.Wrapf(&ErrKeyNotFound{}, "get from upstream failed for key: %s", key)
+			results[i].err = fmt.Errorf("get from upstream failed for key: %s: %w", key, &ErrKeyNotFound{})
 		}
 	}
 
@@ -504,13 +504,13 @@ func (c *Client[T]) setManyWithoutUpstream(ctx context.Context, values map[strin
 			keys = append(keys, key)
 		}
 		if err := delMany(ctx, c.notFoundCache, keys); err != nil {
-			errs = append(errs, errors.Wrap(err, "delete from notFoundCache failed"))
+			errs = append(errs, fmt.Errorf("delete from notFoundCache failed: %w", err))
 		}
 	}
 	if err := setMany(ctx, c.backend, values); err != nil {
-		errs = append(errs, errors.Wrap(err, "set in backend failed"))
+		errs = append(errs, fmt.Errorf("set in backend failed: %w", err))
 	}
-	return stderrors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 // delManyWithoutUpstream is the batch form of delWithoutUpstream.
@@ -526,14 +526,14 @@ func (c *Client[T]) delManyWithoutUpstream(ctx context.Context, keys []string) e
 			cachedAts[key] = now
 		}
 		if err := setMany(ctx, c.notFoundCache, cachedAts); err != nil {
-			errs = append(errs, errors.Wrap(err, "failed to set notFoundCache"))
+			errs = append(errs, fmt.Errorf("failed to set notFoundCache: %w", err))
 		}
 	}
 	// the key is gone upstream, so its old value goes even if no not-found was recorded
 	if err := delMany(ctx, c.backend, keys); err != nil {
-		errs = append(errs, errors.Wrap(err, "delete from backend failed"))
+		errs = append(errs, fmt.Errorf("delete from backend failed: %w", err))
 	}
-	return stderrors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 // asyncRefreshMany is the batch form of asyncRefresh: the stale keys of one

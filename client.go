@@ -2,14 +2,13 @@ package cachex
 
 import (
 	"context"
-	stderrors "errors"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/theplant/cachex/internal/flight"
 	"github.com/theplant/cachex/internal/stripe"
 )
@@ -134,7 +133,7 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 			// Rotten, must refresh
 		}
 	} else if !IsErrKeyNotFound(err) {
-		return zero, errors.Wrapf(err, "get from backend failed for key: %s", key)
+		return zero, fmt.Errorf("get from backend failed for key: %s: %w", key, err)
 	}
 
 	// Backend miss, check notFoundCache
@@ -149,30 +148,30 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 
 			switch state {
 			case StateFresh:
-				return zero, errors.Wrapf(&ErrKeyNotFound{
+				return zero, fmt.Errorf("key not found in cache for key: %s: %w", key, &ErrKeyNotFound{
 					Cached:     true,
 					CacheState: StateFresh,
-				}, "key not found in cache for key: %s", key)
+				})
 
 			case StateStale:
 				if c.serveStale && !doubleCheck {
 					c.asyncRefresh(context.WithoutCancel(ctx), key, seen)
-					return zero, errors.Wrapf(&ErrKeyNotFound{
+					return zero, fmt.Errorf("key not found in cache for key: %s: %w", key, &ErrKeyNotFound{
 						Cached:     true,
 						CacheState: StateStale,
-					}, "key not found in cache for key: %s", key)
+					})
 				}
 
 			case StateRotten:
 				// Rotten, must refresh
 			}
 		} else if !IsErrKeyNotFound(err) {
-			return zero, errors.Wrapf(err, "get from notFoundCache failed for key: %s", key)
+			return zero, fmt.Errorf("get from notFoundCache failed for key: %s: %w", key, err)
 		}
 	}
 
 	if doubleCheck {
-		return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in cache for key: %s", key)
+		return zero, fmt.Errorf("key not found in cache for key: %s: %w", key, &ErrKeyNotFound{})
 	}
 
 	return c.fetchFromUpstreamWithSFKey(ctx, key, c.makeSFKey(key), seen)
@@ -207,7 +206,7 @@ func (c *Client[T]) Del(ctx context.Context, key string) error {
 	return c.write(ctx, key,
 		func(upstream Cache[T]) error {
 			if err := upstream.Del(ctx, key); err != nil {
-				return errors.Wrapf(err, "delete from upstream failed for key: %s", key)
+				return fmt.Errorf("delete from upstream failed for key: %s: %w", key, err)
 			}
 			return nil
 		},
@@ -221,13 +220,13 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 	var errs []error
 	if c.notFoundCache != nil {
 		if err := c.notFoundCache.Set(ctx, key, NowFunc()); err != nil {
-			errs = append(errs, errors.Wrapf(err, "failed to set notFoundCache for key: %s", key))
+			errs = append(errs, fmt.Errorf("failed to set notFoundCache for key: %s: %w", key, err))
 		}
 	}
 	if err := c.backend.Del(ctx, key); err != nil {
-		errs = append(errs, errors.Wrapf(err, "delete from backend failed for key: %s", key))
+		errs = append(errs, fmt.Errorf("delete from backend failed for key: %s: %w", key, err))
 	}
-	return stderrors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 // Set stores a value in the cache and propagates through cache layers.
@@ -268,7 +267,7 @@ func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
 	return c.write(ctx, key,
 		func(upstream Cache[T]) error {
 			if err := upstream.Set(ctx, key, value); err != nil {
-				return errors.Wrapf(err, "set in upstream failed for key: %s", key)
+				return fmt.Errorf("set in upstream failed for key: %s: %w", key, err)
 			}
 			return nil
 		},
@@ -295,7 +294,7 @@ func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache
 	// A write that gave up waiting writes nothing upstream, but like any failed
 	// write it leaves this layer without an entry, once the stripe is free.
 	if err := s.Lock(ctx, func() { written(); c.invalidate(ctx, key) }); err != nil {
-		return errors.Wrapf(err, "context cancelled while waiting to write key: %s", key)
+		return fmt.Errorf("context cancelled while waiting to write key: %s: %w", key, err)
 	}
 	defer s.Unlock()
 	// also drop fetches claimed while this layer was being written: their
@@ -372,13 +371,13 @@ func (c *Client[T]) setWithoutUpstream(ctx context.Context, key string, value T)
 	var errs []error
 	if c.notFoundCache != nil {
 		if err := c.notFoundCache.Del(ctx, key); err != nil {
-			errs = append(errs, errors.Wrapf(err, "delete from notFoundCache failed for key: %s", key))
+			errs = append(errs, fmt.Errorf("delete from notFoundCache failed for key: %s: %w", key, err))
 		}
 	}
 	if err := c.backend.Set(ctx, key, value); err != nil {
-		errs = append(errs, errors.Wrapf(err, "set in backend failed for key: %s", key))
+		errs = append(errs, fmt.Errorf("set in backend failed for key: %s: %w", key, err))
 	}
-	return stderrors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 // fetchFromUpstreamWithSFKey fetches key through the flight group; seen is the
@@ -397,7 +396,7 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 
 	select {
 	case <-ctx.Done():
-		return zero, errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", key)
+		return zero, fmt.Errorf("context cancelled during fetch for key: %s: %w", key, ctx.Err())
 	case <-f.Done():
 		if c.testHooks != nil && c.testHooks.afterSingleflightEnd != nil {
 			c.testHooks.afterSingleflightEnd(ctx, key)
@@ -496,7 +495,7 @@ func (c *Client[T]) doFetch(ctx context.Context, key string) (T, error) {
 			c.backfill(ctx, key, gen, func() error { return c.delWithoutUpstream(ctx, key) }, "failed to delete cache entry")
 		}
 		var zero T
-		return zero, errors.Wrapf(err, "get from upstream failed for key: %s", key)
+		return zero, fmt.Errorf("get from upstream failed for key: %s: %w", key, err)
 	}
 
 	c.backfill(ctx, key, gen, func() error { return c.setWithoutUpstream(ctx, key, value) }, "failed to set cache entry")
