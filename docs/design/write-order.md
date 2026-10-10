@@ -232,7 +232,7 @@ sequenceDiagram
 
 | 操作 | 谁调用 | 做什么 |
 |---|---|---|
-| `epoch(key)` | 读取，读第一层之前 | 取分片纪元，给二次检查用 |
+| `epoch(stripes, key)` | 读取，读第一层之前 | 取分片纪元，给二次检查用；它是普通函数而不是 `Cache` 的方法，因为泛型方法在命中路径上不会内联，多一层调用约慢 3ns |
 | `generation(key)` | 回源，读下面各层之前 | 取写入代数，回填时核对 |
 | `lockWrite` / `unlockWrite` | `Set`/`Del` | 拿分片写锁（空闲时 `TryLock`，不分配）；结束时写入代数 +1、摘除在途回源、释放 |
 | `lockWrites` | `SetMany`/`DelMany` | 按分片编号从小到大拿多把写锁；放弃等待时按上一节收尾 |

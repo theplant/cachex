@@ -16,8 +16,9 @@ import (
 // docs/design/write-order.md and ADR 0003.
 
 // epoch is key's stripe epoch: take it before reading the first layer, and a
-// double check is due only if it changed (see shouldDoubleCheck).
-func (c *Cache[T]) epoch(key string) uint64 { return c.stripes.For(key).Epoch() }
+// double check is due only if it changed (see shouldDoubleCheck). It is not a
+// method of the generic Cache, which costs the hit path a call.
+func epoch(s *stripe.Set, key string) uint64 { return s.For(key).Epoch() }
 
 // generation is key's write generation: take it before reading below the first
 // layer, and pass it to beginFill.

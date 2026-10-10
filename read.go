@@ -22,7 +22,7 @@ import (
 func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 	var seen uint64
 	if len(c.layers) > 0 {
-		seen = c.epoch(key) // before reading, see shouldDoubleCheck
+		seen = epoch(c.stripes, key) // before reading, see shouldDoubleCheck
 		e, ok, err := c.layers[0].backend.Get(ctx, key)
 		if err != nil {
 			var zero T
@@ -64,7 +64,7 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 	missKeys, missSeen := keys, seen
 	if len(c.layers) > 0 {
 		for i, key := range keys {
-			seen[i] = c.epoch(key) // before reading, see shouldDoubleCheck
+			seen[i] = epoch(c.stripes, key) // before reading, see shouldDoubleCheck
 		}
 		es, err := c.layers[0].backend.GetMany(ctx, keys)
 		now := c.opts.now()
@@ -298,7 +298,7 @@ func (c *Cache[T]) shouldDoubleCheck(key string, seen uint64) bool {
 	case DoubleCheckDisabled:
 		return false
 	default:
-		return c.epoch(key) != seen
+		return epoch(c.stripes, key) != seen
 	}
 }
 
@@ -518,7 +518,7 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 		if seen != nil {
 			ownSeen = append(ownSeen, seen[i])
 		} else {
-			ownSeen = append(ownSeen, c.epoch(key))
+			ownSeen = append(ownSeen, epoch(c.stripes, key))
 		}
 	}
 	if len(own) == 0 {
