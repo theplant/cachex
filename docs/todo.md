@@ -36,6 +36,7 @@
 ## 3. 小问题
 
 - **单 key 的后台刷新把「不存在」也记成 ERROR：** `asyncRefresh` 在上游返回不存在时会记一条 `async refresh failed` 的 ERROR 日志，而批量的 `asyncRefreshMany` 会跳过不存在。main 上就是这样。应该统一成跳过不存在。
+- **`BENCHMARK*.md` 和 README 的 Key Metrics 表已经过时：** 它们来自已删除的 `BenchmarkProductSearch`，数字主要反映模拟的 `time.Sleep`。v2 重写文档时按 `benchmark_test.go` 的微基准重写。
 - **GORMCache 在 SQLite 上存不了 JSON 标量数字：** `T = float64` 这类值，SQLite 会把 JSON 存成数字类型，`datatypes.JSON` 读回来时扫描失败。结构体、字符串不受影响。需要确认 MySQL 和 PostgreSQL 上是否也有这个问题，再决定是在读取时兼容，还是在文档里说明限制。
 
 ## 4. GORM 缓存改进

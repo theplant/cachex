@@ -563,55 +563,38 @@ func waitFor(t *testing.T, ch <-chan struct{}) {
 	}
 }
 
-// BenchmarkGetManyVsGet compares fetching 100 missing keys with one GetMany
-// against a loop of Get, with an upstream that costs one round trip per call
-// whether it answers one key or many (a DB query, an API call).
-func BenchmarkGetManyVsGet(b *testing.B) {
-	const n = 100
-	const roundTrip = time.Millisecond
+// TestGetManyCallsTheBatchUpstreamOnce: 100 missing keys cost one upstream
+// call through GetMany, one per key through a loop of Get.
+func TestGetManyCallsTheBatchUpstreamOnce(t *testing.T) {
 	ctx := context.Background()
-	keys := make([]string, n)
+	keys := make([]string, 100)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("key-%d", i)
 	}
-
 	newClient := func(calls *atomic.Int64) *Client[string] {
-		up := batchUpstreamFunc[string](func(_ context.Context, keys []string) (map[string]string, error) {
+		return NewClient(NewSyncMap[string](), batchUpstreamFunc[string](func(_ context.Context, keys []string) (map[string]string, error) {
 			calls.Add(1)
-			time.Sleep(roundTrip)
 			out := make(map[string]string, len(keys))
 			for _, k := range keys {
 				out[k] = "v-" + k
 			}
 			return out, nil
-		})
-		return NewClient(NewSyncMap[string](), up)
+		}))
 	}
 
-	b.Run("GetMany", func(b *testing.B) {
-		var calls atomic.Int64
-		for b.Loop() {
-			cli := newClient(&calls)
-			got, err := cli.GetMany(ctx, keys)
-			if err != nil || len(got) != n {
-				b.Fatal(err, len(got))
-			}
-		}
-		b.ReportMetric(float64(calls.Load())/float64(b.N), "upstream-calls/op")
-	})
+	var batched atomic.Int64
+	got, err := newClient(&batched).GetMany(ctx, keys)
+	require.NoError(t, err)
+	assert.Len(t, got, len(keys))
+	assert.Equal(t, int64(1), batched.Load())
 
-	b.Run("loop Get", func(b *testing.B) {
-		var calls atomic.Int64
-		for b.Loop() {
-			cli := newClient(&calls)
-			for _, k := range keys {
-				if _, err := cli.Get(ctx, k); err != nil {
-					b.Fatal(err)
-				}
-			}
-		}
-		b.ReportMetric(float64(calls.Load())/float64(b.N), "upstream-calls/op")
-	})
+	var looped atomic.Int64
+	cli := newClient(&looped)
+	for _, k := range keys {
+		_, err := cli.Get(ctx, k)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, int64(len(keys)), looped.Load())
 }
 
 func TestClientGetManyUpstreamGoexit(t *testing.T) {

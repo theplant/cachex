@@ -3,438 +3,331 @@ package cachex
 import (
 	"context"
 	"fmt"
-	"math/rand"
-	"sort"
+	"math/rand/v2"
+	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
-// Product represents a search result
-type Product struct {
-	ID          string
-	Name        string
-	Price       int64
-	Stock       int
-	Description string
+// Micro benchmarks of cachex's own cost: every upstream answers at once, so
+// the numbers are the library's overhead per call, not simulated I/O.
+// Compare runs with: go test -run '^$' -bench . -benchmem -count=10 | benchstat
+
+// benchUpstream answers every key except those in missing, at once.
+func benchUpstream(calls *atomic.Int64, missing func(string) bool) batchUpstreamFunc[string] {
+	return func(_ context.Context, keys []string) (map[string]string, error) {
+		if calls != nil {
+			calls.Add(1)
+		}
+		out := make(map[string]string, len(keys))
+		for _, k := range keys {
+			if missing == nil || !missing(k) {
+				out[k] = "v"
+			}
+		}
+		return out, nil
+	}
 }
 
-// mockDB simulates a database with connection limit and latency
-type mockDB struct {
-	connLimit     int64 // 0 means unlimited, represents max concurrent connections
-	queryLatency  time.Duration
-	sem           *semaphore.Weighted
-	totalQueries  atomic.Int64
-	products      map[string]*Product
-	mu            sync.RWMutex
-	rejectedCount atomic.Int64 // Tracks queries that failed to acquire semaphore
+func benchKeys(n int) []string {
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = "key-" + strconv.Itoa(i)
+	}
+	return keys
 }
 
-func newMockDB(connLimit int64, queryLatency time.Duration) *mockDB {
-	db := &mockDB{
-		connLimit:    connLimit,
-		queryLatency: queryLatency,
-		products:     make(map[string]*Product),
+// waitRefreshes waits for c's background refreshes, so none outlives the benchmark.
+func waitRefreshes(c *Client[*Entry[string]]) {
+	for {
+		busy := false
+		c.asyncRefreshing.Range(func(any, any) bool { busy = true; return false })
+		if !busy {
+			return
+		}
+		runtime.Gosched()
+	}
+}
+
+func BenchmarkGet(b *testing.B) {
+	ctx := context.Background()
+	hit := func(b *testing.B, c *Client[string]) {
+		b.Helper()
+		if _, err := c.Get(ctx, "k"); err != nil { // warm
+			b.Fatal(err)
+		}
+		b.Run("serial", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := c.Get(ctx, "k"); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run("parallel", func(b *testing.B) {
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					if _, err := c.Get(ctx, "k"); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+		})
 	}
 
-	// Initialize 10000 products to simulate realistic scale
-	for i := 1; i <= 10000; i++ {
-		id := fmt.Sprintf("product-%d", i)
-		db.products[id] = &Product{
-			ID:          id,
-			Name:        fmt.Sprintf("Product %d", i),
-			Price:       int64(1000 + rand.Intn(9000)),
-			Stock:       rand.Intn(1000),
-			Description: fmt.Sprintf("Description for product %d", i),
+	b.Run("hit/syncmap", func(b *testing.B) {
+		hit(b, NewClient(NewSyncMap[string](), benchUpstream(nil, nil)))
+	})
+	b.Run("hit/ristretto", func(b *testing.B) {
+		r, err := NewRistrettoCache(DefaultRistrettoCacheConfig[string]())
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer r.Close()
+		hit(b, NewClient(r, benchUpstream(nil, nil)))
+	})
+	b.Run("hit/l2", func(b *testing.B) {
+		// L1 misses every time and finds the key in L2, then backfills L1
+		l1Backend := NewSyncMap[string]()
+		l2 := NewClient(NewSyncMap[string](), benchUpstream(nil, nil))
+		l1 := NewClient(l1Backend, l2)
+		if _, err := l1.Get(ctx, "k"); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = l1Backend.Del(ctx, "k")
+			if _, err := l1.Get(ctx, "k"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("notfound-hit", func(b *testing.B) {
+		c := NewClient(NewSyncMap[string](), benchUpstream(nil, func(string) bool { return true }),
+			NotFoundWithTTL[string](NewSyncMap[time.Time](), time.Hour, 0))
+		_, _ = c.Get(ctx, "k") // records the not-found
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := c.Get(ctx, "k"); !IsErrKeyNotFound(err) {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("stale-hit", func(b *testing.B) {
+		// the upstream keeps answering an old entry, so the key stays stale
+		// and every read that finds no refresh running starts one
+		old := &Entry[string]{Data: "v", CachedAt: time.Now().Add(-time.Minute)}
+		backend := NewSyncMap[*Entry[string]]()
+		_ = backend.Set(ctx, "k", old)
+		c := NewClient(backend, UpstreamFunc[*Entry[string]](func(context.Context, string) (*Entry[string], error) {
+			return old, nil
+		}), EntryWithTTL[string](time.Second, time.Hour), WithServeStale[*Entry[string]](true))
+		defer waitRefreshes(c)
+		b.ReportAllocs()
+		for b.Loop() {
+			if _, err := c.Get(ctx, "k"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("miss", func(b *testing.B) {
+		backend := NewSyncMap[string]()
+		c := NewClient(backend, benchUpstream(nil, nil))
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = backend.Del(ctx, "k")
+			if _, err := c.Get(ctx, "k"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("miss/x-sync-baseline", func(b *testing.B) {
+		// the least a deduplicating read-through can do: a map and x/sync's singleflight
+		var m sync.Map
+		var g singleflight.Group
+		up := benchUpstream(nil, nil)
+		get := func(key string) (string, error) {
+			if v, ok := m.Load(key); ok {
+				return v.(string), nil
+			}
+			v, err, _ := g.Do(key, func() (any, error) {
+				v, err := up.Get(ctx, key)
+				if err == nil {
+					m.Store(key, v)
+				}
+				return v, err
+			})
+			return v.(string), err
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			m.Delete("k")
+			if _, err := get("k"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkGetMany(b *testing.B) {
+	ctx := context.Background()
+	for _, n := range []int{10, 100, 1000} {
+		keys := benchKeys(n)
+		for _, mode := range []string{"hit", "half-miss"} {
+			// half-miss: odd keys do not exist upstream and nothing records
+			// that, so they miss and reach the upstream on every call
+			var missing func(string) bool
+			if mode == "half-miss" {
+				missing = func(k string) bool { return k[len(k)-1]%2 == 1 }
+			}
+			c := NewClient(NewSyncMap[string](), benchUpstream(nil, missing))
+			if _, err := c.GetMany(ctx, keys); err != nil {
+				b.Fatal(err)
+			}
+			b.Run(fmt.Sprintf("%s/n=%d/GetMany", mode, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if _, err := c.GetMany(ctx, keys); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run(fmt.Sprintf("%s/n=%d/loop-Get", mode, n), func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					for _, k := range keys {
+						if _, err := c.Get(ctx, k); err != nil && !IsErrKeyNotFound(err) {
+							b.Fatal(err)
+						}
+					}
+				}
+			})
 		}
 	}
-
-	// Initialize semaphore for connection limit
-	if connLimit > 0 {
-		db.sem = semaphore.NewWeighted(connLimit)
-	}
-
-	return db
 }
 
-func (db *mockDB) Query(ctx context.Context, id string) (*Product, error) {
-	// Acquire connection from semaphore (wait if all connections are busy)
-	if db.sem != nil {
-		if err := db.sem.Acquire(ctx, 1); err != nil {
-			db.rejectedCount.Add(1)
-			return nil, fmt.Errorf("failed to acquire DB connection: %w", err)
+// BenchmarkHotKeyStampede releases many concurrent misses of one key at once;
+// the upstream must be called exactly once per round.
+func BenchmarkHotKeyStampede(b *testing.B) {
+	const n = 64
+	ctx := context.Background()
+	backend := NewSyncMap[string]()
+	var calls, entered atomic.Int64
+	up := UpstreamFunc[string](func(context.Context, string) (string, error) {
+		calls.Add(1)
+		for entered.Load() < n { // hold the fetch until every reader is in
+			runtime.Gosched()
 		}
-		defer db.sem.Release(1)
+		return "v", nil
+	})
+	c := NewClient(backend, up)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = backend.Del(ctx, "k")
+		entered.Store(0)
+		var wg sync.WaitGroup
+		for range n {
+			wg.Go(func() {
+				entered.Add(1)
+				if _, err := c.Get(ctx, "k"); err != nil {
+					b.Error(err)
+				}
+			})
+		}
+		wg.Wait()
 	}
-
-	db.totalQueries.Add(1)
-
-	// Simulate query latency
-	time.Sleep(db.queryLatency)
-
-	db.mu.RLock()
-	product, exists := db.products[id]
-	db.mu.RUnlock()
-
-	if !exists {
-		return nil, &ErrKeyNotFound{}
+	if got := float64(calls.Load()) / float64(b.N); got != 1 {
+		b.Fatalf("upstream calls per stampede = %v, want 1", got)
 	}
-
-	return product, nil
+	b.ReportMetric(float64(calls.Load())/float64(b.N), "upstream-calls/op")
 }
 
-func (db *mockDB) Close() {
-	// No cleanup needed for semaphore
-}
-
-func (db *mockDB) Stats() (total, rejected int64) {
-	return db.totalQueries.Load(), db.rejectedCount.Load()
-}
-
-// BenchmarkScenario represents different DB configurations
-type BenchmarkScenario struct {
-	Name             string
-	DBConnLimit      int64         // Max concurrent DB connections (0=unlimited)
-	DBLatency        time.Duration // Simulated DB query latency
-	FetchTimeout     time.Duration // Timeout for upstream fetch
-	DataFreshTTL     time.Duration
-	DataStaleTTL     time.Duration
-	NotFoundFreshTTL time.Duration
-	NotFoundStaleTTL time.Duration
-	Concurrency      int
-	Duration         time.Duration
-	RequestsFunc     func() string // Generate request pattern
-}
-
-func BenchmarkProductSearch(b *testing.B) {
-	// Realistic traffic pattern: 80% hot, 15% warm, 4% cold, 1% not-found (Pareto principle)
-	realisticTrafficPattern := func() string {
-		r := rand.Intn(1000)
-		switch {
-		case r < 800: // 80% hot products (top 20)
-			return fmt.Sprintf("product-%d", rand.Intn(20)+1)
-		case r < 950: // 15% warm products (21-200)
-			return fmt.Sprintf("product-%d", rand.Intn(180)+21)
-		case r < 990: // 4% cold products (201-1000)
-			return fmt.Sprintf("product-%d", rand.Intn(800)+201)
-		default: // 1% not found
-			return fmt.Sprintf("product-notfound-%d", rand.Intn(50))
+// BenchmarkSetDel writes in parallel while a reader keeps reading the same
+// keys: "same-stripe" puts every key in one stripe, "spread" spreads them.
+func BenchmarkSetDel(b *testing.B) {
+	ctx := context.Background()
+	c := NewClient(NewSyncMap[string](), benchUpstream(nil, nil))
+	spread := benchKeys(1024)
+	var same []string
+	for _, k := range benchKeys(1 << 20) {
+		if c.stripe(k) == c.stripe(spread[0]) {
+			same = append(same, k)
+			if len(same) == len(spread) {
+				break
+			}
 		}
 	}
-
-	scenarios := []BenchmarkScenario{
-		{
-			Name:             "High_Performance_DB",
-			DBConnLimit:      100, // High-performance DB with large connection pool
-			DBLatency:        90 * time.Millisecond,
-			FetchTimeout:     2 * time.Second,
-			DataFreshTTL:     1 * time.Second,
-			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 500 * time.Millisecond,
-			NotFoundStaleTTL: 24 * time.Hour,
-			Concurrency:      600,
-			Duration:         10 * time.Second,
-			RequestsFunc:     realisticTrafficPattern,
-		},
-		{
-			Name:             "Cloud_DB_1000QPS",
-			DBConnLimit:      20, // Target 90-93% utilization
-			DBLatency:        85 * time.Millisecond,
-			FetchTimeout:     1 * time.Second,
-			DataFreshTTL:     5 * time.Second,
-			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 3 * time.Second,
-			NotFoundStaleTTL: 24 * time.Hour,
-			Concurrency:      100,
-			Duration:         10 * time.Second,
-			RequestsFunc:     realisticTrafficPattern,
-		},
-		{
-			Name:             "Shared_DB_100QPS",
-			DBConnLimit:      13, // Target 90-93% utilization
-			DBLatency:        125 * time.Millisecond,
-			FetchTimeout:     5 * time.Second,
-			DataFreshTTL:     10 * time.Second,
-			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 5 * time.Second,
-			NotFoundStaleTTL: 24 * time.Hour,
-			Concurrency:      100,
-			Duration:         10 * time.Second,
-			RequestsFunc:     realisticTrafficPattern,
-		},
-		{
-			Name:             "Constrained_DB_50QPS",
-			DBConnLimit:      8, // Target 90-93% utilization
-			DBLatency:        190 * time.Millisecond,
-			FetchTimeout:     10 * time.Second,
-			DataFreshTTL:     20 * time.Second,
-			DataStaleTTL:     24 * time.Hour,
-			NotFoundFreshTTL: 10 * time.Second,
-			NotFoundStaleTTL: 24 * time.Hour,
-			Concurrency:      100,
-			Duration:         10 * time.Second,
-			RequestsFunc:     realisticTrafficPattern,
-		},
-	}
-
-	for _, scenario := range scenarios {
-		b.Run(scenario.Name, func(b *testing.B) {
-			runScenario(b, scenario)
+	for name, keys := range map[string][]string{"same-stripe": same, "spread": spread} {
+		b.Run(name, func(b *testing.B) {
+			stop := make(chan struct{})
+			var readers sync.WaitGroup
+			readers.Go(func() {
+				for i := 0; ; i++ {
+					select {
+					case <-stop:
+						return
+					default:
+						_, _ = c.Get(ctx, keys[i%len(keys)])
+					}
+				}
+			})
+			defer func() { close(stop); readers.Wait() }()
+			var next atomic.Int64
+			b.ReportAllocs()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					i := next.Add(1)
+					k := keys[i%int64(len(keys))]
+					var err error
+					if i%2 == 0 {
+						err = c.Set(ctx, k, "v")
+					} else {
+						err = c.Del(ctx, k)
+					}
+					if err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
 		})
 	}
 }
 
-func runScenario(b *testing.B, scenario BenchmarkScenario) {
-	// Setup mock DB
-	db := newMockDB(scenario.DBConnLimit, scenario.DBLatency)
-	defer db.Close()
-
-	// Setup cache layers: Memory (L1)
-	// Use freshTTL + staleTTL as cache expiration to enable stale data serving
-	config := DefaultRistrettoCacheConfig[*Entry[*Product]]()
-	config.TTL = scenario.DataFreshTTL + scenario.DataStaleTTL
-
-	l1Cache, err := NewRistrettoCache(config)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer func() { _ = l1Cache.Close() }()
-
-	// Setup not-found cache
-	// Use freshTTL + staleTTL as cache expiration
-	notFoundConfig := DefaultRistrettoCacheConfig[time.Time]()
-	notFoundConfig.TTL = scenario.NotFoundFreshTTL + scenario.NotFoundStaleTTL
-	notFoundCache, err := NewRistrettoCache(notFoundConfig)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer func() { _ = notFoundCache.Close() }()
-
-	// Upstream: DB query wrapped in Entry
-	upstream := UpstreamFunc[*Entry[*Product]](func(ctx context.Context, key string) (*Entry[*Product], error) {
-		product, err := db.Query(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		return &Entry[*Product]{
-			Data:     product,
-			CachedAt: NowFunc(),
-		}, nil
-	})
-
-	// Build client with all features enabled
-	client := NewClient(
-		l1Cache,
-		upstream,
-		EntryWithTTL[*Product](scenario.DataFreshTTL, scenario.DataStaleTTL),
-		NotFoundWithTTL[*Entry[*Product]](notFoundCache, scenario.NotFoundFreshTTL, scenario.NotFoundStaleTTL),
-		WithServeStale[*Entry[*Product]](true),
-		WithFetchTimeout[*Entry[*Product]](scenario.FetchTimeout),
-	)
-
-	// No pre-warming - test cold start performance
+// BenchmarkZipfMixed reads keys drawn from a Zipf distribution over 10,000
+// keys; every 10th key does not exist upstream (and no not-found cache), so
+// those reads miss each time.
+func BenchmarkZipfMixed(b *testing.B) {
+	const n = 10000
 	ctx := context.Background()
-
-	// Statistics
-	var (
-		totalRequests  atomic.Int64
-		successCount   atomic.Int64
-		notFoundCount  atomic.Int64
-		errorCount     atomic.Int64
-		latencies      sync.Map
-		latencyBuckets [10]atomic.Int64 // <1ms, <5ms, <10ms, <50ms, <100ms, <200ms, <500ms, <1s, <2s, >=2s
-	)
-
-	// Start benchmark
-	startTime := time.Now()
-	var wg sync.WaitGroup
-
-	// Launch concurrent workers
-	stopCh := make(chan struct{})
-	for i := 0; i < scenario.Concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for {
-				select {
-				case <-stopCh:
-					return
-				default:
-					// Generate request
-					id := scenario.RequestsFunc()
-
-					reqStart := time.Now()
-					entry, err := client.Get(ctx, id)
-					latency := time.Since(reqStart)
-
-					totalRequests.Add(1)
-
-					if err == nil && entry != nil && entry.Data != nil {
-						successCount.Add(1)
-					} else if IsErrKeyNotFound(err) {
-						notFoundCount.Add(1)
-					} else {
-						errorCount.Add(1)
-					}
-
-					// Record latency
-					recordLatency(&latencyBuckets, latency)
-
-					// Sample latencies (store 1 in every 100 to avoid memory issues)
-					if totalRequests.Load()%100 == 0 {
-						latencies.Store(totalRequests.Load(), latency)
-					}
-
-					// Small sleep to avoid CPU spinning
-					time.Sleep(time.Millisecond)
-				}
+	keys := benchKeys(n)
+	missing := map[string]bool{}
+	for i := 0; i < n; i += 10 {
+		missing[keys[i]] = true
+	}
+	c := NewClient(NewSyncMap[string](), benchUpstream(nil, func(k string) bool { return missing[k] }))
+	if _, err := c.GetMany(ctx, keys); err != nil {
+		b.Fatal(err)
+	}
+	var seed atomic.Uint64
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		z := rand.NewZipf(rand.New(rand.NewPCG(seed.Add(1), 0)), 1.1, 1, n-1)
+		for pb.Next() {
+			if _, err := c.Get(ctx, keys[z.Uint64()]); err != nil && !IsErrKeyNotFound(err) {
+				b.Error(err)
+				return
 			}
-		}(i)
-	}
-
-	// Run for specified duration
-	time.Sleep(scenario.Duration)
-	close(stopCh)
-	wg.Wait()
-
-	elapsed := time.Since(startTime)
-
-	// Calculate statistics
-	total := totalRequests.Load()
-	success := successCount.Load()
-	notFound := notFoundCount.Load()
-	errors := errorCount.Load()
-	dbTotal, dbRejected := db.Stats()
-
-	qps := float64(total) / elapsed.Seconds()
-	cacheHitRate := float64(total-dbTotal) / float64(total) * 100
-
-	// Calculate latency percentiles
-	var allLatencies []time.Duration
-	latencies.Range(func(key, value interface{}) bool {
-		allLatencies = append(allLatencies, value.(time.Duration))
-		return true
-	})
-
-	p50, p95, p99 := calculatePercentiles(allLatencies)
-
-	// Report results
-	b.ReportMetric(qps, "req/s")
-	b.ReportMetric(float64(p50.Microseconds()), "p50_μs")
-	b.ReportMetric(float64(p95.Microseconds()), "p95_μs")
-	b.ReportMetric(float64(p99.Microseconds()), "p99_μs")
-	b.ReportMetric(cacheHitRate, "cache_hit_%")
-	b.ReportMetric(float64(dbTotal), "db_queries")
-	b.ReportMetric(float64(dbRejected), "db_rejected")
-
-	// Print detailed report
-	fmt.Printf("\n")
-	fmt.Printf("========== Scenario: %s ==========\n", scenario.Name)
-	fmt.Printf("Configuration:\n")
-	if scenario.DBConnLimit > 0 {
-		fmt.Printf("  DB Conn Limit:       %d\n", scenario.DBConnLimit)
-	} else {
-		fmt.Printf("  DB Conn Limit:       unlimited\n")
-	}
-	fmt.Printf("  DB Latency:          %v\n", scenario.DBLatency)
-	fmt.Printf("  Fetch Timeout:       %v\n", scenario.FetchTimeout)
-	fmt.Printf("  Data Fresh TTL:      %v\n", scenario.DataFreshTTL)
-	fmt.Printf("  Data Stale TTL:      %v\n", scenario.DataStaleTTL)
-	fmt.Printf("  NotFound Fresh TTL:  %v\n", scenario.NotFoundFreshTTL)
-	fmt.Printf("  NotFound Stale TTL:  %v\n", scenario.NotFoundStaleTTL)
-	fmt.Printf("  Concurrency:         %d\n", scenario.Concurrency)
-	fmt.Printf("  Duration:            %v\n", scenario.Duration)
-	fmt.Printf("\n")
-	fmt.Printf("Results:\n")
-	fmt.Printf("  Total Requests:   %d\n", total)
-	fmt.Printf("  Success:          %d (%.1f%%)\n", success, float64(success)/float64(total)*100)
-	fmt.Printf("  Not Found:        %d (%.1f%%)\n", notFound, float64(notFound)/float64(total)*100)
-	fmt.Printf("  Errors:           %d (%.1f%%)\n", errors, float64(errors)/float64(total)*100)
-	fmt.Printf("  Overall QPS:      %.0f req/s\n", qps)
-	fmt.Printf("\n")
-	fmt.Printf("Cache Performance:\n")
-	fmt.Printf("  Cache Hit Rate:   %.2f%%\n", cacheHitRate)
-	fmt.Printf("  DB Queries:       %d (%.1f%%)\n", dbTotal, float64(dbTotal)/float64(total)*100)
-	actualDBQPS := float64(dbTotal) / elapsed.Seconds()
-	fmt.Printf("  DB QPS:           %.1f req/s\n", actualDBQPS)
-	fmt.Printf("  DB Rejected:      %d\n", dbRejected)
-	if scenario.DBConnLimit > 0 {
-		expectedMaxQueries := float64(scenario.DBConnLimit) * elapsed.Seconds() / scenario.DBLatency.Seconds()
-		dbUtilization := float64(dbTotal) / expectedMaxQueries * 100
-		fmt.Printf("  DB Utilization:   %.1f%% of capacity\n", dbUtilization)
-	}
-	fmt.Printf("\n")
-	fmt.Printf("Latency:\n")
-	fmt.Printf("  P50:              %v\n", p50)
-	fmt.Printf("  P95:              %v\n", p95)
-	fmt.Printf("  P99:              %v\n", p99)
-	fmt.Printf("\n")
-	fmt.Printf("Latency Distribution:\n")
-	printLatencyDistribution(&latencyBuckets, total)
-	fmt.Printf("==========================================\n\n")
-}
-
-func recordLatency(buckets *[10]atomic.Int64, latency time.Duration) {
-	switch {
-	case latency < time.Millisecond:
-		buckets[0].Add(1)
-	case latency < 5*time.Millisecond:
-		buckets[1].Add(1)
-	case latency < 10*time.Millisecond:
-		buckets[2].Add(1)
-	case latency < 50*time.Millisecond:
-		buckets[3].Add(1)
-	case latency < 100*time.Millisecond:
-		buckets[4].Add(1)
-	case latency < 200*time.Millisecond:
-		buckets[5].Add(1)
-	case latency < 500*time.Millisecond:
-		buckets[6].Add(1)
-	case latency < time.Second:
-		buckets[7].Add(1)
-	case latency < 2*time.Second:
-		buckets[8].Add(1)
-	default:
-		buckets[9].Add(1)
-	}
-}
-
-func calculatePercentiles(latencies []time.Duration) (p50, p95, p99 time.Duration) {
-	if len(latencies) == 0 {
-		return 0, 0, 0
-	}
-
-	// Sort latencies
-	sorted := make([]time.Duration, len(latencies))
-	copy(sorted, latencies)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
-	})
-
-	p50 = sorted[len(sorted)*50/100]
-	p95 = sorted[len(sorted)*95/100]
-	p99 = sorted[len(sorted)*99/100]
-
-	return
-}
-
-func printLatencyDistribution(buckets *[10]atomic.Int64, total int64) {
-	labels := []string{
-		"<1ms", "<5ms", "<10ms", "<50ms", "<100ms",
-		"<200ms", "<500ms", "<1s", "<2s", ">=2s",
-	}
-
-	for i, label := range labels {
-		count := buckets[i].Load()
-		percentage := float64(count) / float64(total) * 100
-		bar := ""
-		barLen := int(percentage / 2)
-		for j := 0; j < barLen; j++ {
-			bar += "█"
 		}
-		fmt.Printf("  %-8s %6d (%5.1f%%) %s\n", label, count, percentage, bar)
-	}
+	})
 }
