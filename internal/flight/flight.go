@@ -5,13 +5,17 @@
 // the others, so two overlapping batches never wait on each other.
 package flight
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // Flight is one in-flight fetch of a key.
 type Flight[T any] struct {
-	done  chan struct{}
-	value T
-	err   error
+	published atomic.Bool
+	done      chan struct{}
+	value     T
+	err       error
 }
 
 // Done is closed once the result is published.
@@ -27,8 +31,8 @@ type Group[K comparable, T any] struct {
 }
 
 // Claim returns the key's flight and whether the caller leads it (it was just
-// created). The leader must Publish exactly once and Forget the flight (or
-// Finish, which does both); everyone else waits on Done.
+// created). The leader must Publish and then Forget the flight; everyone else
+// waits on Done.
 func (g *Group[K, T]) Claim(key K) (*Flight[T], bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -43,16 +47,13 @@ func (g *Group[K, T]) Claim(key K) (*Flight[T], bool) {
 	return f, true
 }
 
-// Finish unregisters f, then publishes its result: a caller that sees the
-// result and claims key again starts a new flight.
-func (g *Group[K, T]) Finish(key K, f *Flight[T], value T, err error) {
-	g.Forget(key, f)
-	g.Publish(f, value, err)
-}
-
-// Publish answers f's waiters. f stays registered, so a caller that claims
-// key until Forget joins f and gets its result at once.
+// Publish answers f's waiters, once: a flight has exactly one result, and
+// later calls do nothing. f stays registered, so a caller that claims key
+// until Forget joins f and gets its result at once.
 func (g *Group[K, T]) Publish(f *Flight[T], value T, err error) {
+	if !f.published.CompareAndSwap(false, true) {
+		return
+	}
 	f.value, f.err = value, err
 	close(f.done)
 }
@@ -67,18 +68,13 @@ func (g *Group[K, T]) Forget(key K, f *Flight[T]) {
 	}
 }
 
-// Drop unregisters whatever flight holds key without publishing or
-// interrupting it: its waiters still get its result, and the next Claim
-// starts a new flight.
-func (g *Group[K, T]) Drop(key K) {
+// Drop unregisters whatever flights hold keys without publishing or
+// interrupting them: their waiters still get their results, and the next
+// Claim of a key starts a new flight.
+func (g *Group[K, T]) Drop(keys ...K) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	delete(g.flights, key)
-}
-
-// Len is the number of registered flights.
-func (g *Group[K, T]) Len() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return len(g.flights)
+	for _, key := range keys {
+		delete(g.flights, key)
+	}
 }

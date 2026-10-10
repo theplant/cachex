@@ -1,6 +1,7 @@
 package cachex
 
 import (
+	"context"
 	"math/rand/v2"
 	"time"
 )
@@ -68,15 +69,17 @@ func NewLayer[T any](backend Backend[T], opts ...LayerOption) Layer[T] {
 	return Layer[T]{backend: backend, cfg: cfg}
 }
 
-// entry is what the layer stores, from now on, for an answer the source gave
-// at cachedAt (a value, or notFound): the layer's TTLs count from now, and the
-// entry is no fresher than freshCap and no longer usable than expiresCap (zero:
-// no cap), the bounds of the entry it was copied from. So an upper layer keeps
-// a copy for its own TTL, but never past the entry below. It returns false if
-// the layer does not keep such an answer.
-func (l *Layer[T]) entry(value T, notFound bool, cachedAt, now, freshCap, expiresCap time.Time) (Entry[T], bool) {
+// place is what the layer stores, at now, for answer a: the source's answer
+// (see Cache.answer) or an entry found in a layer below. The layer's TTLs
+// count from now, and the entry is no fresher and no longer usable than a (a
+// zero time in a is no bound). So an upper layer keeps a copy for its own TTL,
+// but never past the entry below. It returns false if the layer does not keep
+// a: a not-found without a not-found TTL, or an entry already rotten; the key
+// is deleted there instead.
+func (l *Layer[T]) place(a Entry[T], now time.Time) (Entry[T], bool) {
 	fresh, stale := l.cfg.fresh, l.cfg.stale
-	if notFound {
+	value := a.Value
+	if a.NotFound {
 		fresh, stale = l.cfg.nfFresh, l.cfg.nfStale
 		if fresh == 0 {
 			return Entry[T]{}, false
@@ -89,21 +92,80 @@ func (l *Layer[T]) entry(value T, notFound bool, cachedAt, now, freshCap, expire
 	}
 	e := Entry[T]{
 		Value:      value,
-		NotFound:   notFound,
-		CachedAt:   cachedAt,
+		NotFound:   a.NotFound,
+		CachedAt:   a.CachedAt,
 		FreshUntil: now.Add(fresh),
 		ExpiresAt:  now.Add(fresh + stale),
 	}
-	if !expiresCap.IsZero() && expiresCap.Before(e.ExpiresAt) {
-		e.ExpiresAt = expiresCap
+	if !a.ExpiresAt.IsZero() && a.ExpiresAt.Before(e.ExpiresAt) {
+		e.ExpiresAt = a.ExpiresAt
 	}
-	if !freshCap.IsZero() && freshCap.Before(e.FreshUntil) {
-		e.FreshUntil = freshCap
+	if !a.FreshUntil.IsZero() && a.FreshUntil.Before(e.FreshUntil) {
+		e.FreshUntil = a.FreshUntil
 	}
 	if e.ExpiresAt.Before(e.FreshUntil) {
 		e.FreshUntil = e.ExpiresAt
 	}
-	return e, true
+	return e, now.Before(e.ExpiresAt)
+}
+
+// answer is the source's answer for a key as an entry: when it answered, and
+// no bounds but the value's max age (see WithMaxAge). Set and SetMany write
+// their values as if the source had answered them.
+func (c *Cache[T]) answer(value T, notFound bool) Entry[T] {
+	now := c.opts.now()
+	e := Entry[T]{Value: value, NotFound: notFound, CachedAt: now}
+	if !notFound && c.maxAge != nil {
+		e.ExpiresAt = now.Add(c.maxAge(value))
+		e.FreshUntil = e.ExpiresAt
+		if !e.ExpiresAt.After(now) {
+			e.ExpiresAt = now // zero means no bound; this one is already over
+		}
+	}
+	return e
+}
+
+// put stores what the layer keeps for answer a under key, or deletes key
+// there (see place).
+func (l *Layer[T]) put(ctx context.Context, key string, a Entry[T], now time.Time) error {
+	if e, ok := l.place(a, now); ok {
+		return l.backend.Set(ctx, key, e)
+	}
+	return l.backend.Del(ctx, key)
+}
+
+// putMany is put for many answers, plus deleting dels, in one call each; keys
+// in skip are left alone. It returns the keys that failed.
+func (l *Layer[T]) putMany(ctx context.Context, answers map[string]Entry[T], dels []string, skip map[string]error, now time.Time) map[string]error {
+	sets := map[string]Entry[T]{}
+	for key, a := range answers {
+		if _, ok := skip[key]; ok {
+			continue
+		}
+		if e, ok := l.place(a, now); ok {
+			sets[key] = e
+		} else {
+			dels = append(dels, key)
+		}
+	}
+	failed := map[string]error{}
+	if len(sets) > 0 {
+		err := l.backend.SetMany(ctx, sets)
+		for key := range sets {
+			if kerr := errForKey(err, key); kerr != nil {
+				failed[key] = kerr
+			}
+		}
+	}
+	if len(dels) > 0 {
+		err := l.backend.DelMany(ctx, dels)
+		for _, key := range dels {
+			if kerr := errForKey(err, key); kerr != nil {
+				failed[key] = kerr
+			}
+		}
+	}
+	return failed
 }
 
 type state int8

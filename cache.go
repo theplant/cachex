@@ -57,10 +57,13 @@ type Cache[T any] struct {
 	wg     sync.WaitGroup // fetches and refreshes started before Close
 }
 
-// flightKey is a key and one of its fetch slots (see WithFetchesPerKey).
+// flightKey is a key and one of its fetch slots (see WithFetchesPerKey). A
+// background refresh has flights of its own: it must not join a fetch that
+// takes a stale entry from below.
 type flightKey struct {
-	key  string
-	slot int
+	key     string
+	slot    int
+	refresh bool
 }
 
 type options struct {
@@ -208,37 +211,23 @@ func (c *Cache[T]) Close() error {
 	return nil
 }
 
-// track counts a piece of background work that Close must wait for, if
-// Close has not been called yet; call the returned done once when it ends.
-func (c *Cache[T]) track() (done func()) {
+// track counts a piece of background work that Close must wait for; call
+// done once when it ends. After Close it reports false, and done does nothing.
+func (c *Cache[T]) track() (done func(), ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return func() {}
+		return func() {}, false
 	}
 	c.wg.Add(1)
-	return c.wg.Done
+	return c.wg.Done, true
 }
 
 // background runs f in a goroutine that Close waits for.
 func (c *Cache[T]) background(f func()) {
-	done := c.track()
+	done, _ := c.track()
 	go func() {
 		defer done()
 		f()
 	}()
-}
-
-// lock takes s for writing like stripe.Stripe.Lock; if ctx ends first, late
-// runs once s is free, and Close waits for it.
-func (c *Cache[T]) lock(ctx context.Context, s *stripe.Stripe, late func()) error {
-	done := c.track()
-	err := s.Lock(ctx, func() {
-		defer done()
-		late()
-	})
-	if err == nil {
-		done() // late never runs
-	}
-	return err
 }
