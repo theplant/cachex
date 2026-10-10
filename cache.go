@@ -57,8 +57,9 @@ type Cache[T any] struct {
 }
 
 // flightKey is a key and one of its fetch slots (see WithFetchesPerKey). A
-// background refresh has flights of its own: it must not join a fetch that
-// takes a stale entry from below.
+// background refresh has flights of its own, always in slot 0 so that a key
+// has one refresh at a time: it must not join a fetch that takes a stale entry
+// from below.
 type flightKey struct {
 	key     string
 	slot    int

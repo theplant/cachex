@@ -57,7 +57,7 @@
 
 ### 升级之后，v1 缓存的数据会怎样？
 
-v2 读不了：存字节的后端把解不出来的数据当作未命中，删掉它并记一条警告，所以最初的读取会回源。换一个 `KeyPrefix`（`gormcachex` 用一张新表）可以跳过这一步。见 [MIGRATION_ZH.md](../MIGRATION_ZH.md)。
+v2 读不了。在 Redis 里，存字节的后端把解不出来的数据当作未命中，删掉它并记一条警告，所以最初的读取会回源；换一个 `KeyPrefix` 可以跳过这一步。`gormcachex` 必须用一张新表：它的列变了，用不了 v1 的表。见 [MIGRATION_ZH.md](../MIGRATION_ZH.md)。
 
 ## 合并回源与二次检查
 

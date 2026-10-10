@@ -110,7 +110,7 @@ sequenceDiagram
 - 问每一次数据源（单个 key 的 `Get`，或批量数据源的一段），连同随后的回填；
 - 写入失败后的失效（它用的也是共享 ctx，见 [write-order.md](write-order.md#失败时)）。
 
-这是 `WithFetchTimeout` 作用范围的唯一定义，其他文档链接到这里。
+设计文档里只在这里完整列出 `WithFetchTimeout` 管哪些步骤，其他分篇链接到这里；godoc 和 README 面向使用者各写一份，改的时候一起改。
 
 决策过程见 [ADR 0007](../adr/0007-detached-fetch-context.md)。
 
@@ -135,7 +135,7 @@ sequenceDiagram
 
 ## 每个 key 的回源数
 
-`WithFetchesPerKey(n)` 允许同一个 key 同时有 n 个读取的在途回源；后台刷新另有自己的在途回源（一个 key 同时最多一个刷新），不算在 n 里。实现上，登记的 key 是 `flightKey{key, slot, refresh}`，n 大于 1 时 `slot` 是 `[0, n)` 里的随机数，每次请求随机落进一份；n 为 1 时 `slot` 恒为 0。用结构体而不是拼字符串，认领时不分配内存。
+`WithFetchesPerKey(n)` 允许同一个 key 同时有 n 个读取的在途回源；后台刷新另有自己的在途回源（一个 key 同时最多一个刷新），不算在 n 里。实现上，登记的 key 是 `flightKey{key, slot, refresh}`，n 大于 1 时读取的 `slot` 是 `[0, n)` 里的随机数，每次请求随机落进一份；n 为 1 时、以及刷新，`slot` 恒为 0。用结构体而不是拼字符串，认领时不分配内存。
 
 - `n = 1`（默认）：完全合并，一个 key 同一时刻只回源一次。
 - `n > 1`：请求分散到 n 份，最多同时回源 n 次。代价是多打下层和数据源，好处是避免单个慢回源拖住所有请求。
@@ -169,7 +169,7 @@ sequenceDiagram
 
 ## 后台刷新
 
-返回陈旧值时发起的后台刷新，用一个 `sync.Map`（`refreshing`）按 key 去重：同一个 key 的刷新还没结束时，不会再发起新的刷新。
+返回陈旧值时发起的后台刷新，按 key 去重靠的就是认领：刷新在发起它的请求里当场认领 `flightKey{key, refresh: true}`，认领到才启动，认领不到说明这个 key 已经有刷新在进行，直接跳过，不等它。所以同一个 key 同一时刻只有一次刷新，和 `WithFetchesPerKey` 无关。认领之前先登记到 `Close` 要等的后台工作里；`Close` 之后不再认领，也就不再发起刷新。刷新用共享 ctx（见[回源用的 ctx](#回源用的-ctx)）；失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。
 
 刷新也走这套登记，但认领的是自己的在途回源（`flightKey.refresh` 为真）：它不加入普通回源，普通读取也不加入它。原因是刷新时下层的陈旧条目不算数，而普通回源会接受下层的陈旧条目；刷新加入普通回源，可能拿着一个陈旧条目就结束了，根本没问数据源。代价是同一个 key 的普通回源和刷新可以同时进行，最多多问一次数据源。写入摘除时两种都摘。见 [ADR 0016](../adr/0016-refresh-has-its-own-flights.md)。
 

@@ -4,8 +4,9 @@
 // cost of decoding on every read.
 //
 // BigCache has one lifetime for every entry (its LifeWindow); set it to at
-// least the longest TTL of the layer. Entries past their ExpiresAt stay until
-// BigCache evicts them, but are never served.
+// least the layer's longest fresh + stale TTL, the not-found TTLs included.
+// Entries past their ExpiresAt stay until BigCache evicts them, but are never
+// served.
 package bigcachex
 
 import (

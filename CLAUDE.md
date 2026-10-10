@@ -15,10 +15,10 @@ Go 泛型多层读穿缓存（module `github.com/theplant/cachex/v2`）：一个
 
 ## 仓库布局
 
-- 根目录是核心包 `cachex`，只依赖标准库：`cache.go`（`Cache`、`New`、选项、`Close`）、`layer.go`（层、`Layer.place` 决定一层为一个回答存什么、`Cache.answer`）、`read.go`（`Get`/`GetMany`、回源、回填、后台刷新；`claimed.settle` 按「发布、回填、注销」收尾，`claimed.run` 管 panic 和 Goexit）、`write.go`（`Set`/`Del`/`SetMany`/`DelMany`、失败后的失效）、`guard.go`（写入顺序守卫：对分片的全部用法，读写路径不直接碰分片）、`types.go`（接口、`ErrNotFound`、`BatchError`、`NewBatchError`）、`codec.go`（`Codec`、条目编码、`Batched`）、`bytes.go`（`ByteBackend`、`ByteEntry`、`Encoded`）。
-- 后端子包：`ottercachex`、`bigcachex`、`rediscachex`、`gormcachex`；字节后端（`bigcachex`、`rediscachex`、`gormcachex`）只实现私有的 `ByteBackend`，`New` 返回 `cachex.Encoded` 包好的后端。`cachextest` 是测试用的内存后端、时钟和契约测试 `TestBackend`、`TestByteBackend`，每个后端都要过。
+- 根目录是核心包 `cachex`，只依赖标准库：`cache.go`（`Cache`、`New`、选项、`Close`）、`layer.go`（层、`Layer.place` 决定一层为一个回答存什么、`Cache.answer`）、`read.go`（`Get`/`GetMany`、回源、回填、后台刷新；在途回源的结果是条目（值或不存在）或错误，数据源的错误只在 `askSource*` 分类一次；`claimed.settle` 按「发布、回填、注销」收尾，`claimed.run` 管 panic 和 Goexit）、`write.go`（`Set`/`Del`/`SetMany`/`DelMany`、失败后的失效）、`guard.go`（写入顺序守卫：对分片的全部用法，读写路径不直接碰分片）、`types.go`（接口、`ErrNotFound`、`BatchError`、`NewBatchError`、`Batched`）、`codec.go`（`Codec` 和内置的编解码器）、`bytes.go`（`ByteBackend`、`ByteEntry`、`Encoded`，以及只有 `Encoded` 用的私有条目编码）。
+- 后端子包：`ottercachex`、`bigcachex`、`rediscachex`、`gormcachex`；字节后端（`bigcachex`、`rediscachex`、`gormcachex`）只实现私有的 `ByteBackend`，`New` 返回 `cachex.Encoded` 包好的后端（`gormcachex` 外面再包一层带 `Migrate` 的 `*Backend[T]`）。`cachextest` 是测试用的内存后端、时钟和契约测试 `TestBackend`、`TestByteBackend`，每个后端都要过。
 - `internal/flight`（合并回源的登记表：`Claim`、只生效一次的 `Publish`、`Forget`、`Drop`）、`internal/stripe`（分片锁）：通用部件，暂不公开。
-- 核心的测试是外部测试包 `cachex_test`，只通过公开接口测；`export_test.go` 只暴露两样：分片编号（`StripeIndex`，给基准测试）和 `Settle`（等后台工作结束，给读完马上查后端的测试）。`gormcachex` 的容器测试用 testcontainers 在 MySQL 和 PostgreSQL 上跑，没有 Docker 时自动跳过。
+- 核心的测试是外部测试包 `cachex_test`，只通过公开接口测；`export_test.go` 只暴露两样：分片编号（`StripeIndex`，给基准测试）和 `Settle`（等后台工作结束，给读完马上查后端的测试）。测试替身用 `helpers_test.go` 的 `hooked`（单 key 和批量调用共用一个钩子），不要再为每个测试单写一个包装后端。`gormcachex` 的容器测试用 testcontainers 在 MySQL 和 PostgreSQL 上跑，没有 Docker 时自动跳过。
 - `tools/bench/<日期-主题>/`：实测的复跑脚本，带 `bench` build tag，平时的 `go test ./...` 不会运行。
 
 ## 常用命令
@@ -50,7 +50,7 @@ go test -tags bench -v -run <Test> ./tools/bench/<目录>/   # 复跑实测
 - **写入先写下层、再写上层，从不写数据源；某一层失败，就删掉它和它上面各层的条目。** 不要改成从上往下写。见 [ADR 0002](docs/adr/0002-bottom-up-writes.md)。
 - **回填必须持分片读锁、核对写入代数，写入之后还要摘除在途回源。** 少任何一步，旧值都可能盖过写入。这些都在 `guard.go`（写入顺序守卫）里，不要在读写路径里绕过它直接用分片。回源按「发布、回填、注销」的顺序收尾，只在 `claimed.settle` 一处，见 [singleflight.md](docs/design/singleflight.md#发布与注销)、[ADR 0003](docs/adr/0003-striped-backfill-guard.md)。
 - **每个在途回源恰好发布一次结果**，panic 和 Goexit 也不例外：`flight.Group.Publish` 只生效一次，`claimed.run` 在 panic 或 Goexit 时给还没发布的发布错误。不要让等待方去等一个永远不会来的结果。见 [ADR 0006](docs/adr/0006-goexit-publishes-an-error.md)。
-- **刷新从不加入普通回源**，普通读取也不加入刷新（`flightKey.refresh`）；写入两种都摘除。见 [ADR 0016](docs/adr/0016-refresh-has-its-own-flights.md)。
+- **刷新从不加入普通回源**，普通读取也不加入刷新（`flightKey.refresh`）；写入两种都摘除。刷新靠认领自己的在途回源去重，`slot` 恒为 0，一个 key 同时只有一次刷新；认领之前先 `track`，否则 `Close` 之后认领到的在途回源永远不会注销。见 [ADR 0016](docs/adr/0016-refresh-has-its-own-flights.md)。
 - **回源用的 ctx 不带领头请求的取消，并标记为共享（`cachex.IsShared`）**，后端不能用它里面属于某个调用方的状态（比如事务）。核心包不认识任何后端。见 [ADR 0007](docs/adr/0007-detached-fetch-context.md)、[ADR 0013](docs/adr/0013-batch-backends-in-subpackages.md)。
 - **批量读里，不存在不是错误**，缺席的 key 就是不存在；整批失败的错误要让每个 key 都失败，不能当成「全部不存在」。唯一的例外是批量数据源整批失败的错误里包着 `ErrNotFound`：那一批 key 读成不存在（不缓存）。层的错误即使包着 `ErrNotFound` 也是失败（`readError`），因为后端用 false 报告不存在。见 [ADR 0004](docs/adr/0004-batch-result-shape.md)、[batch.md](docs/design/batch.md#批量调用要遵守的约定)。
 - **gormcachex 的 key 列条件要用 clause 构造**（`key` 是 MySQL 的保留字），**只返回 key 完全相等的行**，**批量写按字节序加锁**，MySQL 表的 `key` 列只认 `utf8mb4_0900_bin`，**只支持各数据库默认的隔离级别**、不在代码里设置它，**每条语句独立提交、从不进调用方的事务**（否则行锁跨调用持有，和分片锁死锁，见 [ADR 0017](docs/adr/0017-gorm-never-joins-a-caller-transaction.md)）。见 [ADR 0009](docs/adr/0009-gorm-exact-keys-and-collation.md)、[ADR 0010](docs/adr/0010-gorm-deadlock-ordering-and-retry.md)。

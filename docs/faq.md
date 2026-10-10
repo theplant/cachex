@@ -57,7 +57,7 @@ Call it at shutdown, before closing the backends. It waits for the fetches in pr
 
 ### What happens to cached data from v1 after upgrading?
 
-v2 cannot read it: a backend that stores bytes treats data that does not decode as a miss, drops it and logs a warning, so the first reads fetch from the source. Use a new `KeyPrefix` (and, for `gormcachex`, a new table) to skip that. See [MIGRATION.md](../MIGRATION.md).
+v2 cannot read it. In Redis, a backend that stores bytes treats data that does not decode as a miss, drops it and logs a warning, so the first reads fetch from the source; use a new `KeyPrefix` to skip that. `gormcachex` needs a new table: its columns changed, so it cannot use a v1 table. See [MIGRATION.md](../MIGRATION.md).
 
 ## Singleflight and the double-check
 
@@ -65,7 +65,7 @@ v2 cannot read it: a backend that stores bytes treats data that does not decode 
 
 In two layers:
 
-1. **Merged fetches** (primary): concurrent misses of one key fetch it once, across all layers; the other requests wait for that result. `WithFetchesPerKey(n)` allows n concurrent fetches of one key (default 1), trading some load on the layers below for throughput. See [design/singleflight.md](design/singleflight.md) (Chinese).
+1. **Singleflight** (primary): concurrent misses of one key fetch it once, across all layers; the other requests wait for that result. `WithFetchesPerKey(n)` allows n concurrent fetches of one key (default 1), trading some load on the layers below for throughput. See [design/singleflight.md](design/singleflight.md) (Chinese).
 2. **Double-check** (supplementary): request B reads a miss before request A's fetch backfills, but claims the key only after A's fetch has finished; B reads the first layer again instead of fetching again.
 
 ### Is the double-check worth it? Is it on by default?

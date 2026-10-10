@@ -2,6 +2,8 @@
 
 日期：2026-10-10。代码：`benchmark_test.go`。
 
+本文的 v1 指带 `GetMany` 的 v1 开发分支，它没有合进 `main`；`main` 上的 v1 没有 `GetMany`。
+
 ## 问题
 
 原来的 `BenchmarkProductSearch` 每个请求都 `time.Sleep(1ms)`，是闭环负载：QPS 约等于并发数除以 sleep 时间，DB QPS 约等于 key 数除以新鲜期，测出来的主要是配置，不是库。它已经删掉。这一组微基准只测 cachex 自己：数据源都是立即返回，命中路径上没有 sleep。

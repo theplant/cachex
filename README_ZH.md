@@ -70,8 +70,9 @@ products := cachex.New(source, []cachex.Layer[*Product]{
 本身会过期的值（比如 token）用 `WithMaxAge` 按值设寿命上限；没法加方法的第三方类型也能用：
 
 ```go
-tokens := cachex.New(source, []cachex.Layer[*oauth2.Token]{
-    cachex.NewLayer(mem, cachex.TTL(time.Hour, 0)),
+tokenMem, _ := ottercachex.New[*oauth2.Token](ottercachex.Config[*oauth2.Token]{MaximumSize: 10_000})
+tokens := cachex.New(tokenSource, []cachex.Layer[*oauth2.Token]{ // tokenSource 是一个 cachex.Source[*oauth2.Token]
+    cachex.NewLayer[*oauth2.Token](tokenMem, cachex.TTL(time.Hour, 0)),
 }, cachex.WithMaxAge(func(t *oauth2.Token) time.Duration {
     return time.Until(t.Expiry) - time.Minute // 快过期的 token 不再返回
 }))
@@ -138,7 +139,7 @@ if errors.As(err, &be) {
 | `ottercachex` | 内存里的值 | 必须设 `MaximumSize`（条目数）或 `MaximumWeight` 加 `Weigher`；每个条目各自到期 |
 | `bigcachex` | 内存里编码后的条目 | 数百万条目、GC 在 profile 里显眼时使用；每次读取都要解码 |
 | `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline |
-| `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 需要 8.0.17 及以上，key 列为 `utf8mb4_0900_bin`；只在各数据库默认隔离级别下测过；key 连同 `KeyPrefix` 最长 255 个字符；过期的行不会自动删除 |
+| `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 只支持 8.0.17 及以上；key、隔离级别、过期的行见注意事项 |
 | `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`，以及给自写后端用的契约测试 `TestBackend`、`TestByteBackend` |
 
 `rediscachex.New` 和 `bigcachex.New` 返回 `cachex.Backend[T]`；`gormcachex.New` 返回 `*gormcachex.Backend[T]`，它也是一个 `cachex.Backend[T]`，另有 `Migrate`。

@@ -246,4 +246,3 @@ func TestBatchErrorMessage(t *testing.T) {
 	err := &cachex.BatchError{Errors: map[string]error{"b": errBoom, "a": errBoom, "c": errBoom, "d": errBoom}}
 	assert.Equal(t, "cachex: 4 keys failed; a: boom; b: boom; c: boom; and 1 more", err.Error())
 }
-

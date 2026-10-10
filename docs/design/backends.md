@@ -44,11 +44,11 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 
 ## 字节后端与 Encoded
 
-`bigcachex`、`rediscachex`、`gormcachex` 存的是字节。它们各自只实现一个私有的 `ByteBackend`，`New` 返回 `cachex.Encoded` 包好的后端；条目怎么编码、解不出来怎么办、已经腐烂的条目怎么处理，都只在 `Encoded` 里写一次（见 [ADR 0015](../adr/0015-byte-backends-through-encoded.md)）。自写的字节存储也这样做：实现 `ByteBackend`，再用 `Encoded` 包装。
+`bigcachex`、`rediscachex`、`gormcachex` 存的是字节。它们各自只实现一个私有的 `ByteBackend`，`New` 返回 `cachex.Encoded` 包好的后端（`gormcachex` 外面再包一层 `*Backend[T]`，加上 `Migrate`）；条目怎么编码、解不出来怎么办、已经腐烂的条目怎么处理，都只在 `Encoded` 里写一次（见 [ADR 0015](../adr/0015-byte-backends-through-encoded.md)）。自写的字节存储也这样做：实现 `ByteBackend`，再用 `Encoded` 包装。
 
 ### 编码
 
-值的编码由 `Codec[T]` 负责，条目的其余字段由 `cachex.EncodeEntry` / `DecodeEntry` 统一编码：
+值的编码由 `Codec[T]` 负责，条目的其余字段由 `Encoded` 内部统一编码（编解码函数不公开，后端碰不到）：
 
 | 字节 | 内容 |
 |---|---|
@@ -68,6 +68,8 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 ### 解码失败算未命中
 
 格式不对、标志位不对、值解不出来，`Encoded` 都记一条 WARN `cachex: dropped an entry that does not decode`、删掉这个 key，报告没有。读取照常回源，结果覆盖坏数据。这样结构体发生不兼容的改动后，旧数据不会让读取一直报错。
+
+这次删除不经过写入顺序守卫，可能删掉并发 `Set` 刚写进来的新值。代价只是多一次未命中，不会让旧值留下来，所以不值得为它加锁。
 
 但 JSON 解码很宽松：字段改了名，旧数据会照样解码成功，那个字段是零值。所以结构体有不兼容的改动时，换一个 `KeyPrefix`。
 
@@ -115,7 +117,7 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 ```go
 type row struct {
     Key       string    `gorm:"not null;primaryKey;size:255"`
-    Value     []byte    `gorm:"not null"`       // EncodeEntry 的结果
+    Value     []byte    `gorm:"not null"`       // Encoded 编码后的条目
     ExpiresAt time.Time `gorm:"not null;index"` // 给清理腐烂的行用
     UpdatedAt time.Time `gorm:"not null"`
 }

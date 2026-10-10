@@ -82,7 +82,7 @@ Redis 和 otter 用 `ExpiresAt` 做原生过期，所以不需要再单独给后
 1. 立即返回它（值或 `ErrNotFound`）；
 2. 在后台为这个 key 发起一次**刷新**。
 
-刷新按 key 去重：同一个 key 的刷新还没结束时，不会再发起第二次。刷新时**下层的陈旧条目不算数**，要么找到新鲜的条目，要么问数据源；所以它认领自己的在途回源，不和普通回源合并（见 [singleflight.md](singleflight.md#后台刷新)）。它用的 ctx 去掉了调用方的取消。刷新失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。`Close` 之后不再发起刷新。
+刷新时**下层的陈旧条目不算数**，要么找到新鲜的条目，要么问数据源。同一个 key 同一时刻只有一次刷新；它怎么去重、为什么不和普通回源合并、失败了怎么办，见 [singleflight.md](singleflight.md#后台刷新)。
 
 ```mermaid
 sequenceDiagram

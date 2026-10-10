@@ -7,7 +7,7 @@
 `GetMany` 该返回哪种形态？从性能角度看，哪种最快？
 
 - A. `map[string]T`：不存在的 key 不放进 map（现在的做法）
-- B. `map[string]Result[T]`：每个 key 都有一项，不存在用 `Err = ErrKeyNotFound` 表示
+- B. `map[string]Result[T]`：每个 key 都有一项，不存在用 `Err = ErrKeyNotFound`（v1 的名字）表示
 - C. `[]Result[T]`：按请求 key 的顺序一一对应
 
 ## 方法

@@ -105,7 +105,7 @@ flowchart LR
 
 | 选项 | 默认 | 作用 | 详见 |
 |---|---|---|---|
-| `WithFetchTimeout(d)` | `DefaultFetchTimeout` = 60 秒 | 各自限时：二次检查；读下面每一层，连同回填它找到的结果；每次问数据源，连同回填它的回答；写入失败后的失效 | [singleflight.md](design/singleflight.md#回源用的-ctx) |
+| `WithFetchTimeout(d)` | `DefaultFetchTimeout` = 60 秒 | 回源的每一步、写入失败后的失效，各自受它限时 | [singleflight.md](design/singleflight.md#回源用的-ctx) |
 | `WithFetchesPerKey(n)` | `DefaultFetchesPerKey` = 1 | 同一个 key 同时最多几个读取的回源（后台刷新另算一个）；1 表示并发未命中共用一次回源 | [singleflight.md](design/singleflight.md#每个-key-的回源数) |
 | `WithGetManyConcurrency(n)` | `DefaultGetManyConcurrency` = 16 | 一次 `GetMany` 同时向数据源发出的请求数：数据源不是批量数据源时是 `Get` 调用，否则是分段调用 | [batch.md](design/batch.md#回源怎么发) |
 | `WithGetManyChunkSize(n)` | 0（不分段） | 发往批量数据源的每次调用最多多少个 key；每段一返回就回答并回填 | [batch.md](design/batch.md#回源怎么发) |
@@ -127,7 +127,7 @@ flowchart LR
 - `New`：数据源为 nil；超时、回源数、并发数不大于 0；分段为负；日志或时钟为 nil；`WithMaxAge` 的参数类型不是 `Cache` 的 `T`；某一层不是用 `NewLayer` 建的（零值的 `Layer`）。
 - `NewLayer`：后端为 nil；没有 `TTL` 或新鲜期不大于 0；TTL 为负；`NotFoundTTL` 只有陈旧期没有新鲜期；抖动不在 `[0, 1)`。
 
-`Close()` 等待它之前启动的后台工作结束：正在进行的回源和它们的回填、后台刷新、放弃等待的写入在分片空出后补做的失效；之后不再发起后台刷新。它不关闭后端，关闭之后读写照常可用。所以关闭后端之前先调用 `Close`。这是 `Close` 等什么的唯一定义，其他文档照此简述或链接到这里。
+`Close()` 等待它之前启动的后台工作结束：正在进行的回源和它们的回填、后台刷新、放弃等待的写入在分片空出后补做的失效；之后不再发起后台刷新。它不关闭后端，关闭之后读写照常可用。所以关闭后端之前先调用 `Close`。设计文档里只在这里完整列出 `Close` 等什么，分篇只提一句或链接到这里；godoc、README、MIGRATION、FAQ 面向使用者各写一份，改的时候一起改。
 
 ## 分篇
 

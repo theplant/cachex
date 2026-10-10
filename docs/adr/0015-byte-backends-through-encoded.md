@@ -17,6 +17,7 @@
 ## 后果
 
 - `rediscachex.New`、`bigcachex.New` 返回 `cachex.Backend[T]`，原来的 `rediscachex.Backend`、`bigcachex.Backend` 类型没有了；`gormcachex.New` 仍返回 `*gormcachex.Backend[T]`，它嵌入 `cachex.Backend[T]`，另有 `Migrate`。
+- 条目的编解码函数也改为私有，只有 `Encoded` 用：原来公开的 `EncodeEntry`/`DecodeEntry` 注释里还在教后端自己处理解码失败，留着它们，后端就有路可以绕过这条规则。
 - 自写的字节存储实现 `ByteBackend`，再用 `Encoded` 包装；存值本身、只有单 key 能力的存储仍然实现 `SingleBackend` 再用 `Batched` 包装。
 - `WithNow` 设的时钟离真实时间很远时（比如从 1970 年开始的 `cachextest.Clock`），按它算出的 `ExpiresAt` 在真实时钟看来早已过去，字节后端和 `ottercachex` 会当场丢掉条目，于是每次都未命中。这类测试用 `cachextest.Map`，或者让测试时钟从 `time.Now()` 开始。
 - 多一层间接调用：`bigcachex` 第一层命中约慢 8ns（94ns → 102ns）；写入的基准变化在 5% 以内；第二层命中反而快了约 38%（`Get/hit/l2` 3.99µs → 2.48µs）。

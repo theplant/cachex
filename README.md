@@ -70,8 +70,9 @@ products := cachex.New(source, []cachex.Layer[*Product]{
 Values that expire on their own, such as tokens, get a per-value cap with `WithMaxAge`; it works on types you cannot add methods to:
 
 ```go
-tokens := cachex.New(source, []cachex.Layer[*oauth2.Token]{
-    cachex.NewLayer(mem, cachex.TTL(time.Hour, 0)),
+tokenMem, _ := ottercachex.New[*oauth2.Token](ottercachex.Config[*oauth2.Token]{MaximumSize: 10_000})
+tokens := cachex.New(tokenSource, []cachex.Layer[*oauth2.Token]{ // tokenSource is a cachex.Source[*oauth2.Token]
+    cachex.NewLayer[*oauth2.Token](tokenMem, cachex.TTL(time.Hour, 0)),
 }, cachex.WithMaxAge(func(t *oauth2.Token) time.Duration {
     return time.Until(t.Expiry) - time.Minute // never serve a token about to expire
 }))
@@ -139,7 +140,7 @@ if errors.As(err, &be) {
 | `ottercachex` | values in memory | `MaximumSize` (entries) or `MaximumWeight` with `Weigher` is required; each entry expires at its own time |
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
 | `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys |
-| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL needs 8.0.17+ and a `utf8mb4_0900_bin` key column; tested at each database's default isolation level only; keys up to 255 characters including `KeyPrefix`; expired rows are not deleted for you |
+| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL 8.0.17+ only; see Pitfalls for keys, isolation and expired rows |
 | `cachextest` | values in memory, unbounded | For tests only, with `Clock`, and `TestBackend` and `TestByteBackend`, contract tests for your own backends |
 
 `rediscachex.New` and `bigcachex.New` return a `cachex.Backend[T]`; `gormcachex.New` returns a `*gormcachex.Backend[T]`, which is one and adds `Migrate`.

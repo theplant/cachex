@@ -27,7 +27,7 @@ The Linux numbers come from a VM on a laptop, not from a server. The machine was
 
 ## Results: v1 → v2
 
-Time per operation, median. v1 is the last v1 code (after `github.com/pkg/errors` was dropped), its benchmarks renamed to v2's.
+Time per operation, median. v1 is the last v1 development code, with `GetMany` (which never reached `main`) and after `github.com/pkg/errors` was dropped; its benchmarks are renamed to v2's.
 
 | Benchmark | What it measures | Linux v1 | Linux v2 | macOS v1 | macOS v2 | Allocs v1 → v2 |
 |---|---|---|---|---|---|---|

@@ -2,7 +2,7 @@
 
 English | [中文](MIGRATION_ZH.md)
 
-v2 is a new major version: a new import path, a new API, and a new storage format. Cached data is disposable, so upgrading costs one cold start, not a data migration. Items marked † already changed in the last v1 releases (the ones with `GetMany`); if you run one of those, they are not new to you.
+v2 is a new major version: a new import path, a new API, and a new storage format. Cached data is disposable, so upgrading costs one cold start, not a data migration.
 
 ## Import path
 
@@ -18,15 +18,14 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 |---|---|
 | `Client[T]`, `NewClient(backend, upstream, opts...)` | `Cache[T]`, `New(source, layers, opts...)` |
 | one `Client` per layer, chained through `upstream` | one `Cache` with `[]Layer[T]`, top layer first; each layer is `NewLayer(backend, layerOpts...)` |
-| `Cache[T]` (backend interface), `BatchCache[T]` | `Backend[T]`, batch methods included; `SingleBackend[T]` + `Batched` for single-key stores |
-| `Upstream[T]`, `UpstreamFunc[T]`, `BatchUpstream[T]` | `Source[T]`, `SourceFunc[T]`, `BatchSource[T]` |
+| `Cache[T]` (backend interface) | `Backend[T]`, batch methods included; `SingleBackend[T]` + `Batched` for single-key stores |
+| `Upstream[T]`, `UpstreamFunc[T]` | `Source[T]`, `SourceFunc[T]` |
 | `ErrKeyNotFound`, `IsErrKeyNotFound(err)` | `ErrNotFound`, `errors.Is(err, cachex.ErrNotFound)`; the `Cached`/`CacheState` fields are gone |
 | `Entry[T]`, `EntryWithTTL`, `WithStale`, `WithServeStale` | layer option `TTL(fresh, stale)`: a stale TTL above zero is serve-stale. Values are plain `T` |
 | `NotFoundWithTTL`, `WithNotFound` (a second backend) | layer option `NotFoundTTL(fresh, stale)`, kept in the same backend |
 | a custom staleness check on the value | `WithMaxAge(func(T) time.Duration)` for values that expire on their own; put a version into the key for "invalidate everything" |
 | `WithFetchConcurrency` | `WithFetchesPerKey` |
-| `WithGetManyFetchConcurrency` | `WithGetManyConcurrency` |
-| `WithGetManyChunkSize`, `WithFetchTimeout`, `WithLogger`, `WithDoubleCheck` | same names, no type parameter |
+| `WithFetchTimeout`, `WithLogger`, `WithDoubleCheck` | same names, no type parameter |
 | `NowFunc`, `MockClock` | `WithNow(func() time.Time)`, `cachextest.Clock` |
 | `DefaultFetchTimeout` and other `Default*` variables | constants |
 | `Transform`, `JSONTransform`, `StringJSONTransform` | removed: byte-storing backends take a `Codec[T]` (default `DefaultCodec`); your own store of bytes implements `ByteBackend` and is wrapped with `Encoded(b, codec, logger)` |
@@ -36,7 +35,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 | `GORMCache` | `gormcachex.New`, which returns a `*gormcachex.Backend[T]` with `Migrate` |
 | `WithGORMTx`, `GetGORMTx` | removed: `gormcachex` never joins your transaction, see below |
 | `SyncMap` | `cachextest.Map`, for tests only (unbounded) |
-| — | `Cache.SetMany`, `Cache.DelMany`, `Cache.Close`, `IsShared` |
+| — | `Cache.GetMany` with `BatchSource[T]`, `WithGetManyConcurrency` and `WithGetManyChunkSize`; `Cache.SetMany`, `Cache.DelMany`, `Cache.Close`, `IsShared` |
 | — | `cachextest.TestBackend(t, newBackend, values)` and `cachextest.TestByteBackend(t, newBackend)`, contract tests for your own backends |
 
 ## Behavior
@@ -47,15 +46,15 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **Jitter is on by default.** Each entry's fresh period is shortened at random by up to 10% (`DefaultJitter`), never lengthened. *What to do:* nothing, or `Jitter(0)` to turn it off.
 
-**Writes go bottom up and never write the source.** † `Set`, `Del`, `SetMany` and `DelMany` write the lowest layer first. If a layer fails, the key is dropped from that layer and every layer above it, and the error is returned. *What to do:* change the source first, then write through the same `Cache`.
+**Writes go bottom up and never write the source.** `Set`, `Del`, `SetMany` and `DelMany` write the lowest layer first; in v1, each client wrote its own backend, then the next one down. If a layer fails, the key is dropped from that layer and every layer above it, and the error is returned. *What to do:* change the source first, then write through the same `Cache`.
 
 **`Del` only invalidates.** v1 recorded a "does not exist" on `Del` when `WithNotFound` was configured, so a `Del` after an update hid the updated row until that record expired. v2 drops the key from every layer; the next read asks the source. *What to do:* nothing; if you relied on `Del` meaning "deleted", the next read records it.
 
-**Fetches outlive their caller.** † A fetch is shared by every request of the key, so it does not end with the caller that started it; its ctx keeps the caller's values but not its cancellation, and `IsShared(ctx)` reports it. *What to do:* nothing; a backend you write must not use caller state, such as a transaction, from such a ctx.
+**Fetches outlive their caller.** A fetch is shared by every request of the key, so it does not end with the caller that started it; its ctx keeps the caller's values but not its cancellation, and `IsShared(ctx)` reports it. *What to do:* nothing; a backend you write must not use caller state, such as a transaction, from such a ctx.
 
-**A fetch that panics or calls `runtime.Goexit` answers every waiter with an error.** † In v1, waiters of a Goexit'ed fetch waited until their own ctx ended.
+**A fetch that panics or calls `runtime.Goexit` answers every waiter with an error.** In v1, waiters of a Goexit'ed fetch waited until their own ctx ended.
 
-**`DoubleCheckAuto` re-reads the first layer only if this `Cache` wrote the key's stripe since the request read it.** † In v1 it was on whenever `WithNotFound` was configured. Use `DoubleCheckEnabled` to see what other processes wrote to a shared first layer.
+**`DoubleCheckAuto` re-reads the first layer only if this `Cache` wrote the key's stripe since the request read it.** In v1 it was on whenever `WithNotFound` was configured. Use `DoubleCheckEnabled` to see what other processes wrote to a shared first layer.
 
 **Data that does not decode is a miss.** In v1, a value the codec could not read (after a type change, say) failed every `Get` until it expired. v2's byte-storing backends (through `cachex.Encoded`) drop it, log a warning, and the read fetches anew.
 
@@ -65,9 +64,9 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **Backends expire entries by the wall clock.** `WithNow` (v1's `NowFunc`) sets the clock the `Cache` judges entries by, but Redis, otter and the byte-storing backends drop an entry once its `ExpiresAt` has passed by `time.Now`. *What to do:* in tests that use a `cachextest.Clock` with such a backend, start the clock at `time.Now()`.
 
-**MySQL needs 8.0.17 or later; MariaDB is not supported.** † `Migrate` creates the table with a `utf8mb4_0900_bin` key column and rejects an existing table whose key column uses another collation, with the `ALTER TABLE` statement that converts it. Only each database's default isolation level is supported.
+**MySQL needs 8.0.17 or later; MariaDB is not supported.** `Migrate` creates the table with a `utf8mb4_0900_bin` key column and rejects an existing table whose key column uses another collation, with the `ALTER TABLE` statement that converts it. Only each database's default isolation level is supported.
 
-**Batch writes are best effort.** † `SetMany`/`DelMany` of the `Cache` and of every backend try every key and list the failed ones in a `*BatchError`.
+**Batch writes are best effort.** `SetMany`/`DelMany` of the `Cache` and of every backend try every key and list the failed ones in a `*BatchError`.
 
 **`GetMany` claims every key up front.** With a source that is not a `BatchSource`, a concurrent `Get` of a key queued in a large `GetMany` waits for its turn. *What to do:* implement `BatchSource` on sources used with `GetMany`.
 

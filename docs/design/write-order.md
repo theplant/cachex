@@ -93,12 +93,7 @@ sequenceDiagram
 
 ## 为什么不是每个 key 一把锁
 
-最直接的想法是 `map[string]*sync.Mutex`。问题在于锁本身的生命周期：
-
-- **内存没有上限**：缓存里有多少个 key，就有多少把锁。
-- **什么时候删锁**：不能用完就删，因为另一个 goroutine 可能刚拿到这把锁的指针、正准备加锁。要安全地删，就得加引用计数，再用一把全局锁保护 map，复杂度和争用都上来了。
-
-**分片锁**（lock striping）换了个思路：准备**固定数量**的锁，每个 key 按哈希落到其中一把上。锁的数量和 key 的数量无关，不需要创建，也不需要删除。一个 `Cache` 只有一套分片，覆盖它的所有层。
+每个 key 一把锁，锁的数量随 key 数无限增长，安全删除还要引用计数加一把全局锁（其他考虑过的方案见 [ADR 0003](../adr/0003-striped-backfill-guard.md)）。**分片锁**（lock striping）准备**固定数量**的锁，每个 key 按哈希落到其中一把上，不需要创建，也不需要删除。一个 `Cache` 只有一套分片（`internal/stripe` 的 `stripe.Set`，4096 个 `stripe.Stripe`），覆盖它的所有层。
 
 ```mermaid
 flowchart LR
@@ -108,28 +103,7 @@ flowchart LR
     s0["分片 0 … 4095<br/>固定 4096 个"]
 ```
 
-不同的 key 可能落到同一个分片（上图的 `user:42` 和 `order:9`）。这不影响正确性，只是它们会共用一把锁，代价见文末。
-
-```go
-// package stripe
-const Count = 4096
-
-type Stripe struct {
-    mu    sync.RWMutex  // 写入持写锁；回填持读锁
-    gen   atomic.Uint64 // 写入代数：每次写入加 1
-    fills atomic.Uint64 // 每次回填加 1
-}
-
-type Set struct {
-    seed    maphash.Seed
-    stripes [Count]Stripe
-}
-
-func (s *Set) Index(key string) int  { return int(maphash.String(s.seed, key) % Count) }
-func (s *Set) For(key string) *Stripe { return &s.stripes[s.Index(key)] }
-```
-
-哈希用标准库的 `hash/maphash`，每个 `Cache` 在创建时随机生成种子。所以同一个 key 在不同进程、不同 `Cache` 里落到的分片一般不同，别人也没法刻意构造一批 key 全部挤进同一个分片。
+不同的 key 可能落到同一个分片（上图的 `user:42` 和 `order:9`）。这不影响正确性，只是它们会共用一把锁，代价见文末。哈希用标准库的 `hash/maphash`，每个 `Cache` 在创建时随机生成种子，所以同一个 key 在不同进程、不同 `Cache` 里落到的分片一般不同，别人也没法刻意构造一批 key 全部挤进同一个分片。
 
 ## 一个分片里有什么
 
@@ -266,6 +240,8 @@ sequenceDiagram
 | `beginFills` | 批量回填 | 同上，每个分片只拿一次读锁，返回可以落下的回填 |
 
 写入结束时的「写入代数 +1、摘除在途回源」（`countWrite`）对部分失败的写入同样执行。
+
+分片本身留在 `internal/stripe`，没有并进 `guard.go`：其中只有 `Lock(ctx, late)` 有真正的逻辑（见下文「等写锁时尊重 ctx」），它的时序要直接测；核心包的测试只走公开接口，并进来就只能隔着 `Cache` 去测它。`internal/stripe` 的其余方法是对读写锁和计数器的一层薄包装，只有守卫调用。
 
 ## 批量为什么不会死锁
 
