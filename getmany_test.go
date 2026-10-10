@@ -90,6 +90,30 @@ func TestGetMany(t *testing.T) {
 		assert.Len(t, be.Errors, 2)
 	})
 
+	t.Run("a batch source's ErrNotFound reads as not found, and is not cached", func(t *testing.T) {
+		for name, fail := range map[string]func(*batchSource){
+			"whole call": func(s *batchSource) { s.failAll = fmt.Errorf("no rows: %w", cachex.ErrNotFound) },
+			"per key":    func(s *batchSource) { s.fail["a"], s.fail["x"] = cachex.ErrNotFound, cachex.ErrNotFound },
+		} {
+			t.Run(name, func(t *testing.T) {
+				src := newBatchSource(map[string]string{"a": "1"})
+				fail(src)
+				mem := cachextest.NewMap[string]()
+				c := cachex.New[string](src, []cachex.Layer[string]{
+					cachex.NewLayer[string](mem, cachex.TTL(time.Minute, 0), cachex.NotFoundTTL(time.Minute, 0)),
+				})
+				for range 2 {
+					m, err := c.GetMany(ctx, []string{"a", "x"})
+					require.NoError(t, err)
+					assert.Empty(t, m)
+					cachex.Settle(c)
+				}
+				assert.Equal(t, 0, mem.Len(), "nothing is cached")
+				assert.Len(t, src.batchCalls(), 2, "so each read asks again")
+			})
+		}
+	})
+
 	t.Run("a first layer that cannot be read fails its keys", func(t *testing.T) {
 		mem := newFaulty[string](cachextest.NewMap[string]())
 		mem.failOn("get", errBoom)

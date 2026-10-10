@@ -22,7 +22,7 @@ import (
 func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 	var seen uint64
 	if len(c.layers) > 0 {
-		seen = c.stripes.For(key).Epoch() // before reading, see shouldDoubleCheck
+		seen = c.epoch(key) // before reading, see shouldDoubleCheck
 		e, ok, err := c.layers[0].backend.Get(ctx, key)
 		if err != nil {
 			var zero T
@@ -64,7 +64,7 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 	missKeys, missSeen := keys, seen
 	if len(c.layers) > 0 {
 		for i, key := range keys {
-			seen[i] = c.stripes.For(key).Epoch() // before reading, see shouldDoubleCheck
+			seen[i] = c.epoch(key) // before reading, see shouldDoubleCheck
 		}
 		es, err := c.layers[0].backend.GetMany(ctx, keys)
 		now := c.opts.now()
