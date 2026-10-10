@@ -54,10 +54,21 @@ func isDeadlock(err error) bool {
 	return strings.Contains(s, "deadlock") || strings.Contains(s, "40p01") || strings.Contains(s, "(40001)")
 }
 
+// expectation is what a strategy must show for the run to be valid.
+type expectation int
+
+const (
+	expectDeadlocks        expectation = iota // must reproduce the race, or the load did not exercise it
+	expectNoneOnPG                            // no deadlocks on PostgreSQL; MySQL's gap locks may still cause a few
+	expectNoFailures                          // no deadlocks and no errors at all
+	expectNoFailuresSerial                    // same, and at most one write inside the lock at a time
+)
+
 type strategy struct {
-	name string
-	set  func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, values map[string]string) error
-	del  func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, keys []string) error
+	name   string
+	expect expectation
+	set    func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, values map[string]string) error
+	del    func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, keys []string) error
 }
 
 var keyCol = clause.Column{Name: "key"}
@@ -100,6 +111,17 @@ func anys(keys []string) []any {
 	return out
 }
 
+// inLock and maxInLock check that the table lock really serializes writes.
+var inLock, maxInLock atomic.Int32
+
+func locked(f func() error) error {
+	n := inLock.Add(1)
+	for m := maxInLock.Load(); n > m && !maxInLock.CompareAndSwap(m, n); m = maxInLock.Load() {
+	}
+	defer inLock.Add(-1)
+	return f()
+}
+
 // tableLocked serializes every write to the table: a named lock on MySQL, held
 // on one connection around the whole transaction (taken before BEGIN, released
 // after COMMIT); an advisory transaction lock on PostgreSQL. Either has the
@@ -110,7 +132,7 @@ func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(ctx cont
 			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "bench:"+table).Error; err != nil {
 				return err
 			}
-			return f(cachex.WithGORMTx(ctx, tx))
+			return locked(func() error { return f(cachex.WithGORMTx(ctx, tx)) })
 		})
 	}
 	return db.WithContext(ctx).Connection(func(conn *gorm.DB) error {
@@ -118,21 +140,23 @@ func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(ctx cont
 			return err
 		}
 		defer conn.Exec("SELECT RELEASE_LOCK(?)", "bench:"+table)
-		return conn.Transaction(func(tx *gorm.DB) error { return f(cachex.WithGORMTx(ctx, tx)) })
+		return conn.Transaction(func(tx *gorm.DB) error {
+			return locked(func() error { return f(cachex.WithGORMTx(ctx, tx)) })
+		})
 	})
 }
 
 var strategies = []strategy{
-	{name: "unordered", set: rawSet(false), del: rawDel(false)},
-	{name: "ordered", set: rawSet(true), del: rawDel(true)},
-	{name: "ordered+retry (GORMCache)",
+	{name: "unordered", expect: expectDeadlocks, set: rawSet(false), del: rawDel(false)},
+	{name: "ordered", expect: expectNoneOnPG, set: rawSet(true), del: rawDel(true)},
+	{name: "ordered+retry (GORMCache)", expect: expectNoFailures,
 		set: func(ctx context.Context, _ *gorm.DB, c *cachex.GORMCache[string], _ string, v map[string]string) error {
 			return c.SetMany(ctx, v)
 		},
 		del: func(ctx context.Context, _ *gorm.DB, c *cachex.GORMCache[string], _ string, k []string) error {
 			return c.DelMany(ctx, k)
 		}},
-	{name: "table lock",
+	{name: "table lock", expect: expectNoFailuresSerial,
 		set: func(ctx context.Context, db *gorm.DB, c *cachex.GORMCache[string], table string, v map[string]string) error {
 			return tableLocked(ctx, db, table, func(ctx context.Context) error { return c.SetMany(ctx, v) })
 		},
@@ -186,7 +210,9 @@ func TestDeadlockStrategies(t *testing.T) {
 			c := cachex.NewGORMCache[string](&cachex.GORMCacheConfig{DB: db, TableName: table})
 			require.NoError(t, c.Migrate(ctx))
 
-			var deadlocks, ops atomic.Int64
+			var deadlocks, failures, ops atomic.Int64
+			var sample atomic.Value // one real deadlock error, to show what was counted
+			maxInLock.Store(0)
 			start := time.Now()
 			var wg sync.WaitGroup
 			for range workers {
@@ -210,7 +236,9 @@ func TestDeadlockStrategies(t *testing.T) {
 						ops.Add(1)
 						if isDeadlock(err) {
 							deadlocks.Add(1)
+							sample.CompareAndSwap(nil, err.Error())
 						} else if err != nil {
+							failures.Add(1)
 							t.Errorf("%s/%s: %v", d.name, st.name, err)
 						}
 					}
@@ -220,6 +248,27 @@ func TestDeadlockStrategies(t *testing.T) {
 			elapsed := time.Since(start)
 			t.Logf("%-8s %-26s deadlocks %4d / %d   %7.2fs   %6.0f ops/s",
 				d.name, st.name, deadlocks.Load(), ops.Load(), elapsed.Seconds(), float64(ops.Load())/elapsed.Seconds())
+			if msg, ok := sample.Load().(string); ok {
+				t.Logf("    sample: %.140s", msg)
+			}
+
+			switch st.expect {
+			case expectDeadlocks:
+				if deadlocks.Load() == 0 {
+					t.Errorf("%s/%s: no deadlock reproduced; the load is too light to show the race", d.name, st.name)
+				}
+			case expectNoneOnPG:
+				if d.name == "postgres" && deadlocks.Load() > 0 {
+					t.Errorf("%s/%s: %d deadlocks with one lock order", d.name, st.name, deadlocks.Load())
+				}
+			case expectNoFailures, expectNoFailuresSerial:
+				if deadlocks.Load()+failures.Load() > 0 {
+					t.Errorf("%s/%s: %d deadlocks and %d other failures reached the caller", d.name, st.name, deadlocks.Load(), failures.Load())
+				}
+				if st.expect == expectNoFailuresSerial && maxInLock.Load() != 1 {
+					t.Errorf("%s/%s: %d writes ran inside the lock at once", d.name, st.name, maxInLock.Load())
+				}
+			}
 		}
 	}
 }

@@ -46,20 +46,39 @@
 
 锁表的吞吐损失随并发上升：8 个 worker 时约 -20%，16 个时 -32% 到 -46%。缓存层正是高并发的地方，所以没有采用。
 
-这两轮实验里，MySQL 的「锁表」在事务提交之前就释放了命名锁，锁得不够严格；严格的锁表吞吐只会更低，结论不变。复跑脚本已经改成提交之后才释放。
+这两轮实验里，MySQL 的「锁表」在事务提交之前就释放了命名锁，锁得不够严格。复跑脚本已经改成提交之后才释放，严格锁表的结果见下一节。
 
-### 复跑脚本的抽样结果
+### 复跑脚本的完整验证（2026-10-10）
 
-`tools/bench/2026-10-gorm-deadlock` 把上面的方案整理成了四种：`unordered` 是修复之前的写法（随机顺序 upsert，普通 `DELETE`）；`ordered` 是统一加锁顺序但不重试；`ordered+retry` 直接调用现在的 `GORMCache`；`table lock` 是锁表。用很小的负载（8 个 worker × 10 轮）验证过脚本：
+`tools/bench/2026-10-gorm-deadlock` 把上面的方案整理成四种：
 
-| 方案 | MySQL 死锁 | PostgreSQL 死锁 |
+| 策略 | 是什么 | 脚本断言 |
 |---|---|---|
-| unordered | 52 / 80 | 30 / 80（24 秒） |
-| ordered | 0 / 80 | 0 / 80 |
-| ordered+retry（GORMCache） | 0 / 80 | 0 / 80 |
-| table lock | 0 / 80 | 0 / 80 |
+| `unordered` | 修复之前的写法：随机顺序 upsert，普通 `DELETE` | **必须**复现出死锁，否则说明负载没有触发竞态，实验无效 |
+| `ordered` | 统一加锁顺序，不重试 | PostgreSQL 上必须零死锁（MySQL 的间隙锁允许少量死锁） |
+| `ordered+retry` | 直接调用现在的 `GORMCache` | 零死锁、零错误传到调用方 |
+| `table lock` | 整表串行写：MySQL 在同一个连接上，于事务开始前取命名锁、提交后释放；PostgreSQL 用事务级咨询锁 | 零死锁、零错误，并且锁内同一时刻最多只有 1 个写入 |
 
-这么小的负载下，吞吐量没有参考意义；比较吞吐请用默认负载复跑。脚本只复现第二轮的设置（2000 个 key），第一轮的「只重试」和「READ COMMITTED」两种方案没有放进脚本。
+每种策略还会记录一条真实的死锁错误样本，确认计数的确实是数据库的死锁（MySQL 是 `Error 1213 (40001): Deadlock found…`，PostgreSQL 是 `ERROR: deadlock detected (SQLSTATE 40P01)`）。
+
+**断言本身也做过反向验证**：
+- 把「锁表」改成不加锁，断言报告「8 writes ran inside the lock at once」，测试失败；
+- 把 `GORMCache.SetMany` 的排序去掉（脚本引用的是本地的库代码），断言报告 PostgreSQL 上「22 deadlocks … reached the caller」，测试失败。MySQL 上的死锁全部被重试吸收，这也说明重试只能兜住少量死锁，PostgreSQL 必须靠统一加锁顺序。
+
+默认负载（16 个 worker × 80 轮，2000 个 key）完整跑了两遍，断言全部通过：
+
+| 策略 | MySQL 第 1 遍 | MySQL 第 2 遍 | PostgreSQL 第 1 遍 | PostgreSQL 第 2 遍 |
+|---|---|---|---|---|
+| unordered | 1072 次死锁 | 1052 次死锁 | 781 次死锁（646 秒） | 747 次死锁（620 秒） |
+| ordered | 11 次死锁，796 ops/s | 8 次死锁，607 ops/s | 0，1326 ops/s | 0，1516 ops/s |
+| ordered+retry（GORMCache） | **0，794 ops/s** | **0，533 ops/s** | **0，1561 ops/s** | **0，1613 ops/s** |
+| table lock | 0，462 ops/s（-42%） | 0，315 ops/s（-41%） | 0，787 ops/s（-50%） | 0，833 ops/s（-48%） |
+
+- 第 2 遍运行时，机器上同时在跑其他测试，MySQL 的绝对吞吐偏低；各策略之间的相对关系不变。
+- 严格的锁表比前两轮测到的更慢（-41% 到 -50%，前两轮是 -32% 到 -46%），「不锁表」的结论更站得住。
+- `unordered` 在 MySQL 上看起来吞吐很高，是因为大部分操作直接以死锁失败返回了。
+
+脚本只复现第二轮的设置（2000 个 key）；第一轮的「只重试」和「READ COMMITTED」两种方案没有放进脚本。
 
 ## 复跑
 
