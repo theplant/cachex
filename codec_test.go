@@ -43,17 +43,22 @@ func (p *point) UnmarshalBinary(b []byte) error {
 	return nil
 }
 
+// roundTrip stores e through Encoded and reads it back.
 func roundTrip[T any](t *testing.T, codec cachex.Codec[T], e cachex.Entry[T]) cachex.Entry[T] {
 	t.Helper()
-	data, err := cachex.EncodeEntry(codec, e)
+	ctx := context.Background()
+	b := cachex.Encoded(newByteMap(), codec, nil)
+	require.NoError(t, b.Set(ctx, "k", e))
+	got, ok, err := b.Get(ctx, "k")
 	require.NoError(t, err)
-	got, err := cachex.DecodeEntry(codec, data)
-	require.NoError(t, err)
+	require.True(t, ok)
 	return got
 }
 
 func TestEntryEncoding(t *testing.T) {
-	times := cachex.Entry[string]{CachedAt: epoch, FreshUntil: epoch.Add(time.Minute), ExpiresAt: epoch.Add(time.Hour)}
+	now := time.Now().UTC().Round(0) // as decoded: UTC, no monotonic reading
+	later := now.Add(time.Hour)
+	times := cachex.Entry[string]{CachedAt: now, FreshUntil: now.Add(time.Minute), ExpiresAt: later}
 
 	t.Run("a value and its times survive", func(t *testing.T) {
 		e := times
@@ -68,11 +73,12 @@ func TestEntryEncoding(t *testing.T) {
 	})
 
 	t.Run("zero times stay zero", func(t *testing.T) {
-		assert.Equal(t, cachex.Entry[string]{Value: "v"}, roundTrip(t, cachex.DefaultCodec[string](), cachex.Entry[string]{Value: "v"}))
+		e := cachex.Entry[string]{Value: "v", ExpiresAt: later}
+		assert.Equal(t, e, roundTrip(t, cachex.DefaultCodec[string](), e))
 	})
 
 	t.Run("struct values are JSON by default", func(t *testing.T) {
-		e := cachex.Entry[*product]{Value: &product{ID: 1, Name: "p"}, CachedAt: epoch}
+		e := cachex.Entry[*product]{Value: &product{ID: 1, Name: "p"}, CachedAt: now, ExpiresAt: later}
 		got := roundTrip(t, cachex.DefaultCodec[*product](), e)
 		assert.Equal(t, e, got)
 		assert.NotSame(t, e.Value, got.Value)
@@ -82,7 +88,8 @@ func TestEntryEncoding(t *testing.T) {
 		data, err := cachex.DefaultCodec[point]().Marshal(point{1, 2})
 		require.NoError(t, err)
 		assert.Len(t, data, 8)
-		assert.Equal(t, cachex.Entry[point]{Value: point{1, 2}}, roundTrip(t, cachex.DefaultCodec[point](), cachex.Entry[point]{Value: point{1, 2}}))
+		e := cachex.Entry[point]{Value: point{1, 2}, ExpiresAt: later}
+		assert.Equal(t, e, roundTrip(t, cachex.DefaultCodec[point](), e))
 	})
 
 	t.Run("strings and bytes are stored as is", func(t *testing.T) {
@@ -101,15 +108,15 @@ func TestEntryEncoding(t *testing.T) {
 	})
 
 	t.Run("garbage does not decode", func(t *testing.T) {
+		ctx := context.Background()
 		long := func(format, flags byte) []byte { return append([]byte{format, flags}, make([]byte, 24)...) }
 		for _, data := range [][]byte{nil, {9}, {1, 0, 1, 2}, long(2, 0), long(1, 2), append(long(1, 1), 'x')} {
-			_, err := cachex.DecodeEntry(cachex.DefaultCodec[string](), data)
-			assert.Error(t, err, "%v", data)
+			m := newByteMap()
+			require.NoError(t, m.Set(ctx, "k", data, later))
+			_, ok, err := cachex.Encoded[string](m, nil, nil).Get(ctx, "k")
+			require.NoError(t, err)
+			assert.False(t, ok, "%v", data)
 		}
-		data, err := cachex.EncodeEntry(cachex.DefaultCodec[string](), cachex.Entry[string]{Value: "not json"})
-		require.NoError(t, err)
-		_, err = cachex.DecodeEntry(cachex.JSONCodec[string](), data)
-		assert.Error(t, err)
 	})
 }
 

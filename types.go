@@ -126,3 +126,44 @@ func errForKey(err error, key string) error {
 	}
 	return err
 }
+
+// Batched turns a SingleBackend into a Backend whose Many methods go key by
+// key, best effort: the keys that fail are reported in a *BatchError.
+func Batched[T any](b SingleBackend[T]) Backend[T] { return batched[T]{b} }
+
+type batched[T any] struct{ SingleBackend[T] }
+
+func (b batched[T]) GetMany(ctx context.Context, keys []string) (map[string]Entry[T], error) {
+	out := make(map[string]Entry[T], len(keys))
+	errs := map[string]error{}
+	for _, key := range keys {
+		e, ok, err := b.Get(ctx, key)
+		switch {
+		case err != nil:
+			errs[key] = err
+		case ok:
+			out[key] = e
+		}
+	}
+	return out, batchError(errs)
+}
+
+func (b batched[T]) SetMany(ctx context.Context, entries map[string]Entry[T]) error {
+	errs := map[string]error{}
+	for key, e := range entries {
+		if err := b.Set(ctx, key, e); err != nil {
+			errs[key] = err
+		}
+	}
+	return batchError(errs)
+}
+
+func (b batched[T]) DelMany(ctx context.Context, keys []string) error {
+	errs := map[string]error{}
+	for _, key := range keys {
+		if err := b.Del(ctx, key); err != nil {
+			errs[key] = err
+		}
+	}
+	return batchError(errs)
+}

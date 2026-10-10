@@ -125,9 +125,8 @@ func TestEncoded(t *testing.T) {
 		assert.False(t, m.has("k"), "and deleted")
 
 		// the value's type changed: the entry decodes, its value does not
-		data, err := cachex.EncodeEntry(cachex.DefaultCodec[string](), cachex.Entry[string]{Value: "not json", ExpiresAt: later})
-		require.NoError(t, err)
-		require.NoError(t, m.SetMany(ctx, map[string]cachex.ByteEntry{"k": {Data: data, ExpiresAt: later}, "ok": {Data: data, ExpiresAt: later}}))
+		raw := cachex.Encoded(m, cachex.DefaultCodec[string](), nil)
+		require.NoError(t, raw.Set(ctx, "k", cachex.Entry[string]{Value: "not json", ExpiresAt: later}))
 		require.NoError(t, b.Set(ctx, "ok", cachex.Entry[string]{Value: "v", ExpiresAt: later}))
 		got, err := b.GetMany(ctx, []string{"k", "ok"})
 		require.NoError(t, err)

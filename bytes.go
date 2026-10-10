@@ -2,6 +2,9 @@ package cachex
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -29,14 +32,14 @@ type ByteEntry struct {
 	ExpiresAt time.Time
 }
 
-// Encoded turns a ByteBackend into a Backend that stores each entry as
-// EncodeEntry encodes it with codec (nil: DefaultCodec). Data that does not
-// decode is a miss, not a failure: it was written by something else, or before
-// the value's type changed, so Encoded logs a WARN to logger (nil:
-// slog.Default()), deletes the key, and reports it absent. An entry already
-// past its ExpiresAt is not written: its key is deleted instead. That is
-// judged by the wall clock (time.Now), as backends expire entries by it,
-// whatever clock the Cache uses.
+// Encoded turns a ByteBackend into a Backend that stores each entry as bytes:
+// its times, whether it is a not-found, and its value as codec (nil:
+// DefaultCodec) marshals it. Data that does not decode is a miss, not a
+// failure: it was written by something else, or before the value's type
+// changed, so Encoded logs a WARN to logger (nil: slog.Default()), deletes the
+// key, and reports it absent. An entry already past its ExpiresAt is not
+// written: its key is deleted instead. That is judged by the wall clock
+// (time.Now), as backends expire entries by it, whatever clock the Cache uses.
 func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[T] {
 	if codec == nil {
 		codec = DefaultCodec[T]()
@@ -54,7 +57,7 @@ type encoded[T any] struct {
 }
 
 func (e *encoded[T]) decode(ctx context.Context, key string, data []byte) (Entry[T], bool) {
-	entry, err := DecodeEntry(e.codec, data)
+	entry, err := decodeEntry(e.codec, data)
 	if err != nil {
 		e.logger.WarnContext(ctx, "cachex: dropped an entry that does not decode", "key", key, "error", err)
 		return Entry[T]{}, false
@@ -98,7 +101,7 @@ func (e *encoded[T]) Set(ctx context.Context, key string, entry Entry[T]) error 
 	if !entry.ExpiresAt.After(time.Now()) {
 		return e.b.Del(ctx, key)
 	}
-	data, err := EncodeEntry(e.codec, entry)
+	data, err := encodeEntry(e.codec, entry)
 	if err != nil {
 		return err
 	}
@@ -115,7 +118,7 @@ func (e *encoded[T]) SetMany(ctx context.Context, entries map[string]Entry[T]) e
 			expired = append(expired, key)
 			continue
 		}
-		data, err := EncodeEntry(e.codec, entry)
+		data, err := encodeEntry(e.codec, entry)
 		if err != nil {
 			errs[key] = err
 			continue
@@ -145,4 +148,65 @@ func (e *encoded[T]) Del(ctx context.Context, key string) error { return e.b.Del
 
 func (e *encoded[T]) DelMany(ctx context.Context, keys []string) error {
 	return e.b.DelMany(ctx, keys)
+}
+
+// entryFormat is the first byte of an encoded entry; another value means the
+// data was written by something else, or by an incompatible version.
+const entryFormat = 1
+
+const entryHeader = 2 + 3*8 // format, flags, three times
+
+// encodeEntry encodes an entry for a ByteBackend: its times and
+// whether it is a not-found, then its value as codec marshals it.
+func encodeEntry[T any](codec Codec[T], e Entry[T]) ([]byte, error) {
+	var value []byte
+	var flags byte
+	if e.NotFound {
+		flags = 1
+	} else {
+		var err error
+		if value, err = codec.Marshal(e.Value); err != nil {
+			return nil, fmt.Errorf("cachex: encode entry: %w", err)
+		}
+	}
+	data := make([]byte, entryHeader, entryHeader+len(value))
+	data[0], data[1] = entryFormat, flags
+	for i, t := range []time.Time{e.CachedAt, e.FreshUntil, e.ExpiresAt} {
+		var n int64
+		if !t.IsZero() {
+			n = t.UnixNano()
+		}
+		binary.BigEndian.PutUint64(data[2+8*i:], uint64(n))
+	}
+	return append(data, value...), nil
+}
+
+var errBadEntry = errors.New("cachex: not an encoded entry")
+
+// decodeEntry decodes what encodeEntry encoded. Data that does not decode was
+// written by something else, or before the value's type changed: Encoded
+// treats it as a miss.
+func decodeEntry[T any](codec Codec[T], data []byte) (Entry[T], error) {
+	if len(data) < entryHeader || data[0] != entryFormat || data[1]&^1 != 0 {
+		return Entry[T]{}, errBadEntry
+	}
+	var e Entry[T]
+	e.NotFound = data[1] == 1
+	for i, t := range []*time.Time{&e.CachedAt, &e.FreshUntil, &e.ExpiresAt} {
+		if n := int64(binary.BigEndian.Uint64(data[2+8*i:])); n != 0 {
+			*t = time.Unix(0, n).UTC()
+		}
+	}
+	if e.NotFound {
+		if len(data) != entryHeader {
+			return Entry[T]{}, errBadEntry
+		}
+		return e, nil
+	}
+	value, err := codec.Unmarshal(data[entryHeader:])
+	if err != nil {
+		return Entry[T]{}, fmt.Errorf("cachex: decode entry: %w", err)
+	}
+	e.Value = value
+	return e, nil
 }
