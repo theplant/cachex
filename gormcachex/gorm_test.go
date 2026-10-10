@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"regexp"
 	"sync/atomic"
 	"testing"
@@ -22,7 +23,7 @@ import (
 
 func newSQLite(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open("file:"+url.PathEscape(t.Name())+"?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
@@ -51,11 +52,16 @@ func entry(v string) cachex.Entry[string] {
 func TestContract(t *testing.T) {
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 		return newBackend(t, Config[string]{KeyPrefix: "p:"})
-	})
+	}, strs)
+	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[item] {
+		b := New[item](Config[item]{DB: newSQLite(t), TableName: "cache"})
+		require.NoError(t, b.Migrate(context.Background()))
+		return b
+	}, items)
 	t.Run("in chunks", func(t *testing.T) {
 		cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 			return newBackend(t, Config[string]{ChunkSize: 2})
-		})
+		}, strs)
 	})
 }
 
@@ -233,3 +239,14 @@ func TestNewRejectsAMissingDBOrTable(t *testing.T) {
 	assert.Panics(t, func() { New[string](Config[string]{TableName: "t"}) })
 	assert.Panics(t, func() { New[string](Config[string]{DB: &gorm.DB{}}) })
 }
+
+type item struct {
+	ID   int
+	Tags []string
+}
+
+// strs and items are values for cachextest.TestBackend.
+var (
+	strs  = []string{"v", "", "héllo, 世界", "\x00\xff"}
+	items = []item{{ID: 1, Tags: []string{"a"}}, {}, {ID: 2}}
+)

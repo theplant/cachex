@@ -30,12 +30,16 @@ func TestContract(t *testing.T) {
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 		_, client := newRedis(t)
 		return rediscachex.New[string](rediscachex.Config[string]{Client: client, KeyPrefix: "p:"})
-	})
+	}, []string{"v", "", "héllo, 世界", "\x00\xff"})
+	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[item] {
+		_, client := newRedis(t)
+		return rediscachex.New[item](rediscachex.Config[item]{Client: client, KeyPrefix: "p:"})
+	}, []item{{ID: 1, Tags: []string{"a"}}, {}, {ID: 2}})
 	t.Run("in chunks", func(t *testing.T) {
 		cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 			_, client := newRedis(t)
 			return rediscachex.New[string](rediscachex.Config[string]{Client: client, ChunkSize: 2})
-		})
+		}, []string{"v", "", "w"})
 	})
 }
 
@@ -122,4 +126,9 @@ func TestManyKeysAcrossChunks(t *testing.T) {
 	m, err = b.GetMany(ctx, keys)
 	require.NoError(t, err)
 	assert.Empty(t, m)
+}
+
+type item struct {
+	ID   int
+	Tags []string
 }

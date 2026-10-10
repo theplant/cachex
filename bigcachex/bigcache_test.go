@@ -27,7 +27,10 @@ func newBigCache(t *testing.T) *bigcache.BigCache {
 func TestContract(t *testing.T) {
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 		return bigcachex.New[string](bigcachex.Config[string]{Cache: newBigCache(t)})
-	})
+	}, []string{"v", "", "héllo, 世界", "\x00\xff"})
+	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[item] {
+		return bigcachex.New[item](bigcachex.Config[item]{Cache: newBigCache(t)})
+	}, []item{{ID: 1, Tags: []string{"a"}}, {}, {ID: 2}})
 }
 
 func TestAnEntryThatDoesNotDecodeIsAMiss(t *testing.T) {
@@ -67,4 +70,9 @@ func TestValuesAreCopies(t *testing.T) {
 	e, _, err = b.Get(ctx, "k")
 	require.NoError(t, err)
 	assert.Equal(t, 1, e.Value.N, "a decoded value is the caller's own")
+}
+
+type item struct {
+	ID   int
+	Tags []string
 }

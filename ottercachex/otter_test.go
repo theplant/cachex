@@ -14,12 +14,22 @@ import (
 	"github.com/theplant/cachex/v2/ottercachex"
 )
 
+type item struct {
+	ID   int
+	Tags []string
+}
+
 func TestContract(t *testing.T) {
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 		b, err := ottercachex.New[string](ottercachex.Config[string]{MaximumSize: 1000})
 		require.NoError(t, err)
 		return b
-	})
+	}, []string{"v", "", "w"})
+	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[item] {
+		b, err := ottercachex.New[item](ottercachex.Config[item]{MaximumSize: 1000})
+		require.NoError(t, err)
+		return b
+	}, []item{{ID: 1, Tags: []string{"a"}}, {}, {ID: 2}})
 }
 
 func TestEntriesExpireOnTheirOwn(t *testing.T) {

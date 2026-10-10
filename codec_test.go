@@ -19,6 +19,12 @@ type product struct {
 	Name string `json:"name"`
 }
 
+// strs and products are values for cachextest.TestBackend.
+var (
+	strs     = []string{"v", "", "héllo, 世界", "\x00\xff"}
+	products = []product{{ID: 1, Name: "a"}, {}, {ID: -2, Name: "héllo, 世界"}}
+)
+
 // point marshals itself as 8 bytes.
 type point struct{ X, Y int32 }
 
@@ -137,7 +143,7 @@ func (s *singleMap) Del(ctx context.Context, key string) error {
 func TestBatched(t *testing.T) {
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] {
 		return cachex.Batched[string](&singleMap{Map: cachextest.NewMap[string]()})
-	})
+	}, strs)
 
 	t.Run("failed keys are reported, the others done", func(t *testing.T) {
 		ctx := context.Background()
@@ -157,5 +163,6 @@ func TestBatched(t *testing.T) {
 }
 
 func TestMapBackend(t *testing.T) {
-	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] { return cachextest.NewMap[string]() })
+	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] { return cachextest.NewMap[string]() }, strs)
+	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[product] { return cachextest.NewMap[product]() }, products)
 }

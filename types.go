@@ -102,6 +102,10 @@ func (e *BatchError) Error() string {
 	return b.String()
 }
 
+// NewBatchError returns a *BatchError listing errs, or nil if errs is empty:
+// what a backend's Many method returns after trying every key.
+func NewBatchError(errs map[string]error) error { return batchError(errs) }
+
 // batchError returns a *BatchError for errs, or nil if errs is empty.
 func batchError(errs map[string]error) error {
 	if len(errs) == 0 {
