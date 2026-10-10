@@ -132,14 +132,19 @@ func locked(f func() error) error {
 // tableLocked serializes every write to the table: a named lock on MySQL, held
 // on one connection around the whole transaction (taken before BEGIN, released
 // after COMMIT); an advisory transaction lock on PostgreSQL. Either has the
-// effect of a table lock.
-func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(ctx context.Context) error) error {
+// effect of a table lock. f writes through a backend over the transaction.
+func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(c *gormcachex.Backend[string]) error) error {
+	inTx := func(tx *gorm.DB) error {
+		return locked(func() error {
+			return f(gormcachex.New[string](gormcachex.Config[string]{DB: tx, TableName: table}))
+		})
+	}
 	if db.Name() != "mysql" {
 		return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "bench:"+table).Error; err != nil {
 				return err
 			}
-			return locked(func() error { return f(gormcachex.WithTx(ctx, tx)) })
+			return inTx(tx)
 		})
 	}
 	return db.WithContext(ctx).Connection(func(conn *gorm.DB) error {
@@ -148,7 +153,7 @@ func tableLocked(ctx context.Context, db *gorm.DB, table string, f func(ctx cont
 		}
 		defer conn.Exec("SELECT RELEASE_LOCK(?)", "bench:"+table)
 		return conn.Transaction(func(tx *gorm.DB) error {
-			return locked(func() error { return f(gormcachex.WithTx(ctx, tx)) })
+			return inTx(tx)
 		})
 	})
 }
@@ -165,10 +170,10 @@ var strategies = []strategy{
 		}},
 	{name: "table lock", expect: expectNoFailuresSerial,
 		set: func(ctx context.Context, db *gorm.DB, c *gormcachex.Backend[string], table string, v map[string]string) error {
-			return tableLocked(ctx, db, table, func(ctx context.Context) error { return c.SetMany(ctx, entries(v)) })
+			return tableLocked(ctx, db, table, func(c *gormcachex.Backend[string]) error { return c.SetMany(ctx, entries(v)) })
 		},
 		del: func(ctx context.Context, db *gorm.DB, c *gormcachex.Backend[string], table string, k []string) error {
-			return tableLocked(ctx, db, table, func(ctx context.Context) error { return c.DelMany(ctx, k) })
+			return tableLocked(ctx, db, table, func(c *gormcachex.Backend[string]) error { return c.DelMany(ctx, k) })
 		}},
 }
 

@@ -69,56 +69,6 @@ func TestByteBackend(t *testing.T) {
 	})
 }
 
-func TestTransactions(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("writes run in the caller's transaction", func(t *testing.T) {
-		db := newSQLite(t)
-		b := newBackend(t, Config[string]{DB: db})
-		tx := db.Begin()
-		require.NoError(t, b.Set(WithTx(ctx, tx), "k", entry("v")))
-		_, ok, err := b.Get(WithTx(ctx, tx), "k")
-		require.NoError(t, err)
-		assert.True(t, ok)
-		require.NoError(t, tx.Rollback().Error)
-		_, ok, err = b.Get(ctx, "k")
-		require.NoError(t, err)
-		assert.False(t, ok, "rolled back with it")
-	})
-
-	t.Run("Migrate never runs in the caller's transaction", func(t *testing.T) {
-		// on MySQL, DDL would commit the caller's transaction
-		db := newSQLite(t)
-		sqlDB, err := db.DB()
-		require.NoError(t, err)
-		sqlDB.SetMaxOpenConns(2) // the transaction's and Migrate's
-		tx := db.Begin()
-		b := New[string](Config[string]{DB: db, TableName: "cache"})
-		require.NoError(t, b.Migrate(WithTx(ctx, tx)))
-		require.NoError(t, tx.Rollback().Error)
-		assert.True(t, db.Migrator().HasTable("cache"), "the table outlives the rolled-back transaction")
-	})
-
-	t.Run("a shared fetch does not use the caller's transaction", func(t *testing.T) {
-		db := newSQLite(t)
-		b := newBackend(t, Config[string]{DB: db})
-		tx := db.Begin()
-		defer tx.Rollback()
-		var sharedCtx context.Context
-		c := cachex.New(cachex.SourceFunc[string](func(ctx context.Context, _ string) (string, error) {
-			sharedCtx = ctx
-			return "v", nil
-		}), nil)
-		_, err := c.Get(WithTx(ctx, tx), "k")
-		require.NoError(t, err)
-		require.True(t, cachex.IsShared(sharedCtx), "the Cache marks a fetch's ctx")
-		_, inTx := b.bytes.conn(sharedCtx)
-		assert.False(t, inTx, "and the backend does not join the caller's transaction with it")
-		_, inTx = b.bytes.conn(WithTx(ctx, tx))
-		assert.True(t, inTx)
-	})
-}
-
 func TestTheKeyColumnIsQuoted(t *testing.T) {
 	// "key" is reserved in MySQL; SQLite accepts it bare, so check the SQL itself
 	db := newSQLite(t)
@@ -200,10 +150,6 @@ func TestDeadlockVictimsAreRetried(t *testing.T) {
 	var be *cachex.BatchError
 	require.ErrorAs(t, err, &be)
 	assert.True(t, isDeadlock(be.Errors["k"]), "retries are bounded")
-
-	fails.Store(1)
-	err = db.Transaction(func(tx *gorm.DB) error { return b.Set(WithTx(ctx, tx), "k", entry("v3")) })
-	assert.True(t, isDeadlock(err), "inside the caller's transaction, which the deadlock rolled back, nothing is retried")
 }
 
 func TestCheckMySQLVersion(t *testing.T) {

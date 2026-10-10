@@ -4,8 +4,13 @@
 //
 // Batch writes lock rows in one order (keys sorted by bytes) so that
 // concurrent writers do not deadlock, and the few deadlocks MySQL's gap locks
-// still cause are retried. Expired rows are not removed: delete rows whose
-// expires_at has passed from time to time.
+// still cause are retried. Each statement commits on its own, never in a
+// caller's transaction: a write held in one across Cache calls would hold its
+// row locks while the Cache waits for a stripe another write holds, which
+// itself waits for those rows, a deadlock the database cannot see. Change the
+// source in a transaction, then write the Cache after it commits. Expired
+// rows are not removed: delete rows whose expires_at has passed from time to
+// time.
 package gormcachex
 
 import (
@@ -98,29 +103,6 @@ func New[T any](cfg Config[T]) *Backend[T] {
 	return &Backend[T]{Backend: cachex.Encoded(b, cfg.Codec, cfg.Logger), bytes: b}
 }
 
-type txKey struct{}
-
-// WithTx makes the backend's reads and writes with ctx run in tx (which the
-// caller commits or rolls back), except those of a fetch shared by several
-// callers (see cachex.IsShared), which never join one caller's transaction.
-func WithTx(ctx context.Context, tx *gorm.DB) context.Context {
-	return context.WithValue(ctx, txKey{}, tx)
-}
-
-// TxFrom returns the transaction WithTx put in ctx, or nil.
-func TxFrom(ctx context.Context) *gorm.DB {
-	tx, _ := ctx.Value(txKey{}).(*gorm.DB)
-	return tx
-}
-
-// conn is where ctx's statements run: its transaction, if it may join it.
-func (b *byteBackend) conn(ctx context.Context) (db *gorm.DB, inTx bool) {
-	if tx := TxFrom(ctx); tx != nil && !cachex.IsShared(ctx) {
-		return tx.WithContext(ctx), true
-	}
-	return b.db.WithContext(ctx), false
-}
-
 // keyColumn is the key column as a clause, so GORM quotes it: "key" is a
 // reserved word in MySQL.
 var keyColumn = clause.Column{Name: "key"}
@@ -142,8 +124,7 @@ func anys(keys []string) []any {
 // column must compare keys exactly (case, trailing spaces): Migrate creates
 // tables with utf8mb4_0900_bin, which needs MySQL 8.0.17 or later, and rejects
 // an existing table whose key column uses another collation, with the
-// statement that converts it. It runs on Config.DB, never in a transaction
-// WithTx put in ctx: on MySQL, DDL would commit it.
+// statement that converts it.
 func (b *Backend[T]) Migrate(ctx context.Context) error { return b.bytes.migrate(ctx) }
 
 func (b *byteBackend) migrate(ctx context.Context) error {
@@ -201,13 +182,9 @@ func (b *byteBackend) checkMySQLKeyCollation(db *gorm.DB) error {
 }
 
 // write runs a statement, retrying it if the database aborts it as a deadlock
-// victim, unless it runs in the caller's transaction, which the deadlock has
-// already rolled back as a whole.
+// victim.
 func (b *byteBackend) write(ctx context.Context, f func(db *gorm.DB) error) error {
-	db, inTx := b.conn(ctx)
-	if inTx {
-		return f(db)
-	}
+	db := b.db.WithContext(ctx)
 	for attempt := 1; ; attempt++ {
 		err := f(db)
 		if !isDeadlock(err) || attempt == deadlockAttempts {
@@ -252,7 +229,7 @@ func (b *byteBackend) GetMany(ctx context.Context, keys []string) (map[string][]
 func (b *byteBackend) getMany(ctx context.Context, keys []string) (map[string][]byte, map[string]error) {
 	out := make(map[string][]byte, len(keys))
 	errs := map[string]error{}
-	db, _ := b.conn(ctx)
+	db := b.db.WithContext(ctx)
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
 		prefixed := make([]string, len(chunk))
 		for i, key := range chunk {
