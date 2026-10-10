@@ -1,6 +1,6 @@
 # 写入顺序与分片锁
 
-这篇讲 `Set`/`Del` 怎么写、写入和回填之间怎么排序，以及支撑这一切的**分片锁**。代码在 `client.go`：`write`、`writeStripe`、`backfill`；批量回填在 `batch.go` 的 `doFetchMany`。
+这篇讲 `Set`/`Del` 怎么写、写入和回填之间怎么排序，以及支撑这一切的**分片锁**。分片本身在内部包 `internal/stripe`（`stripe.Set`、`stripe.Stripe`）；写入和回填怎么用它，在 `client.go` 的 `write`、`backfill`，批量回填在 `batch.go` 的 `doFetchMany`。
 
 ## 先说结论：对使用者意味着什么
 
@@ -110,16 +110,22 @@ flowchart LR
 不同的 key 可能落到同一个分片（上图的 `user:42` 和 `order:9`）。这不影响正确性，只是它们会共用一把锁，代价见文末。
 
 ```go
-const writeStripeCount = 4096
+// package stripe
+const Count = 4096
 
-type writeStripe struct {
+type Stripe struct {
     mu    sync.RWMutex  // Set/Del 持写锁；回填持读锁
     gen   atomic.Uint64 // 写入代数：每次 Set/Del 加 1
     fills atomic.Uint64 // 每次回填写入本层加 1
 }
 
-func (c *Client[T]) stripe(key string) *writeStripe {
-    return &c.writes[maphash.String(c.writeSeed, key)%writeStripeCount]
+type Set struct {
+    seed    maphash.Seed
+    stripes [Count]Stripe
+}
+
+func (s *Set) For(key string) *Stripe {
+    return &s.stripes[maphash.String(s.seed, key)%Count]
 }
 ```
 
@@ -239,14 +245,14 @@ sequenceDiagram
 sequenceDiagram
     participant A as 请求 A（写入前开始）
     participant W as Del(k)
-    participant G as flightGroup
+    participant G as flight.Group
     participant B as 请求 B（Del 返回后开始）
     participant U as 上游
-    A->>G: claim(k)，回源中（读到旧值 v1）
+    A->>G: Claim(k)，回源中（读到旧值 v1）
     W->>W: 写上游（删除）
-    W->>G: drop(k)
-    W->>W: 删本层，再 drop(k)，Del 返回
-    B->>G: claim(k)：没有登记，新建回源
+    W->>G: Drop(k)
+    W->>W: 删本层，再 Drop(k)，Del 返回
+    B->>G: Claim(k)：没有登记，新建回源
     B->>U: Get(k)
     U-->>B: 不存在 ✓
     A-->>A: A 自己拿到 v1（它开始得早），但回填被跳过
@@ -260,7 +266,7 @@ sequenceDiagram
 
 ## 等写锁时尊重 ctx
 
-`sync.RWMutex` 的 `Lock()` 没法被取消。如果前一个 `Set` 卡在上游，后面的 `Set` 就会无视自己的超时一直等下去。所以 `writeStripe.lock` 这样实现：
+`sync.RWMutex` 的 `Lock()` 没法被取消。如果前一个 `Set` 卡在上游，后面的 `Set` 就会无视自己的超时一直等下去。所以 `stripe.Stripe.Lock` 这样实现：
 
 ```mermaid
 flowchart TD

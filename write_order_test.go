@@ -474,9 +474,7 @@ func TestReadAfterWriteDoesNotJoinAnOlderFetch(t *testing.T) {
 				src.holdReads()
 				require.Eventually(t, func() bool {
 					go func() { _, _ = cli.Get(ctx, "k") }()
-					cli.flights.mu.Lock()
-					defer cli.flights.mu.Unlock()
-					return len(cli.flights.flights) == conc
+					return cli.flights.Len() == conc
 				}, time.Second, time.Millisecond)
 				for range conc {
 					waitFor(t, src.entered)
@@ -556,12 +554,12 @@ func TestWriteWaitingForTheStripeRespectsCtx(t *testing.T) {
 	s := cli.stripe("k")
 	// the given-up Set's lock is taken in the background once the first Set
 	// releases it; it bumps the generation (the first Set did too) and unlocks
-	require.Eventually(t, func() bool { return s.gen.Load() == 2 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return s.Generation() == 2 }, time.Second, time.Millisecond)
 	require.Eventually(t, func() bool {
-		if !s.mu.TryLock() {
+		if !s.TryLock() {
 			return false
 		}
-		s.mu.Unlock()
+		s.Unlock()
 		return true
 	}, time.Second, time.Millisecond)
 	done, cancel := context.WithCancel(ctx)

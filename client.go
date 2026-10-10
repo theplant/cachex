@@ -4,14 +4,14 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
-	"hash/maphash"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/theplant/cachex/internal/flight"
+	"github.com/theplant/cachex/internal/stripe"
 )
 
 var (
@@ -39,12 +39,11 @@ type Client[T any] struct {
 	getManyChunk     int // keys per BatchUpstream call; 0 means all in one
 	logger           *slog.Logger
 
-	flights         flightGroup[T]
+	flights         flight.Group[T]
 	asyncRefreshing sync.Map
 
 	// Write ordering, see Set and backfill
-	writeSeed maphash.Seed
-	writes    [writeStripeCount]writeStripe
+	stripes *stripe.Set
 
 	// Double-check optimization
 	doubleCheckMode DoubleCheckMode // User configuration (immutable)
@@ -76,7 +75,7 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		getManyConc:      DefaultGetManyFetchConcurrency,
 		logger:           slog.Default(),
 		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
-		writeSeed:        maphash.MakeSeed(),
+		stripes:          stripe.NewSet(),
 	}
 
 	// Apply user options
@@ -110,7 +109,7 @@ func (c *Client[T]) Get(ctx context.Context, key string) (T, error) {
 func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, error) {
 	var zero T
 
-	seen := c.stripe(key).epoch() // before reading, see shouldDoubleCheck
+	seen := c.stripe(key).Epoch() // before reading, see shouldDoubleCheck
 	// Check backend cache first
 	value, err := c.backend.Get(ctx, key)
 
@@ -277,55 +276,7 @@ func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
 	)
 }
 
-// writeStripeCount is the number of write stripes per Client.
-//
-// Keys share stripes by hash, so two keys in one stripe serialize
-// their writes and a write to one can skip the other's backfill (a spare
-// cache miss, never a stale value); raise it if that shows up.
-// 4096 stripes of 40 bytes cost 160 KB per Client, embedded, no allocation.
-const writeStripeCount = 4096
-
-// writeStripe orders writes and backfills of the keys that hash to it.
-type writeStripe struct {
-	mu    sync.RWMutex  // Set/Del hold it, so all layers apply them in one order; backfills hold it for reading
-	gen   atomic.Uint64 // bumped by every Set/Del, checked by backfills
-	fills atomic.Uint64 // bumped by every backfill that wrote this layer
-}
-
-// epoch changes whenever this Client writes this layer for a key of the
-// stripe (a Set/Del or a backfill). If it has not changed since a request read
-// the layer, re-reading it (the double-check) would find the same miss.
-func (s *writeStripe) epoch() uint64 { return s.gen.Load() + s.fills.Load() }
-
-// lock takes the stripe for writing. Waiting for another write or a backfill
-// gives up when ctx is done; a free stripe is taken even with a done ctx. A
-// lock given up on is still taken in the background, runs late while holding
-// it, and is released.
-func (s *writeStripe) lock(ctx context.Context, late func()) error {
-	if s.mu.TryLock() {
-		return nil
-	}
-	locked := make(chan struct{})
-	go func() {
-		s.mu.Lock()
-		close(locked)
-	}()
-	select {
-	case <-locked:
-		return nil
-	case <-ctx.Done():
-		go func() {
-			<-locked
-			late()
-			s.mu.Unlock()
-		}()
-		return ctx.Err()
-	}
-}
-
-func (c *Client[T]) stripe(key string) *writeStripe {
-	return &c.writes[maphash.String(c.writeSeed, key)%writeStripeCount]
-}
+func (c *Client[T]) stripe(key string) *stripe.Stripe { return c.stripes.For(key) }
 
 // write runs a Set or Del: the upstream first (if it is a Cache), then this
 // layer. Any failure leaves this layer without an entry for the key.
@@ -337,16 +288,16 @@ func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache
 	// a read that starts from now on fetches anew instead of joining a fetch
 	// that may have read the upstream before the write.
 	written := func() {
-		s.gen.Add(1)
+		s.AddWrite()
 		c.dropFlights(key)
 	}
 
 	// A write that gave up waiting writes nothing upstream, but like any failed
 	// write it leaves this layer without an entry, once the stripe is free.
-	if err := s.lock(ctx, func() { written(); c.invalidate(ctx, key) }); err != nil {
+	if err := s.Lock(ctx, func() { written(); c.invalidate(ctx, key) }); err != nil {
 		return errors.Wrapf(err, "context cancelled while waiting to write key: %s", key)
 	}
-	defer s.mu.Unlock()
+	defer s.Unlock()
 	// also drop fetches claimed while this layer was being written: their
 	// double-check may have read the old value
 	defer c.dropFlights(key)
@@ -371,11 +322,11 @@ func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache
 // interrupting them: callers already waiting still get their result.
 func (c *Client[T]) dropFlights(key string) {
 	if c.fetchConcurrency <= 1 {
-		c.flights.drop(key)
+		c.flights.Drop(key)
 		return
 	}
 	for i := range c.fetchConcurrency {
-		c.flights.drop(fmt.Sprintf("%d:%s", i, key))
+		c.flights.Drop(fmt.Sprintf("%d:%s", i, key))
 	}
 }
 
@@ -402,17 +353,17 @@ func (c *Client[T]) invalidate(ctx context.Context, key string) {
 // (TryRLock): reads never wait on writes, at the cost of a spare cache miss.
 func (c *Client[T]) backfill(ctx context.Context, key string, gen uint64, fill func() error, failMsg string) {
 	s := c.stripe(key)
-	if !s.mu.TryRLock() {
+	if !s.TryRLock() {
 		return
 	}
-	defer s.mu.RUnlock()
-	if s.gen.Load() != gen {
+	defer s.RUnlock()
+	if s.Generation() != gen {
 		return
 	}
 	if err := fill(); err != nil {
 		c.logger.WarnContext(ctx, failMsg, "key", key, "error", err)
 	}
-	s.fills.Add(1)
+	s.AddFill()
 }
 
 // setWithoutUpstream clears a cached not-found and writes the backend; a failed
@@ -439,7 +390,7 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 		c.testHooks.beforeSingleflightStart(ctx, key)
 	}
 
-	f, leader := c.flights.claim(sfKey)
+	f, leader := c.flights.Claim(sfKey)
 	if leader {
 		go c.runClaimed(flightCtx(ctx), key, sfKey, f, seen)
 	}
@@ -447,14 +398,15 @@ func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, 
 	select {
 	case <-ctx.Done():
 		return zero, errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", key)
-	case <-f.done:
+	case <-f.Done():
 		if c.testHooks != nil && c.testHooks.afterSingleflightEnd != nil {
 			c.testHooks.afterSingleflightEnd(ctx, key)
 		}
-		if f.err != nil {
-			return zero, f.err
+		value, err := f.Result()
+		if err != nil {
+			return zero, err
 		}
-		return f.value, nil
+		return value, nil
 	}
 }
 
@@ -466,8 +418,8 @@ func flightCtx(ctx context.Context) context.Context {
 }
 
 // runClaimed fetches a key this request has claimed and publishes the result.
-func (c *Client[T]) runClaimed(ctx context.Context, key, sfKey string, f *flight[T], seen uint64) {
-	p := c.claimedFlights([]string{key}, []string{sfKey}, []*flight[T]{f})
+func (c *Client[T]) runClaimed(ctx context.Context, key, sfKey string, f *flight.Flight[T], seen uint64) {
+	p := c.claimedFlights([]string{key}, []string{sfKey}, []*flight.Flight[T]{f})
 	p.run(ctx, []int{0}, func() {
 		value, err := c.fetchClaimed(ctx, key, seen)
 		p.publish(0, result[T]{value: value, err: err})
@@ -537,7 +489,7 @@ func (c *Client[T]) asyncRefresh(ctx context.Context, key string, seen uint64) {
 }
 
 func (c *Client[T]) doFetch(ctx context.Context, key string) (T, error) {
-	gen := c.stripe(key).gen.Load()
+	gen := c.stripe(key).Generation()
 	value, err := c.upstream.Get(ctx, key)
 	if err != nil {
 		if IsErrKeyNotFound(err) {
@@ -563,7 +515,7 @@ func (c *Client[T]) shouldDoubleCheck(key string, seen uint64) bool {
 	case DoubleCheckDisabled:
 		return false
 	default:
-		return c.stripe(key).epoch() != seen
+		return c.stripe(key).Epoch() != seen
 	}
 }
 

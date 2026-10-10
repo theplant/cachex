@@ -1190,9 +1190,7 @@ func TestClientGetManyOverAClientIsStillBounded(t *testing.T) {
 	_, err := l1.GetMany(ctx, []string{"k"})
 	require.Error(t, err)
 	require.Eventually(t, func() bool {
-		l1.flights.mu.Lock()
-		defer l1.flights.mu.Unlock()
-		return len(l1.flights.flights) == 0
+		return l1.flights.Len() == 0
 	}, 2*time.Second, 5*time.Millisecond, "a lower layer that hangs does not keep the key claimed forever")
 }
 

@@ -11,67 +11,11 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/theplant/cachex/internal/flight"
+	"github.com/theplant/cachex/internal/stripe"
 )
 
 var _ BatchUpstream[any] = &Client[any]{}
-
-// flight is one in-flight upstream fetch of a singleflight key.
-type flight[T any] struct {
-	done  chan struct{}
-	value T
-	err   error
-}
-
-// flightGroup is the singleflight shared by Get and GetMany. Unlike
-// x/sync/singleflight, claim tells the caller synchronously whether it now
-// owns the fetch, which lets GetMany claim many keys and fetch the ones it
-// owns as one batch without waiting on (and deadlocking with) other batches.
-type flightGroup[T any] struct {
-	mu      sync.Mutex
-	flights map[string]*flight[T]
-}
-
-// claim returns the flight for sfKey and whether the caller owns it. The owner
-// must call finish exactly once; everyone else waits on flight.done.
-func (g *flightGroup[T]) claim(sfKey string) (*flight[T], bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if f, ok := g.flights[sfKey]; ok {
-		return f, false
-	}
-	if g.flights == nil {
-		g.flights = map[string]*flight[T]{}
-	}
-	f := &flight[T]{done: make(chan struct{})}
-	g.flights[sfKey] = f
-	return f, true
-}
-
-// finish releases the claim before publishing the result, so a request that
-// sees the result and comes back starts a new flight (where double-check
-// finds the value this flight wrote) instead of joining a finished one.
-func (g *flightGroup[T]) finish(sfKey string, f *flight[T], value T, err error) {
-	g.forget(sfKey, f)
-	f.value, f.err = value, err
-	close(f.done)
-}
-
-// drop releases whatever flight holds sfKey without publishing a result: its
-// waiters still get its result, and the next claim starts a new flight.
-func (g *flightGroup[T]) drop(sfKey string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	delete(g.flights, sfKey)
-}
-
-// forget releases the claim without publishing a result.
-func (g *flightGroup[T]) forget(sfKey string, f *flight[T]) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.flights[sfKey] == f {
-		delete(g.flights, sfKey)
-	}
-}
 
 // claimed are flights one request has claimed. Each gets exactly one result,
 // published as soon as it is known; run makes sure an upstream that panics or
@@ -80,12 +24,12 @@ type claimed[T any] struct {
 	c       *Client[T]
 	keys    []string
 	sfKeys  []string
-	flights []*flight[T]
+	flights []*flight.Flight[T]
 	mu      sync.Mutex
 	done    []bool
 }
 
-func (c *Client[T]) claimedFlights(keys, sfKeys []string, flights []*flight[T]) *claimed[T] {
+func (c *Client[T]) claimedFlights(keys, sfKeys []string, flights []*flight.Flight[T]) *claimed[T] {
 	return &claimed[T]{c: c, keys: keys, sfKeys: sfKeys, flights: flights, done: make([]bool, len(keys))}
 }
 
@@ -97,7 +41,7 @@ func (p *claimed[T]) publish(i int, r result[T]) {
 		return
 	}
 	p.done[i] = true
-	p.c.flights.finish(p.sfKeys[i], p.flights[i], r.value, r.err)
+	p.c.flights.Finish(p.sfKeys[i], p.flights[i], r.value, r.err)
 }
 
 // run runs body, which fetches flights idxs, and publishes an error for each
@@ -239,7 +183,7 @@ func (c *Client[T]) lookupMany(ctx context.Context, keys []string, doubleCheck b
 	}
 
 	for i, key := range keys {
-		res[i].seen = c.stripe(key).epoch()
+		res[i].seen = c.stripe(key).Epoch()
 	}
 	values, err := getMany(ctx, c.backend, keys)
 	var missing []int
@@ -323,12 +267,12 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string, seen [
 	if _, ok := c.upstream.(BatchUpstream[T]); !ok {
 		return c.fetchEach(ctx, keys, sfKeys, seen)
 	}
-	flights := make([]*flight[T], len(keys))
+	flights := make([]*flight.Flight[T], len(keys))
 	var ownKeys, ownSFKeys []string
-	var ownFlights []*flight[T]
+	var ownFlights []*flight.Flight[T]
 	var ownSeen []uint64
 	for i, sfKey := range sfKeys {
-		f, leader := c.flights.claim(sfKey)
+		f, leader := c.flights.Claim(sfKey)
 		flights[i] = f
 		if leader {
 			ownKeys = append(ownKeys, keys[i])
@@ -344,12 +288,13 @@ func (c *Client[T]) fetchMany(ctx context.Context, keys, sfKeys []string, seen [
 	results := make([]result[T], len(keys))
 	for i, f := range flights {
 		select {
-		case <-f.done:
+		case <-f.Done():
 		case <-ctx.Done():
 		}
 		select {
-		case <-f.done:
-			results[i] = result[T]{value: f.value, err: f.err}
+		case <-f.Done():
+			value, err := f.Result()
+			results[i] = result[T]{value: value, err: err}
 		default:
 			results[i].err = errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", keys[i])
 		}
@@ -387,7 +332,7 @@ func (c *Client[T]) fetchEach(ctx context.Context, keys, sfKeys []string, seen [
 // fetchClaimedMany is the batch form of fetchClaimed for a BatchUpstream:
 // double-check, then fetch what is still missing; every flight is answered as
 // soon as its result is known.
-func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight[T], seen []uint64) {
+func (c *Client[T]) fetchClaimedMany(ctx context.Context, keys, sfKeys []string, flights []*flight.Flight[T], seen []uint64) {
 	p := c.claimedFlights(keys, sfKeys, flights)
 	all := make([]int, len(keys))
 	for i := range all {
@@ -485,7 +430,7 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 	results := make([]result[T], len(keys))
 	gens := make([]uint64, len(keys))
 	for i, key := range keys {
-		gens[i] = c.stripe(key).gen.Load()
+		gens[i] = c.stripe(key).Generation()
 	}
 
 	values, err := c.upstream.(BatchUpstream[T]).GetMany(ctx, keys)
@@ -502,25 +447,25 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 	// The batch form of backfill: hold each key's stripe for reading (TryRLock
 	// never blocks, so no lock order is needed) and skip the keys whose stripe
 	// has a write in progress or whose gen moved since it was taken.
-	held := map[*writeStripe]bool{}
+	held := map[*stripe.Stripe]bool{}
 	defer func() {
 		for s, ok := range held {
 			if ok {
-				s.mu.RUnlock()
+				s.RUnlock()
 			}
 		}
 	}()
 	found := map[string]T{}
 	var notFound []string
-	filled := map[*writeStripe]bool{}
+	filled := map[*stripe.Stripe]bool{}
 	for i, key := range keys {
 		s := c.stripe(key)
 		ok, seen := held[s]
 		if !seen {
-			ok = s.mu.TryRLock()
+			ok = s.TryRLock()
 			held[s] = ok
 		}
-		if !ok || s.gen.Load() != gens[i] {
+		if !ok || s.Generation() != gens[i] {
 			continue
 		}
 		switch {
@@ -538,8 +483,8 @@ func (c *Client[T]) doFetchMany(ctx context.Context, keys []string) []result[T] 
 	if err := c.delManyWithoutUpstream(ctx, notFound); err != nil {
 		c.logger.WarnContext(ctx, "failed to delete cache entries", "error", err)
 	}
-	for s := range filled { // see writeStripe.epoch
-		s.fills.Add(1)
+	for s := range filled { // see stripe.Stripe.Epoch
+		s.AddFill()
 	}
 
 	return results

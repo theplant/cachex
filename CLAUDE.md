@@ -10,12 +10,13 @@ Go 泛型多层缓存客户端：合并回源、二次检查、不存在缓存�
 | [GLOSSARY.md](GLOSSARY.md) | 写文档、写注释、和用户讨论时，用这里的叫法 |
 | [docs/adr/](docs/adr/) | 想改一个「看起来很奇怪」的做法之前，先看有没有对应的决策 |
 | [docs/todo.md](docs/todo.md) | 发现了但这次不解决的问题都在这里 |
-| [docs/faq.md](docs/faq.md) | 用户问过的问题 |
+| [docs/faq_ZH.md](docs/faq_ZH.md) | 用户问过的问题（英文版是 `docs/faq.md`） |
 | [docs/research/](docs/research/README.md) | 实测数据；复跑脚本在 `tools/bench/` |
 
 ## 仓库布局
 
-- 根目录就是 `cachex` 包：`client.go`（单 key 读取、写入、分片锁）、`batch.go`（批量读、合并回源的 `flightGroup`）、`double_check.go`、`entry.go`、各后端（`ristretto.go`、`syncmap.go`、`bigcache.go`、`redis.go`、`gorm.go`、`transform.go`）。
+- 根目录就是 `cachex` 包：`client.go`（单 key 读取、写入、回填）、`batch.go`（批量读、`claimed`：每个在途回源恰好发布一次）、`double_check.go`、`entry.go`、各后端（`ristretto.go`、`syncmap.go`、`bigcache.go`、`redis.go`、`gorm.go`、`transform.go`）。
+- `internal/flight`（合并回源的登记表）、`internal/stripe`（分片锁）：从 cachex 里拆出来的通用部件，暂不公开；以后别的库需要时再挪到公开路径。
 - 测试和代码放在一起。`get_compat_test.go` 固定了单 key `Get` 和 main 一致的可观察行为，改它要有对应的 ADR。`gorm_container_test.go` 用 testcontainers 在 MySQL 和 PostgreSQL 上跑，没有 Docker 时自动跳过。
 - `tools/bench/<日期-主题>/`：实测的复跑脚本，带 `bench` build tag，平时的 `go test ./...` 不会运行。
 
@@ -32,11 +33,11 @@ go test -tags bench -v -run <Test> ./tools/bench/<目录>/   # 复跑实测
 
 ## 协作约定
 
-- **文档语言**：`README.md`/`README_ZH.md` 和 `BENCHMARK.md`/`BENCHMARK_ZH.md` 是中英双语，**两份必须逐段一一对应**，改一份就同步改另一份。其余文档（`GLOSSARY.md`、`docs/` 下的全部、本文件）只写中文；术语表里保留每个术语对应的英文。
+- **文档语言**：`README.md`/`README_ZH.md`、`BENCHMARK.md`/`BENCHMARK_ZH.md`、`docs/faq.md`/`docs/faq_ZH.md` 是中英双语，**两份必须逐段一一对应**，改一份就同步改另一份。其余文档（`GLOSSARY.md`、`docs/` 下的全部、本文件）只写中文；术语表里保留每个术语对应的英文。
 - **设计结论写回 design**：只写现在成立的设计，被推翻的直接删，理由写进 ADR。专题写进 `docs/design/` 的对应分篇，`docs/design.md` 跟着同步。
 - **ADR**：只给难回退、没有背景会让人意外、确实有过取舍的决定写，编号递增。
 - **不解决的问题记 todo**：当场记进 `docs/todo.md`，解决了就删。
-- **用户问过的问题记 faq**：先给结论，再给依据。
+- **用户问过的问题记 faq**：先给结论，再给依据；中英两份都要加。
 - **实测存档**：报告写进 `docs/research/` 并更新索引，脚本放进 `tools/bench/<日期-主题>/`。
 - **文档里不引用其他缓存库或同类项目**。依赖的库（例如 `golang.org/x/sync`）和 Go 官方的 issue 可以引用。
 - **提交和 PR**：提交信息、PR 描述用英文，照仓库现有的风格写，不加任何 AI 署名。行为变了就更新 PR 描述里的行为变化表。

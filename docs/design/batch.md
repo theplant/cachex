@@ -32,7 +32,7 @@ sequenceDiagram
     participant L as Client
     participant B as 后端
     participant N as 不存在缓存
-    participant G as flightGroup
+    participant G as flight.Group
     participant U as 批量上游
     C->>L: GetMany(k1..k5)
     L->>L: 去重；记下每个 key 的分片纪元
@@ -58,7 +58,7 @@ sequenceDiagram
 1. **去重**：重复的 key 只处理一次。
 2. **读后端**：一次批量读。读到的每个值按新鲜度处理：新鲜的放进结果；陈旧的也放进结果（开启返回陈旧值时），同时这些 key 在后台合成一批刷新；腐烂的和未命中的继续往下走，后面查到的也放进同一份结果。**整份结果最后一次性返回。**
 3. **查不存在缓存**：后端未命中的 key 一起查一次，规则同 `Get`。
-4. **合并回源**：需要回源的 key 逐个在同一个 flightGroup 里认领。别人正在回源的 key 直接等结果，自己领头的 key 由自己回源。见 [singleflight.md](singleflight.md#批量认领)。
+4. **合并回源**：需要回源的 key 逐个在同一个 flight.Group 里认领。别人正在回源的 key 直接等结果，自己领头的 key 由自己回源。见 [singleflight.md](singleflight.md#批量认领)。
 5. **二次检查**：只对需要的 key 再读一次本层（默认的 `DoubleCheckAuto` 下，只检查读取之后本 Client 写过其分片的 key）。
 6. **回源**：见下一节。
 7. **回填**：找到的值写进后端，不存在的 key 写进不存在缓存，并删掉后端的旧值。只写本层。

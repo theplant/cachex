@@ -2,32 +2,38 @@
 
 同一个 key 的并发未命中只回源一次：第一个请求**认领**这个 key、成为**领头请求**去回源，其他请求成为**等待方**，等它**发布**结果。`Get` 和 `GetMany` 共用同一套登记，所以一个 `Get` 和一个包含同一 key 的 `GetMany` 也只回源一次。
 
-实现是 `batch.go` 里的 `flightGroup`，替代了 main 上使用的 `golang.org/x/sync/singleflight`，原因见 [ADR 0001](../adr/0001-own-flight-group.md)。
+实现分两部分，替代了 main 上使用的 `golang.org/x/sync/singleflight`（原因见 [ADR 0001](../adr/0001-own-flight-group.md)）：
+
+- `internal/flight`：通用的登记表 `flight.Group`，只管「认领、发布、摘除」；
+- `batch.go` 里的 `claimed`：cachex 自己的一层，保证每个在途回源恰好发布一次（见下文「panic 与 Goexit」）。
+
+`internal/flight` 是内部包，暂不对外公开，以后有别的库需要时再考虑挪出去。
 
 ## 数据结构
 
 ```go
-type flight[T any] struct {
-    done  chan struct{} // 发布时关闭
-    value T
+// package flight
+type Flight[T any] struct {
+    done  chan struct{} // 发布时关闭；对外是 Done()
+    value T             // 对外是 Result()
     err   error
 }
 
-type flightGroup[T any] struct {
+type Group[T any] struct {
     mu      sync.Mutex
-    flights map[string]*flight[T] // 回源槽位 key → 在途回源
+    flights map[string]*Flight[T] // 回源槽位 key → 在途回源
 }
 ```
 
 | 操作 | 做什么 | 谁调用 |
 |---|---|---|
-| `claim(sfKey)` | 有在途回源就返回它（调用方成为等待方），没有就新建并返回「你是领头请求」。**当场**给出答案，不阻塞 | 每个要回源的请求 |
-| `finish(sfKey, f, value, err)` | 先从登记中移除（只在登记的仍是这个在途回源时才移除），再写入结果、关闭 `done` | 领头请求，每个在途回源恰好一次 |
-| `drop(sfKey)` | 从登记中移除，但不发布结果、不打断回源 | `Set`/`Del`，见 [write-order.md](write-order.md#摘除在途回源) |
+| `Claim(sfKey)` | 有在途回源就返回它（调用方成为等待方），没有就新建并返回「你是领头请求」。**当场**给出答案，不阻塞 | 每个要回源的请求 |
+| `Finish(sfKey, f, value, err)` | 先从登记中移除（只在登记的仍是这个在途回源时才移除），再写入结果、关闭 `done` | 领头请求，每个在途回源恰好一次 |
+| `Drop(sfKey)` | 从登记中移除，但不发布结果、不打断回源 | `Set`/`Del`，见 [write-order.md](write-order.md#摘除在途回源) |
 
 「只在登记的仍是这个在途回源时才移除」很重要：一个被 `Set`/`Del` 摘除的回源结束时，登记里可能已经是写入之后新建的回源，不能把它删掉（见 [write-order.md](write-order.md#摘除在途回源)）。
 
-`finish` **先移除、再发布**：一个请求拿到结果后立刻再来读，会发现没有在途回源，于是新建一个；这时它的二次检查会读到刚回填的值。反过来，如果先发布再移除，它就可能加入一个已经结束的回源。
+`Finish` **先移除、再发布**：一个请求拿到结果后立刻再来读，会发现没有在途回源，于是新建一个；这时它的二次检查会读到刚回填的值。反过来，如果先发布再移除，它就可能加入一个已经结束的回源。
 
 ## 单个 key 的时序
 
@@ -35,13 +41,13 @@ type flightGroup[T any] struct {
 sequenceDiagram
     participant A as 请求 A
     participant B as 请求 B
-    participant G as flightGroup
+    participant G as flight.Group
     participant F as 回源 goroutine
     participant U as 上游
-    A->>G: claim(k)
+    A->>G: Claim(k)
     G-->>A: 新建 flight，A 是领头请求
     A->>F: 启动回源（脱离 A 的取消）
-    B->>G: claim(k)
+    B->>G: Claim(k)
     G-->>B: 已有 flight，B 是等待方
     par A 和 B 都等同一个 flight
         A->>A: 等 done 或自己的 ctx 结束
@@ -51,7 +57,7 @@ sequenceDiagram
     F->>U: Get(k)
     U-->>F: v
     F->>F: 回填本层
-    F->>G: finish：先移除登记，再写入 v、关闭 done
+    F->>G: Finish：先移除登记，再写入 v、关闭 done
     G-->>A: v
     G-->>B: v
 ```
@@ -115,14 +121,14 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant M as GetMany(k1, k2, k3)
-    participant G as flightGroup
+    participant G as flight.Group
     participant X as 另一个 Get(k2)
     participant F as 批量回源 goroutine
     participant U as 批量上游
-    X->>G: claim(k2)，成为 k2 的领头请求
-    M->>G: claim(k1) → 领头
-    M->>G: claim(k2) → 等待方（X 正在回源）
-    M->>G: claim(k3) → 领头
+    X->>G: Claim(k2)，成为 k2 的领头请求
+    M->>G: Claim(k1) → 领头
+    M->>G: Claim(k2) → 等待方（X 正在回源）
+    M->>G: Claim(k3) → 领头
     M->>F: 回源自己领头的 k1、k3
     F->>U: GetMany(k1, k3)
     U-->>F: 结果
@@ -142,4 +148,4 @@ sequenceDiagram
 
 ## 使用约束
 
-上游不能在回源时**同步**回调同一个 Client 读取同一个 key：这个 key 已经被调用方认领了，回调会等待它自己的结果，形成自锁。分层的 Client 不受影响，因为每一层都有自己的 flightGroup。
+上游不能在回源时**同步**回调同一个 Client 读取同一个 key：这个 key 已经被调用方认领了，回调会等待它自己的结果，形成自锁。分层的 Client 不受影响，因为每一层都有自己的 flight.Group。
