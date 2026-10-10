@@ -27,8 +27,8 @@ type Group[K comparable, T any] struct {
 }
 
 // Claim returns the key's flight and whether the caller leads it (it was just
-// created). The leader must call Finish exactly once; everyone else waits on
-// Done.
+// created). The leader must Publish exactly once and Forget the flight (or
+// Finish, which does both); everyone else waits on Done.
 func (g *Group[K, T]) Claim(key K) (*Flight[T], bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -43,7 +43,8 @@ func (g *Group[K, T]) Claim(key K) (*Flight[T], bool) {
 	return f, true
 }
 
-// Finish publishes f's result and unregisters f: Publish then Forget.
+// Finish unregisters f, then publishes its result: a caller that sees the
+// result and claims key again starts a new flight.
 func (g *Group[K, T]) Finish(key K, f *Flight[T], value T, err error) {
 	g.Forget(key, f)
 	g.Publish(f, value, err)
