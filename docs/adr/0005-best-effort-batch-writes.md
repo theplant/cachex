@@ -1,6 +1,6 @@
 # 批量写尽力而为
 
-后端的 `SetMany`/`DelMany` 对每个 key 都尝试写，失败的 key 列在原样返回的 `*BatchError` 里，其余照常写入；返回其他 error 表示不知道哪些写成功了。所有内置后端都照此实现：Redis 逐条命令判断错误；GORM 每段一条语句、独立提交，某段失败就继续写后面的段；`Batched` 逐个 key 进行。理由是：回填时多缓存一个 key 就少一次回源；写入时 `Cache` 能按 key 处理失败（只删失败的 key，见 [ADR 0002](0002-upstream-first-writes.md)），而整批回滚只会让本来能写进去的 key 也一起失败。
+后端的 `SetMany`/`DelMany` 对每个 key 都尝试写，失败的 key 列在原样返回的 `*BatchError` 里，其余照常写入；返回其他 error 表示不知道哪些写成功了。所有内置后端都照此实现：Redis 逐条命令判断错误；GORM 每段一条语句、独立提交，某段失败就继续写后面的段；`Batched` 逐个 key 进行。理由是：回填时多缓存一个 key 就少一次回源；写入时 `Cache` 能按 key 处理失败（只删失败的 key，见 [ADR 0002](0002-bottom-up-writes.md)），而整批回滚只会让本来能写进去的 key 也一起失败。
 
 ## 考虑过的方案
 

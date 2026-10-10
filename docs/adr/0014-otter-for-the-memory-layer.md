@@ -3,7 +3,7 @@
 v1 的 `RistrettoCache` 有几处问题：
 
 - `DefaultRistrettoCacheConfig` 的 `MaxCost: 1<<30` 注释写的是 1GB，但每次 `Set` 传的成本是 1，加上内部开销，容量其实是一千多万个条目，值的大小完全不计入，缓存大对象时内存没有上限。
-- `NumCounters: 1e7` 每个实例固定占约 30MB；v1 再配一个 ristretto 做不存在缓存就是两份。
+- `NumCounters: 1e7` 每个实例固定占约 30MB；v1 再配一个 ristretto 存不存在记录就是两份。
 - 每次 `Set` 都调用 `Wait()` 才能保证「写完能读到」，所有写入因此串行。
 - 写入缓冲区满或被准入策略拒绝时，`Set` 会被静默丢弃。
 - 在偏重「最近访问」的负载下，命中率明显低于 W-TinyLFU。
@@ -20,5 +20,5 @@ BigCache 保留为 `bigcachex`：值按 `Codec` 编码成字节存储。GC 要�
 ## 后果
 
 - otter 是 Apache-2.0。只有 import 了 `ottercachex` 或 `bigcachex` 的程序会链接进这些代码，向他人分发二进制时要附上它们的 LICENSE。
-- `bigcachex` 里过期的条目由 BigCache 自己的 `LifeWindow` 和容量淘汰清理，Cache 读取时按 `ExpiresAt` 判断是否可用。
+- `bigcachex` 里腐烂的条目由 BigCache 自己的 `LifeWindow` 和容量淘汰清理，Cache 读取时按 `ExpiresAt` 判断是否可用。
 - 内存后端返回的值是同一份：`T` 是指针时，调用方修改返回的值会改坏缓存。`bigcachex` 每次解码出新值，没有这个问题。

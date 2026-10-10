@@ -1,5 +1,7 @@
 # v2：后端接口必须支持批量，后端拆成子包，字节后端用 Codec
 
+> 被 [ADR 0015](0015-byte-backends-through-encoded.md) 部分取代：解码失败当未命中、条目的编码和「已经腐烂的条目不写入」不再由每个字节后端各自负责，统一放进 `cachex.Encoded`。
+
 v1 的批量能力是可选接口（`BatchCache`），Client 每次靠类型断言决定走批量还是逐个；一个后端经过 `Transform` 包装，批量能力就悄悄消失。核心包还直接 import 了 gorm、go-redis、ristretto、bigcache，回源逻辑也认识 GORM 事务放在 ctx 里的 key。
 
 v2 的做法：
