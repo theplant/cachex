@@ -280,6 +280,24 @@ func TestLayers(t *testing.T) {
 		assert.EqualValues(t, 1, s.src.calls.Load(), "the second read is answered by the layer below")
 	})
 
+	t.Run("a batch source is not asked when a lower layer answers", func(t *testing.T) {
+		src := newBatchSource(map[string]string{"a": "1"})
+		l2 := cachextest.NewMap[string]()
+		var log logs
+		c := cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer(cachextest.NewMap[string](), cachex.TTL(time.Minute, 0)),
+			cachex.NewLayer(l2, cachex.TTL(time.Minute, 0)),
+		}, log.option())
+		require.NoError(t, l2.Set(ctx, "a", cachex.Entry[string]{Value: "below", FreshUntil: time.Now().Add(time.Hour), ExpiresAt: time.Now().Add(time.Hour)}))
+		v, err := c.Get(ctx, "a")
+		require.NoError(t, err)
+		assert.Equal(t, "below", v)
+		assert.Empty(t, src.batchCalls())
+		assert.Zero(t, src.calls.Load())
+		require.NoError(t, c.Close()) // waits for the fetch to finish
+		assert.Empty(t, log.String())
+	})
+
 	t.Run("a lower layer that cannot be read fails the read", func(t *testing.T) {
 		src := newSource(map[string]string{"a": "1"})
 		l2 := newFaulty[string](cachextest.NewMap[string]())
@@ -367,4 +385,31 @@ func TestMaxAgeAndJitter(t *testing.T) {
 		}
 		assert.Greater(t, len(distinct), 100, "entries written together turn stale at different times")
 	})
+}
+
+func TestCloseWaitsForTheFetchesInProgress(t *testing.T) {
+	src := newSource(map[string]string{"a": "1"})
+	src.gate = make(chan struct{})
+	calls, onGet := started()
+	src.onGet = onGet
+	mem := cachextest.NewMap[string]()
+	c := cachex.New(src, oneLayer(mem))
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _, _ = c.Get(ctx, "a") }()
+	<-calls
+	cancel() // the caller leaves; the fetch goes on
+
+	closed := make(chan struct{})
+	go func() { _ = c.Close(); close(closed) }()
+	require.Never(t, func() bool {
+		select {
+		case <-closed:
+			return true
+		default:
+			return false
+		}
+	}, 50*time.Millisecond, time.Millisecond)
+	close(src.gate)
+	<-closed
+	assert.Equal(t, 1, mem.Len(), "the backfill is done before Close returns")
 }

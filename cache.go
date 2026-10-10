@@ -54,7 +54,7 @@ type Cache[T any] struct {
 
 	mu     sync.Mutex // guards closed and adding to wg
 	closed bool
-	wg     sync.WaitGroup // background refreshes
+	wg     sync.WaitGroup // fetches and refreshes started before Close
 }
 
 // flightKey is a key and one of its fetch slots (see WithFetchesPerKey).
@@ -192,12 +192,31 @@ func sharedCtx(ctx context.Context) context.Context {
 	return context.WithValue(context.WithoutCancel(ctx), sharedKey{}, true)
 }
 
-// Close stops starting background refreshes and waits for the running ones.
-// It does not close the backends. The Cache still serves reads and writes.
+// Close waits for the fetches and background refreshes in progress (and
+// their backfills), so that the backends can be closed after it, and starts
+// no more background refreshes. It does not close the backends. The Cache
+// still serves reads and writes.
 func (c *Cache[T]) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
 	c.wg.Wait()
 	return nil
+}
+
+// background runs f in a goroutine that Close waits for, if Close has not
+// been called yet.
+func (c *Cache[T]) background(f func()) {
+	c.mu.Lock()
+	tracked := !c.closed
+	if tracked {
+		c.wg.Add(1)
+	}
+	c.mu.Unlock()
+	go func() {
+		if tracked {
+			defer c.wg.Done()
+		}
+		f()
+	}()
 }

@@ -43,7 +43,8 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 	f, leader := c.flights.Claim(fk)
 	if leader {
 		p := c.claim([]string{key}, []flightKey{fk}, []*flight.Flight[T]{f})
-		go c.resolve(sharedCtx(ctx), p, []uint64{seen}, false)
+		fctx := sharedCtx(ctx)
+		c.background(func() { c.resolve(fctx, p, []uint64{seen}, false) })
 	}
 	return c.await(ctx, key, f)
 }
@@ -138,7 +139,8 @@ func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64, 
 		}
 	}
 	if len(ownKeys) > 0 {
-		go c.resolve(sharedCtx(ctx), c.claim(ownKeys, ownFKs, ownFlights), ownSeen, refresh)
+		fctx, p := sharedCtx(ctx), c.claim(ownKeys, ownFKs, ownFlights)
+		c.background(func() { c.resolve(fctx, p, ownSeen, refresh) })
 	}
 	results := make([]result[T], len(keys))
 	for i, f := range flights {
@@ -359,7 +361,10 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], gens []uint64, 
 // a BatchSource, key by key otherwise, up to getManyConc calls at once. Each
 // call's answers are backfilled and published as soon as it returns.
 func (c *Cache[T]) askSource(ctx context.Context, p *claimed[T], gens []uint64, idxs []int) {
-	if len(idxs) == 1 {
+	switch len(idxs) {
+	case 0:
+		return
+	case 1:
 		c.askSourceOne(ctx, p, gens, idxs[0])
 		return
 	}
