@@ -142,10 +142,10 @@ func anys(keys []string) []any {
 // column must compare keys exactly (case, trailing spaces): Migrate creates
 // tables with utf8mb4_0900_bin, which needs MySQL 8.0.17 or later, and rejects
 // an existing table whose key column uses another collation, with the
-// statement that converts it.
+// statement that converts it. It runs on Config.DB, never in a transaction
+// WithTx put in ctx: on MySQL, DDL would commit it.
 func (b *Backend[T]) Migrate(ctx context.Context) error {
-	db, _ := b.conn(ctx)
-	db = db.Table(b.table)
+	db := b.db.WithContext(ctx).Table(b.table)
 	if db.Name() == "mysql" {
 		if db.Migrator().HasTable(b.table) {
 			if err := b.checkMySQLKeyCollation(db); err != nil {

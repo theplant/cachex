@@ -82,6 +82,19 @@ func TestTransactions(t *testing.T) {
 		assert.False(t, ok, "rolled back with it")
 	})
 
+	t.Run("Migrate never runs in the caller's transaction", func(t *testing.T) {
+		// on MySQL, DDL would commit the caller's transaction
+		db := newSQLite(t)
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		sqlDB.SetMaxOpenConns(2) // the transaction's and Migrate's
+		tx := db.Begin()
+		b := New[string](Config[string]{DB: db, TableName: "cache"})
+		require.NoError(t, b.Migrate(WithTx(ctx, tx)))
+		require.NoError(t, tx.Rollback().Error)
+		assert.True(t, db.Migrator().HasTable("cache"), "the table outlives the rolled-back transaction")
+	})
+
 	t.Run("a shared fetch does not use the caller's transaction", func(t *testing.T) {
 		db := newSQLite(t)
 		b := newBackend(t, Config[string]{DB: db})
