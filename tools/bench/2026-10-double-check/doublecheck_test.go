@@ -10,11 +10,13 @@ package bench
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/theplant/cachex"
 )
 
@@ -67,32 +69,52 @@ func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (upstreamCa
 	return calls.Load(), float64(backend.reads.Load()) / float64(n.Load())
 }
 
+// spread is the min, median and max of xs.
+func spread[N int64 | float64](xs []N) (lo, mid, hi N) {
+	xs = slices.Clone(xs)
+	slices.Sort(xs)
+	return xs[0], xs[len(xs)/2], xs[len(xs)-1]
+}
+
 func TestDoubleCheckValue(t *testing.T) {
+	const rounds = 5
 	modes := []struct {
 		name string
 		mode cachex.DoubleCheckMode
 	}{{"enabled", cachex.DoubleCheckEnabled}, {"auto", cachex.DoubleCheckAuto}, {"disabled", cachex.DoubleCheckDisabled}}
+	// medians by "hot|cold/delay/mode", for the assertions below
+	callsMid, readsMid := map[string]int64{}, map[string]float64{}
 	for _, hot := range []bool{true, false} {
 		for _, delay := range []time.Duration{0, 200 * time.Microsecond, time.Millisecond} {
 			if !hot && delay != time.Millisecond {
 				continue // cold keys: only the cost matters, one latency is enough
 			}
 			for _, m := range modes {
-				const rounds = 3
-				var calls int64
-				var reads float64
-				for range rounds {
-					c, r := run(m.mode, delay, hot)
-					calls += c
-					reads += r
+				calls, reads := make([]int64, rounds), make([]float64, rounds)
+				for i := range rounds {
+					calls[i], reads[i] = run(m.mode, delay, hot)
 				}
 				scenario := "hot key, expires every 20ms"
+				id := fmt.Sprintf("hot/%v/%s", delay, m.name)
 				if !hot {
 					scenario = "8000 cold keys"
+					id = fmt.Sprintf("cold/%v/%s", delay, m.name)
 				}
-				t.Logf("%-28s backend=%-6v %-9s upstream calls %5d   backend reads per Get %.3f",
-					scenario, delay, m.name, calls/rounds, reads/rounds)
+				cLo, cMid, cHi := spread(calls)
+				rLo, rMid, rHi := spread(reads)
+				callsMid[id], readsMid[id] = cMid, rMid
+				t.Logf("%-28s backend=%-6v %-9s upstream calls %3d [%d..%d]   backend reads per Get %.3f [%.3f..%.3f]",
+					scenario, delay, m.name, cMid, cLo, cHi, rMid, rLo, rHi)
 			}
 		}
 	}
+
+	// hot key behind a 1ms backend: the double-check saves upstream calls,
+	// and the on-demand one keeps most of the saving
+	assert.Greater(t, float64(callsMid["hot/1ms/disabled"]), 1.2*float64(callsMid["hot/1ms/enabled"]))
+	assert.Less(t, callsMid["hot/1ms/auto"], callsMid["hot/1ms/disabled"])
+	// cold keys: always on reads the backend twice per miss, on demand almost never
+	assert.Greater(t, readsMid["cold/1ms/enabled"], 1.9)
+	assert.Less(t, readsMid["cold/1ms/auto"], 1.05)
+	assert.InDelta(t, 1.0, readsMid["cold/1ms/disabled"], 0.001)
 }
