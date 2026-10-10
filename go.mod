@@ -1,4 +1,4 @@
-module github.com/theplant/cachex
+module github.com/theplant/cachex/v2
 
 go 1.26.0
 

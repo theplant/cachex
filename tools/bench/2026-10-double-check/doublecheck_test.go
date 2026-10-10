@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/theplant/cachex"
+	"github.com/theplant/cachex/v2"
 )
 
 // slowBackend answers like a remote cache: it reads, then the reply takes

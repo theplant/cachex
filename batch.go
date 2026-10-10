@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/theplant/cachex/internal/flight"
-	"github.com/theplant/cachex/internal/stripe"
+	"github.com/theplant/cachex/v2/internal/flight"
+	"github.com/theplant/cachex/v2/internal/stripe"
 )
 
 var _ BatchUpstream[any] = &Client[any]{}
