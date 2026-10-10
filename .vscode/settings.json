@@ -1,3 +1,0 @@
-{
-  "go.testFlags": ["-v", "-count=1", "-coverpkg=github.com/theplant/cachex/..."]
-}

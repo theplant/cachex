@@ -15,7 +15,7 @@ import (
 // not even expired ones (the Cache does not serve those), so it is not meant
 // for production.
 type Map[T any] struct {
-	entries sync.Map // string -> cachex.Entry[T]
+	entries sync.Map // string -> *cachex.Entry[T]: a pointer, so a read copies the entry once
 }
 
 var _ cachex.Backend[any] = (*Map[any])(nil)
@@ -28,7 +28,7 @@ func (m *Map[T]) Get(_ context.Context, key string) (cachex.Entry[T], bool, erro
 	if !ok {
 		return cachex.Entry[T]{}, false, nil
 	}
-	return e.(cachex.Entry[T]), true, nil
+	return *e.(*cachex.Entry[T]), true, nil
 }
 
 func (m *Map[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[T], error) {
@@ -42,13 +42,13 @@ func (m *Map[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.
 }
 
 func (m *Map[T]) Set(_ context.Context, key string, e cachex.Entry[T]) error {
-	m.entries.Store(key, e)
+	m.entries.Store(key, &e)
 	return nil
 }
 
 func (m *Map[T]) SetMany(_ context.Context, entries map[string]cachex.Entry[T]) error {
 	for key, e := range entries {
-		m.entries.Store(key, e)
+		m.entries.Store(key, &e)
 	}
 	return nil
 }

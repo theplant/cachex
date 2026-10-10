@@ -144,15 +144,47 @@ if errors.As(err, &be) {
 
 Your own store implements `Backend[T]`, or `SingleBackend[T]` wrapped with `cachex.Batched`. A store of bytes encodes entries with `cachex.EncodeEntry`/`DecodeEntry` and a `Codec`.
 
-## Must know
+## Pitfalls
 
-- **"Does not exist" is `ErrNotFound`.** Test it with `errors.Is`. A cached nil is a value, not a miss.
-- **`GetMany` has three outcomes per key:** in the map (found), absent from the map and from the error (does not exist), or listed in the `*BatchError` (failed).
-- **Change the source first, then write through the same `Cache`.** The order guarantee holds within one `Cache` in one process.
-- **Across instances, the TTLs are the only bound.** Another instance's memory layer keeps an old value until its entry turns rotten; set each layer's TTLs to how long old data is acceptable.
-- **In-memory backends return the stored value itself.** Do not modify a value you got from `ottercachex` or `cachextest`.
-- **When the value type changes incompatibly, change `KeyPrefix`.** JSON decodes leniently: a renamed field reads back as a zero value instead of failing.
-- **Call `Close` before closing the backends.** It waits for the fetches and refreshes in progress.
+Each item: the mistake, what happens, what to do.
+
+**Source**
+
+- **Returning `nil, nil` for a missing key.** The zero value is cached as a real value. Return `cachex.ErrNotFound` (wrapping it is fine).
+- **Returning `ErrNotFound` from `BatchSource.GetMany`.** Every key of the call reads as missing but nothing is cached, so each read asks again. Leave missing keys out of the map; for some keys failing, return a `*cachex.BatchError` as is, not wrapped.
+- **Relying on the caller's cancellation inside the source.** A fetch is shared by every caller waiting for the key, so its ctx does not end when one caller leaves; it is bounded by `WithFetchTimeout` instead, and keeps the caller's values. Do not use caller state from it, such as a database transaction (`cachex.IsShared(ctx)` tells you it is a fetch).
+- **Calling the same `Cache` for the same key from inside the source.** The call waits for the fetch it is part of and fails at the fetch timeout.
+- **A source without `GetMany` behind large `GetMany` calls.** Keys are fetched one by one (`WithGetManyConcurrency` at a time), and a concurrent `Get` of a queued key waits for its turn. Implement `BatchSource`.
+
+**Reads**
+
+- **Treating `err != nil` from `GetMany` as "nothing found".** The map holds every key that succeeded; only the keys in the `*BatchError` failed. A key absent from both does not exist.
+- **Testing presence with `m[k] == nil`.** A cached nil is a value. Use `v, ok := m[k]`.
+- **Expecting a stale value never to be returned.** With a stale TTL above zero, a value past its fresh TTL is returned at once and refreshed in the background. Use a zero stale TTL where that is not acceptable.
+- **Values that expire on their own (tokens, signed URLs) cached for the layer TTL.** Use `WithMaxAge` so an entry never outlives the value.
+- **Expecting a broken layer to be skipped.** If a layer cannot be read, the read fails rather than sending every request to the source.
+- **Checking a backend right after `Get` returns.** The answer is returned before it is written into the layers. Call `Close` first in tests.
+
+**Writes**
+
+- **Writing the cache before the source, or only the cache.** `Set` and `Del` never write the source. Change the source first, then call `Set` or `Del` on the same `Cache`; the other order lets a read in between cache the old value again.
+- **Expecting a write in one process to reach another's memory layer.** It does not; across instances only the TTLs bound how long old data lives. Set each layer's TTLs to what you can accept.
+- **Expecting `Del` to record that the key no longer exists.** It only drops the entries; the next read asks the source.
+- **Ignoring an error from `Set` or `Del`.** The layers below the failed one may hold the new value; the key is dropped from the failed layer and those above (best effort). The source is as you left it.
+
+**Values and backends**
+
+- **Modifying a value you got from an in-memory backend** (`ottercachex`, `cachextest.Map`). It is the stored value itself, shared with every reader. Treat values as read-only, or copy them.
+- **Changing a value type incompatibly and keeping `KeyPrefix`.** JSON decodes leniently: a renamed field reads back as a zero value. Change `KeyPrefix` with the type.
+- **`ottercachex` without a bound.** `New` fails: set `MaximumSize`, or `MaximumWeight` with a `Weigher`.
+- **`bigcachex` with a `LifeWindow` shorter than the layer's TTLs.** Entries disappear early. Use it only for millions of entries where GC shows in profiles; every read decodes.
+- **`gormcachex` without `Migrate`, or a MySQL table not in `utf8mb4_0900_bin`.** `Migrate` creates the table, and rejects an existing MySQL table whose key column compares case-insensitively. Keys, `KeyPrefix` included, are at most 255 characters. Expired rows are not deleted for you. Only each database's default isolation level is supported.
+- **`gormcachex.WithTx` expecting every write to join the transaction.** `Set`/`Del` with that ctx do; the backfill of a fetch never does.
+- **`cachex.NewLayer(backend, …)` failing to compile with a concrete backend.** Go cannot infer `T` from it: write `cachex.NewLayer[*Product](backend, …)`.
+
+**Lifecycle**
+
+- **Closing the backends while the `Cache` still works.** Call `Close` first: it waits for the fetches, their backfills, background refreshes and the invalidations of writes that gave up.
 
 ## Documentation
 
