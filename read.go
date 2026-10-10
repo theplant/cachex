@@ -101,7 +101,7 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 		}
 	}
 
-	for i, r := range c.fetchMany(ctx, missKeys, missSeen, false) {
+	for i, r := range c.fetchMany(ctx, missKeys, missSeen) {
 		key := missKeys[i]
 		switch {
 		case r.err != nil:
@@ -123,9 +123,8 @@ type result[T any] struct {
 // fetchMany fetches keys through the flight group: it claims every key,
 // resolves the ones it leads in one background call, and waits for all of
 // them (including those led by others). seen is each key's stripe epoch from
-// before the caller read the first layer. A refresh claims flights of its own
-// (see flightKey).
-func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64, refresh bool) []result[T] {
+// before the caller read the first layer.
+func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64) []result[T] {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -135,7 +134,7 @@ func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64, 
 	var ownFlights []*flight.Flight[Entry[T]]
 	var ownSeen []uint64
 	for i, key := range keys {
-		fk := c.flightKey(key, refresh)
+		fk := c.flightKey(key, false)
 		f, leader := c.flights.Claim(fk)
 		flights[i] = f
 		if leader {
@@ -146,7 +145,7 @@ func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64, 
 		}
 	}
 	if len(ownKeys) > 0 {
-		fctx, p := sharedCtx(ctx), c.claim(ownKeys, ownFKs, ownFlights, ownSeen, refresh)
+		fctx, p := sharedCtx(ctx), c.claim(ownKeys, ownFKs, ownFlights, ownSeen, false)
 		c.background(func() { c.resolve(fctx, p) })
 	}
 	results := make([]result[T], len(keys))
@@ -172,7 +171,7 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[Entry
 }
 
 func (c *Cache[T]) flightKey(key string, refresh bool) flightKey {
-	if c.opts.fetchesPerKey == 1 {
+	if refresh || c.opts.fetchesPerKey == 1 { // a key has one refresh at a time
 		return flightKey{key: key, refresh: refresh}
 	}
 	return flightKey{key: key, slot: rand.IntN(c.opts.fetchesPerKey), refresh: refresh}
@@ -185,9 +184,10 @@ func (c *Cache[T]) dropFlights(key string) {
 		c.flights.Drop(flightKey{key: key}, flightKey{key: key, refresh: true})
 		return
 	}
-	fks := make([]flightKey, 0, 2*c.opts.fetchesPerKey)
+	fks := make([]flightKey, 0, c.opts.fetchesPerKey+1)
+	fks = append(fks, flightKey{key: key, refresh: true})
 	for slot := range c.opts.fetchesPerKey {
-		fks = append(fks, flightKey{key: key, slot: slot}, flightKey{key: key, slot: slot, refresh: true})
+		fks = append(fks, flightKey{key: key, slot: slot})
 	}
 	c.flights.Drop(fks...)
 }
@@ -494,16 +494,25 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 }
 
 // refresh refetches keys in the background (stale entries below the first
-// layer do not count), one refresh per key at a time. seen, if not nil, is
-// each key's stripe epoch from before the caller read the first layer.
+// layer do not count): it leads a refresh flight for each key that has none,
+// and skips the others. seen, if not nil, is each key's stripe epoch from
+// before the caller read the first layer.
 func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
+	done, ok := c.track() // before claiming: a claimed flight must be resolved
+	if !ok {              // closed: no more refreshes
+		return
+	}
 	var own []string
+	var ownFKs []flightKey
+	var ownFlights []*flight.Flight[Entry[T]]
 	var ownSeen []uint64
 	for i, key := range keys {
-		if _, loaded := c.refreshing.LoadOrStore(key, struct{}{}); loaded {
+		fk := c.flightKey(key, true)
+		f, leader := c.flights.Claim(fk)
+		if !leader {
 			continue
 		}
-		own = append(own, key)
+		own, ownFKs, ownFlights = append(own, key), append(ownFKs, fk), append(ownFlights, f)
 		if seen != nil {
 			ownSeen = append(ownSeen, seen[i])
 		} else {
@@ -511,25 +520,16 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 		}
 	}
 	if len(own) == 0 {
+		done()
 		return
 	}
-	forget := func() {
-		for _, key := range own {
-			c.refreshing.Delete(key)
-		}
-	}
-	done, ok := c.track()
-	if !ok { // closed: no more refreshes
-		forget()
-		return
-	}
-	ctx = sharedCtx(ctx)
+	ctx, p := sharedCtx(ctx), c.claim(own, ownFKs, ownFlights, ownSeen, true)
 	go func() {
 		defer done()
-		defer forget()
-		for i, r := range c.fetchMany(ctx, own, ownSeen, true) {
-			if r.err != nil {
-				c.opts.logger.ErrorContext(ctx, "cachex: background refresh failed", "key", own[i], "error", r.err)
+		c.resolve(ctx, p)
+		for i, f := range ownFlights {
+			if _, err := f.Result(); err != nil {
+				c.opts.logger.ErrorContext(ctx, "cachex: background refresh failed", "key", own[i], "error", err)
 			}
 		}
 	}()
