@@ -56,7 +56,7 @@
 |---|---|---|
 | `unordered` | 修复之前的写法：随机顺序 upsert，普通 `DELETE` | **必须**复现出死锁，否则说明负载没有触发竞态，实验无效 |
 | `ordered` | 统一加锁顺序，不重试 | PostgreSQL 上必须零死锁（MySQL 的间隙锁允许少量死锁） |
-| `ordered+retry` | 直接调用现在的 `GORMCache` | 零死锁、零错误传到调用方 |
+| `ordered+retry` | 直接调用 v1 的 `GORMCache`（v2 起是 `gormcachex`） | 零死锁、零错误传到调用方 |
 | `table lock` | 整表串行写：MySQL 在同一个连接上，于事务开始前取命名锁、提交后释放；PostgreSQL 用事务级咨询锁 | 零死锁、零错误，并且锁内同一时刻最多只有 1 个写入 |
 
 每种策略还会记录一条真实的死锁错误样本，确认计数的确实是数据库的死锁（MySQL 是 `Error 1213 (40001): Deadlock found…`，PostgreSQL 是 `ERROR: deadlock detected (SQLSTATE 40P01)`）。
@@ -71,7 +71,7 @@
 |---|---|---|---|---|
 | unordered | 1072 次死锁 | 1052 次死锁 | 781 次死锁（646 秒） | 747 次死锁（620 秒） |
 | ordered | 11 次死锁，796 ops/s | 8 次死锁，607 ops/s | 0，1326 ops/s | 0，1516 ops/s |
-| ordered+retry（GORMCache） | **0，794 ops/s** | **0，533 ops/s** | **0，1561 ops/s** | **0，1613 ops/s** |
+| ordered+retry（v1 GORMCache） | **0，794 ops/s** | **0，533 ops/s** | **0，1561 ops/s** | **0，1613 ops/s** |
 | table lock | 0，462 ops/s（-42%） | 0，315 ops/s（-41%） | 0，787 ops/s（-50%） | 0，833 ops/s（-48%） |
 
 - 第 2 遍运行时，机器上同时在跑其他测试，MySQL 的绝对吞吐偏低；各策略之间的相对关系不变。
@@ -79,6 +79,19 @@
 - `unordered` 在 MySQL 上看起来吞吐很高，是因为大部分操作直接以死锁失败返回了。
 
 脚本只复现第二轮的设置（2000 个 key）；第一轮的「只重试」和「READ COMMITTED」两种方案没有放进脚本。
+
+### v2 的 gormcachex（2026-10-10）
+
+v2 把后端拆成 `gormcachex`，表多了 `expires_at` 列、值改成编码后的字节，加锁顺序和重试不变。用同一个脚本、同样的负载跑了一遍，断言全部通过：
+
+| 策略 | MySQL 8.4 | PostgreSQL 16 |
+|---|---|---|
+| unordered | 1075 次死锁 | 746 次死锁（657 秒） |
+| ordered | 5 次死锁，360 ops/s | 0，1354 ops/s |
+| **ordered+retry（gormcachex）** | **0，797 ops/s** | **0，1115 ops/s** |
+| table lock | 0，396 ops/s（-50%） | 0，855 ops/s（-23%） |
+
+和 v1 的结论一致：统一加锁顺序加有限重试，两个库上都没有死锁传到调用方，吞吐和 v1 相当；锁表的损失仍然明显。这一遍跑在本机同时有其他测试运行的时候，PostgreSQL 的锁表损失比前面小，绝对数字只作参考。
 
 ## 复跑
 
