@@ -90,7 +90,7 @@ func BenchmarkGet(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		hit(b, NewClient(r, benchUpstream(nil, nil)))
 	})
 	b.Run("hit/l2", func(b *testing.B) {

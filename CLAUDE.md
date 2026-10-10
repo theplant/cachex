@@ -25,7 +25,7 @@ Go 泛型多层缓存客户端：合并回源、二次检查、不存在缓存�
 ```sh
 go test -race ./...                                 # 全量，约 3 分钟
 go test -short -p=1 -count=1 ./...                  # CI 的跑法
-golangci-lint run ./...                             # 用 CI 锁定的 v2.13.2；本机旧版本跑不了 go1.26 的代码
+golangci-lint run ./...                             # 本机和 CI 都用 v2.14.0（CI 锁在 .github/workflows/go.yml）
 go test -tags bench -v -run <Test> ./tools/bench/<目录>/   # 复跑实测
 ```
 
