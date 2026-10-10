@@ -290,12 +290,12 @@ func (c *Cache[T]) doubleCheck(ctx context.Context, p *claimed[T], seen []uint64
 		return pending
 	}
 	cctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
-	es, err := c.layers[0].backend.GetMany(cctx, keysAt(p.keys, check))
+	found := readLayer(cctx, c.layers[0].backend, p.keys, check)
 	cancel()
 	now := c.opts.now()
 	for _, i := range check {
 		key := p.keys[i]
-		if e, ok := es[key]; ok && errForKey(err, key) == nil && e.state(now) == fresh {
+		if e, ok, err := found(key); ok && err == nil && e.state(now) == fresh {
 			value, rerr := e.result()
 			p.publish(i, value, rerr)
 			continue
@@ -319,20 +319,20 @@ type fill[T any] struct {
 func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], gens []uint64, idxs []int, refresh bool) []int {
 	for li := 1; li < len(c.layers) && len(idxs) > 0; li++ {
 		lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
-		es, err := c.layers[li].backend.GetMany(lctx, keysAt(p.keys, idxs))
-		cancel()
+		found := readLayer(lctx, c.layers[li].backend, p.keys, idxs)
 		now := c.opts.now()
 		var next, hit []int
 		var fills []fill[T]
 		var staleKeys []string
 		for _, i := range idxs {
 			key := p.keys[i]
-			if kerr := errForKey(err, key); kerr != nil {
+			e, ok, err := found(key)
+			if err != nil {
 				var zero T
-				p.publish(i, zero, fmt.Errorf("cachex: get %q from layer %d: %w", key, li, kerr))
+				p.publish(i, zero, fmt.Errorf("cachex: get %q from layer %d: %w", key, li, err))
 				continue
 			}
-			if e, ok := es[key]; ok {
+			if ok {
 				if st := e.state(now); st == fresh || st == stale && !refresh {
 					hit = append(hit, i)
 					fills = append(fills, fill[T]{key: key, gen: gens[i], entry: e})
@@ -344,7 +344,8 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], gens []uint64, 
 			}
 			next = append(next, i)
 		}
-		c.backfill(ctx, li, fills)
+		c.backfill(lctx, li, fills)
+		cancel()
 		for j, i := range hit {
 			value, rerr := fills[j].entry.result()
 			p.publish(i, value, rerr)
@@ -392,15 +393,15 @@ func (c *Cache[T]) askSource(ctx context.Context, p *claimed[T], gens []uint64, 
 func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], gens []uint64, i int) {
 	key := p.keys[i]
 	sctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
+	defer cancel() // after the backfill, which the same timeout bounds
 	value, err := c.source.Get(sctx, key)
-	cancel()
 	var zero T
 	switch {
 	case err == nil:
-		c.backfill(ctx, len(c.layers), []fill[T]{c.sourceFill(key, gens[i], value, false)})
+		c.backfillOne(sctx, len(c.layers), c.sourceFill(key, gens[i], value, false))
 		p.publish(i, value, nil)
 	case errors.Is(err, ErrNotFound):
-		c.backfill(ctx, len(c.layers), []fill[T]{c.sourceFill(key, gens[i], zero, true)})
+		c.backfillOne(sctx, len(c.layers), c.sourceFill(key, gens[i], zero, true))
 		p.publish(i, zero, ErrNotFound)
 	default:
 		p.publish(i, zero, fmt.Errorf("cachex: get %q from source: %w", key, err))
@@ -409,8 +410,8 @@ func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], gens []uint6
 
 func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], gens []uint64, idxs []int) {
 	sctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
+	defer cancel() // after the backfill, which the same timeout bounds
 	values, err := c.batchSource.GetMany(sctx, keysAt(p.keys, idxs))
-	cancel()
 	var zero T
 	fills := make([]fill[T], 0, len(idxs))
 	var answered []int
@@ -424,7 +425,7 @@ func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], gens []uin
 		fills = append(fills, c.sourceFill(key, gens[i], value, !ok))
 		answered = append(answered, i)
 	}
-	c.backfill(ctx, len(c.layers), fills)
+	c.backfill(sctx, len(c.layers), fills)
 	for j, i := range answered {
 		value, rerr := fills[j].entry.result()
 		p.publish(i, value, rerr)
@@ -457,6 +458,10 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	if origin == 0 || len(fills) == 0 {
 		return
 	}
+	if len(fills) == 1 {
+		c.backfillOne(ctx, origin, fills[0])
+		return
+	}
 	held := map[*stripe.Stripe]bool{}
 	defer func() {
 		for s, ok := range held {
@@ -482,8 +487,6 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	if len(ok) == 0 {
 		return
 	}
-	bctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
-	defer cancel()
 	now := c.opts.now()
 	for j := origin - 1; j >= 0; j-- {
 		l := &c.layers[j]
@@ -498,12 +501,12 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 			}
 		}
 		if len(sets) > 0 {
-			if err := l.backend.SetMany(bctx, sets); err != nil {
+			if err := l.backend.SetMany(ctx, sets); err != nil {
 				c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 			}
 		}
 		if len(dels) > 0 {
-			if err := l.backend.DelMany(bctx, dels); err != nil {
+			if err := l.backend.DelMany(ctx, dels); err != nil {
 				c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 			}
 		}
@@ -511,6 +514,32 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	for s := range filled { // see stripe.Stripe.Epoch
 		s.AddFill()
 	}
+}
+
+// backfillOne is backfill for one answer, without the bookkeeping of many.
+func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
+	s := c.stripes.For(f.key)
+	if !s.TryRLock() {
+		return
+	}
+	defer s.RUnlock()
+	if s.Generation() != f.gen {
+		return
+	}
+	now := c.opts.now()
+	for j := origin - 1; j >= 0; j-- {
+		l := &c.layers[j]
+		var err error
+		if e, keep := l.entry(f.entry.Value, f.entry.NotFound, f.entry.CachedAt, f.entry.FreshUntil, f.entry.ExpiresAt); keep && now.Before(e.ExpiresAt) {
+			err = l.backend.Set(ctx, f.key, e)
+		} else {
+			err = l.backend.Del(ctx, f.key)
+		}
+		if err != nil {
+			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
+		}
+	}
+	s.AddFill()
 }
 
 // refresh refetches keys in the background (stale entries below the first
@@ -557,6 +586,23 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 			}
 		}
 	}()
+}
+
+// readLayer reads keys idxs from b, and returns what it found for a key:
+// one Get for one key, which spares the common single-key miss a map.
+func readLayer[T any](ctx context.Context, b Backend[T], keys []string, idxs []int) func(key string) (Entry[T], bool, error) {
+	if len(idxs) == 1 {
+		e, ok, err := b.Get(ctx, keys[idxs[0]])
+		return func(string) (Entry[T], bool, error) { return e, ok, err }
+	}
+	es, err := b.GetMany(ctx, keysAt(keys, idxs))
+	return func(key string) (Entry[T], bool, error) {
+		if kerr := errForKey(err, key); kerr != nil {
+			return Entry[T]{}, false, kerr
+		}
+		e, ok := es[key]
+		return e, ok, nil
+	}
 }
 
 func keysAt(keys []string, idxs []int) []string {

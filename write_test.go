@@ -211,6 +211,10 @@ type blockingSet struct {
 	release chan struct{}
 }
 
+func (b *blockingSet) Set(ctx context.Context, key string, e cachex.Entry[string]) error {
+	return b.SetMany(ctx, map[string]cachex.Entry[string]{key: e})
+}
+
 func (b *blockingSet) SetMany(ctx context.Context, entries map[string]cachex.Entry[string]) error {
 	if _, ok := entries["a"]; ok {
 		b.entered <- struct{}{}

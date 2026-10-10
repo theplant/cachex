@@ -15,28 +15,26 @@ import (
 // not even expired ones (the Cache does not serve those), so it is not meant
 // for production.
 type Map[T any] struct {
-	mu      sync.RWMutex
-	entries map[string]cachex.Entry[T]
+	entries sync.Map // string -> cachex.Entry[T]
 }
 
 var _ cachex.Backend[any] = (*Map[any])(nil)
 
 // NewMap returns an empty Map.
-func NewMap[T any]() *Map[T] { return &Map[T]{entries: map[string]cachex.Entry[T]{}} }
+func NewMap[T any]() *Map[T] { return &Map[T]{} }
 
 func (m *Map[T]) Get(_ context.Context, key string) (cachex.Entry[T], bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	e, ok := m.entries[key]
-	return e, ok, nil
+	e, ok := m.entries.Load(key)
+	if !ok {
+		return cachex.Entry[T]{}, false, nil
+	}
+	return e.(cachex.Entry[T]), true, nil
 }
 
-func (m *Map[T]) GetMany(_ context.Context, keys []string) (map[string]cachex.Entry[T], error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+func (m *Map[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[T], error) {
 	out := make(map[string]cachex.Entry[T], len(keys))
 	for _, key := range keys {
-		if e, ok := m.entries[key]; ok {
+		if e, ok, _ := m.Get(ctx, key); ok {
 			out[key] = e
 		}
 	}
@@ -44,42 +42,34 @@ func (m *Map[T]) GetMany(_ context.Context, keys []string) (map[string]cachex.En
 }
 
 func (m *Map[T]) Set(_ context.Context, key string, e cachex.Entry[T]) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.entries[key] = e
+	m.entries.Store(key, e)
 	return nil
 }
 
 func (m *Map[T]) SetMany(_ context.Context, entries map[string]cachex.Entry[T]) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	for key, e := range entries {
-		m.entries[key] = e
+		m.entries.Store(key, e)
 	}
 	return nil
 }
 
 func (m *Map[T]) Del(_ context.Context, key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.entries, key)
+	m.entries.Delete(key)
 	return nil
 }
 
 func (m *Map[T]) DelMany(_ context.Context, keys []string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, key := range keys {
-		delete(m.entries, key)
+		m.entries.Delete(key)
 	}
 	return nil
 }
 
 // Len is the number of stored entries, expired ones included.
 func (m *Map[T]) Len() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.entries)
+	n := 0
+	m.entries.Range(func(any, any) bool { n++; return true })
+	return n
 }
 
 // Clock is a manual clock: pass its Now to cachex.WithNow.

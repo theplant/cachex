@@ -25,14 +25,14 @@ import (
 // from every layer once the stripe is free, since the caller may have changed
 // the source already.
 func (c *Cache[T]) Set(ctx context.Context, key string, value T) error {
-	return errOfKey(c.write(ctx, map[string]T{key: value}, nil), key)
+	return c.writeOne(ctx, key, &value)
 }
 
 // Del drops key from every layer, bottom up, so the next read asks the
 // source. Like Set, call it after changing the source; it records nothing
 // about whether the key exists. Failures and waiting are as for Set.
 func (c *Cache[T]) Del(ctx context.Context, key string) error {
-	return errOfKey(c.write(ctx, nil, []string{key}), key)
+	return c.writeOne(ctx, key, nil)
 }
 
 // SetMany is Set for many keys, with one call per layer. A key that fails in a
@@ -49,12 +49,47 @@ func (c *Cache[T]) DelMany(ctx context.Context, keys []string) error {
 	return c.write(ctx, nil, uniqueKeys(keys))
 }
 
-// errOfKey turns the error of a one-key write into that key's own error.
-func errOfKey(err error, key string) error {
-	if be, ok := err.(*BatchError); ok { //nolint:errorlint // write returns it unwrapped
-		return be.Errors[key]
+// writeOne is write for one key (deleting it if value is nil), without the
+// bookkeeping of many.
+func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
+	s := c.stripes.For(key)
+	done := func() {
+		s.AddWrite()
+		c.dropFlights(key)
 	}
-	return err
+	if err := s.Lock(ctx, func() { done(); c.invalidate(ctx, []string{key}, len(c.layers)-1) }); err != nil {
+		return fmt.Errorf("cachex: context done while waiting to write: %w", err)
+	}
+	defer s.Unlock()
+	defer done()
+
+	var a Entry[T]
+	if value != nil {
+		a = c.sourceFill(key, 0, *value, false).entry
+	}
+	now := c.opts.now()
+	for j := len(c.layers) - 1; j >= 0; j-- {
+		l := &c.layers[j]
+		var e Entry[T]
+		keep := false
+		if value != nil {
+			e, keep = l.entry(a.Value, false, a.CachedAt, a.FreshUntil, a.ExpiresAt)
+			keep = keep && now.Before(e.ExpiresAt)
+		}
+		var err error
+		if keep {
+			if err = l.backend.Set(ctx, key, e); err != nil {
+				err = fmt.Errorf("cachex: set %q in layer %d: %w", key, j, err)
+			}
+		} else if err = l.backend.Del(ctx, key); err != nil {
+			err = fmt.Errorf("cachex: delete %q in layer %d: %w", key, j, err)
+		}
+		if err != nil {
+			c.invalidate(ctx, []string{key}, j)
+			return err
+		}
+	}
+	return nil
 }
 
 // write sets values and deletes dels in every layer, bottom up, holding the
