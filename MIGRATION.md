@@ -40,9 +40,9 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 ## Behavior
 
-**Layers live in one `Cache`.** A key has one fetch across all layers: a miss in the top layer claims it, reads the lower layers in turn, then the source, and backfills every layer above where it was found. An entry copied up keeps the time the source answered, so its age is not reset per layer, and it never outlives the entry below it. *What to do:* build one `Cache` with all layers instead of chaining clients.
+**Layers live in one `Cache`.** A key has one fetch across all layers: a miss in the top layer claims it, reads the lower layers in turn, then the source, and backfills every layer above where it was found. An entry copied up gets the upper layer's TTLs from the copy on, but is never fresher or longer lived than the entry below it, so data is never older than the lowest layer allows. *What to do:* build one `Cache` with all layers instead of chaining clients.
 
-**Backends no longer have their own TTL.** Each entry carries when it turns stale and rotten, computed from the layer's TTLs; Redis, otter and the table use that as the entry's native expiry. *What to do:* drop backend TTL settings; set `TTL` on each layer.
+**Backends no longer have their own TTL.** Each entry carries when it turns stale and rotten, computed from the layer's TTLs; Redis and otter expire each entry natively at that time; the database table keeps rows until you delete them, and BigCache until its `LifeWindow` ends. *What to do:* drop backend TTL settings; set `TTL` on each layer.
 
 **Jitter is on by default.** Each entry's fresh period is shortened at random by up to 10% (`DefaultJitter`), never lengthened. *What to do:* nothing, or `Jitter(0)` to turn it off.
 

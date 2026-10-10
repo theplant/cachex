@@ -17,14 +17,15 @@ var ErrNotFound = errors.New("cachex: not found")
 
 // Entry is what a layer stores for one key: a value, or a record that the
 // source does not have the key, and when it stops being fresh and usable.
-// Backends store it as given and treat ExpiresAt as the entry's native
-// expiry; the Cache computes every field.
+// The Cache computes every field and never serves an entry past ExpiresAt;
+// a backend stores it as given and may drop it from then on (rediscachex and
+// ottercachex expire it natively).
 type Entry[T any] struct {
 	Value    T
 	NotFound bool // the source does not have the key; Value is the zero value
 
 	// CachedAt is when the source answered; an entry copied from a lower layer
-	// keeps it, so an entry's age is not reset layer by layer.
+	// keeps it.
 	CachedAt time.Time
 	// FreshUntil is when the entry turns stale: still served (and refreshed in
 	// the background) until ExpiresAt, if the layer has a stale TTL.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,18 +163,19 @@ func TestFreshness(t *testing.T) {
 func TestLayers(t *testing.T) {
 	ctx := context.Background()
 	type setup struct {
-		src    *source
-		l1, l2 *cachextest.Map[string]
-		clock  *cachextest.Clock
-		c      *cachex.Cache[string]
+		src     *source
+		l1, l2  *cachextest.Map[string]
+		l2Reads *atomic.Int64
+		clock   *cachextest.Clock
+		c       *cachex.Cache[string]
 	}
 	newSetup := func(l1, l2 []cachex.LayerOption) setup {
-		s := setup{src: newSource(map[string]string{"a": "1"}), l1: cachextest.NewMap[string](), l2: cachextest.NewMap[string]()}
+		s := setup{src: newSource(map[string]string{"a": "1"}), l1: cachextest.NewMap[string](), l2: cachextest.NewMap[string](), l2Reads: &atomic.Int64{}}
 		var now cachex.Option
 		s.clock, now = newClock()
 		s.c = cachex.New(s.src, []cachex.Layer[string]{
 			cachex.NewLayer(s.l1, append([]cachex.LayerOption{cachex.Jitter(0)}, l1...)...),
-			cachex.NewLayer(s.l2, append([]cachex.LayerOption{cachex.Jitter(0)}, l2...)...),
+			cachex.NewLayer[string](&countingGets{Backend: s.l2, n: s.l2Reads}, append([]cachex.LayerOption{cachex.Jitter(0)}, l2...)...),
 		}, now)
 		return s
 	}
@@ -190,7 +192,7 @@ func TestLayers(t *testing.T) {
 		assert.Equal(t, epoch.Add(time.Hour), e2.ExpiresAt)
 	})
 
-	t.Run("a hit below is backfilled above, keeping its age", func(t *testing.T) {
+	t.Run("a hit below is backfilled above for the layer's own TTL, within the entry below", func(t *testing.T) {
 		s := newSetup([]cachex.LayerOption{cachex.TTL(time.Minute, 0)}, []cachex.LayerOption{cachex.TTL(time.Hour, 0)})
 		require.NoError(t, s.l2.Set(ctx, "a", cachex.Entry[string]{
 			Value: "below", CachedAt: epoch, FreshUntil: epoch.Add(time.Hour), ExpiresAt: epoch.Add(time.Hour),
@@ -202,8 +204,26 @@ func TestLayers(t *testing.T) {
 		assert.Zero(t, s.src.calls.Load())
 		e1, ok := stored(t, s.l1, "a")
 		require.True(t, ok)
-		assert.Equal(t, epoch, e1.CachedAt, "the age counts from when the source answered")
-		assert.Equal(t, epoch.Add(time.Minute), e1.ExpiresAt)
+		assert.Equal(t, epoch, e1.CachedAt, "when the source answered")
+		assert.Equal(t, epoch.Add(90*time.Second), e1.ExpiresAt, "a minute from the copy")
+	})
+
+	t.Run("an upper layer with a shorter TTL keeps serving while the entry below is fresh", func(t *testing.T) {
+		s := newSetup([]cachex.LayerOption{cachex.TTL(30*time.Second, time.Minute)}, []cachex.LayerOption{cachex.TTL(5*time.Minute, time.Hour)})
+		_, err := s.c.Get(ctx, "a") // source answers at epoch; both layers filled
+		require.NoError(t, err)
+		s.l2Reads.Store(0)
+		for _, at := range []time.Duration{40 * time.Second, 2 * time.Minute, 4 * time.Minute} {
+			s.clock.Advance(at - s.clock.Now().Sub(epoch))
+			for range 20 {
+				v, err := s.c.Get(ctx, "a")
+				require.NoError(t, err)
+				assert.Equal(t, "1", v)
+				require.NoError(t, s.c.Close()) // let a refresh it started finish
+			}
+		}
+		assert.EqualValues(t, 1, s.src.calls.Load(), "the entry below is fresh: the source is asked once")
+		assert.LessOrEqual(t, s.l2Reads.Load(), int64(6), "the upper layer answers; the one below is read about once per upper TTL, not per Get")
 	})
 
 	t.Run("an entry above never outlives the one below", func(t *testing.T) {
@@ -365,7 +385,7 @@ func TestMaxAgeAndJitter(t *testing.T) {
 		data := map[string]string{}
 		var keys []string
 		for i := range 200 {
-			k := string(rune('a' + i%26)) + string(rune('A'+i/26))
+			k := string(rune('a'+i%26)) + string(rune('A'+i/26))
 			data[k], keys = "v", append(keys, k)
 		}
 		mem := cachextest.NewMap[string]()

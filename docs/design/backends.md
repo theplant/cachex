@@ -28,7 +28,7 @@ func Batched[T any](b SingleBackend[T]) Backend[T]     // 批量方法逐个 key
 
 - 未命中不用错误表示，`Cache` 也不拿错误做控制流。
 - 批量方法遵守 [batch.md](batch.md#批量调用要遵守的约定) 的约定：部分失败返回原样的 `*BatchError`，其他错误表示整批失败。
-- 后端应当把 `ExpiresAt` 当作原生过期时间。在那之前可以因为容量淘汰而丢掉条目，那只是一次未命中。
+- 后端可以从 `ExpiresAt` 起丢掉条目（`rediscachex`、`ottercachex` 原生过期），也可以留着：Cache 不会返回腐烂的条目。在那之前也可以因为容量淘汰而丢掉条目，那只是一次未命中。
 - `cachextest.TestBackend(t, newBackend)` 是所有后端共用的契约测试：未命中不是错误、条目原样读回（包括不存在记录和各种字符串）、key 精确比较（大小写、末尾空格、重音）、批量操作和空批量。自写后端可以直接拿它来测。
 
 ## 编码：存字节的后端
@@ -95,7 +95,7 @@ type row struct {
 }
 ```
 
-`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用。`Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要自己定期删除（清理任务在 [todo](../todo.md) 里）。
+`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用；key 列最长 255 个字符，**包括前缀**，更长的 key 写不进去（回填失败只记 WARN，这个 key 就每次都未命中）。`Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要自己定期删除（清理任务在 [todo](../todo.md) 里）。
 
 ### key 必须精确比较
 

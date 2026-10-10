@@ -51,7 +51,7 @@ case err != nil:
 
 ## Two layers
 
-Memory in front of Redis, both in front of the database. Each layer has its own TTLs; an entry copied from Redis into memory keeps the time the source answered, so its age is not reset:
+Memory in front of Redis, both in front of the database. Each layer has its own TTLs; an entry copied from Redis into memory is kept for the memory layer's TTL, but never fresher or longer than the entry in Redis:
 
 ```go
 mem, _ := ottercachex.New[*Product](ottercachex.Config[*Product]{MaximumSize: 100_000})
@@ -139,7 +139,7 @@ if errors.As(err, &be) {
 | `ottercachex` | values in memory | `MaximumSize` (entries) or `MaximumWeight` with `Weigher` is required; each entry expires at its own time |
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
 | `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys |
-| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL needs 8.0.17+ and a `utf8mb4_0900_bin` key column; tested at each database's default isolation level only |
+| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL needs 8.0.17+ and a `utf8mb4_0900_bin` key column; tested at each database's default isolation level only; keys up to 255 characters including `KeyPrefix`; expired rows are not deleted for you |
 | `cachextest` | values in memory, unbounded | For tests only, with `Clock` and `TestBackend`, a contract test for your own backends |
 
 Your own store implements `Backend[T]`, or `SingleBackend[T]` wrapped with `cachex.Batched`. A store of bytes encodes entries with `cachex.EncodeEntry`/`DecodeEntry` and a `Codec`.

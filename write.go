@@ -57,7 +57,7 @@ func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 		s.AddWrite()
 		c.dropFlights(key)
 	}
-	if err := s.Lock(ctx, func() { done(); c.invalidate(ctx, []string{key}, len(c.layers)-1) }); err != nil {
+	if err := c.lock(ctx, s, func() { done(); c.invalidate(ctx, []string{key}, len(c.layers)-1) }); err != nil {
 		return fmt.Errorf("cachex: context done while waiting to write: %w", err)
 	}
 	defer s.Unlock()
@@ -73,7 +73,7 @@ func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 		var e Entry[T]
 		keep := false
 		if value != nil {
-			e, keep = l.entry(a.Value, false, a.CachedAt, a.FreshUntil, a.ExpiresAt)
+			e, keep = l.entry(a.Value, false, a.CachedAt, now, a.FreshUntil, a.ExpiresAt)
 			keep = keep && now.Before(e.ExpiresAt)
 		}
 		var err error
@@ -129,7 +129,7 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 	}
 	for n, i := range order {
 		s := c.stripes.At(i)
-		if err := s.Lock(ctx, abandoned(s, byStripe[i])); err != nil {
+		if err := c.lock(ctx, s, abandoned(s, byStripe[i])); err != nil {
 			for _, j := range order[:n] {
 				h := c.stripes.At(j)
 				abandoned(h, byStripe[j])()
@@ -137,7 +137,7 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 			}
 			for _, j := range order[n+1:] {
 				r := c.stripes.At(j)
-				if r.Lock(ctx, abandoned(r, byStripe[j])) == nil {
+				if c.lock(ctx, r, abandoned(r, byStripe[j])) == nil {
 					abandoned(r, byStripe[j])()
 					r.Unlock()
 				}
@@ -168,7 +168,7 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 			if _, failed := errs[key]; failed {
 				continue
 			}
-			if e, keep := l.entry(a.Value, false, a.CachedAt, a.FreshUntil, a.ExpiresAt); keep && now.Before(e.ExpiresAt) {
+			if e, keep := l.entry(a.Value, false, a.CachedAt, now, a.FreshUntil, a.ExpiresAt); keep && now.Before(e.ExpiresAt) {
 				sets[key] = e
 			} else {
 				drop = append(drop, key)

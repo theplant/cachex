@@ -26,7 +26,9 @@ type LayerOption func(*layerConfig)
 
 // TTL sets how long a value stays fresh and, after that, how long it is still
 // served stale while being refreshed in the background (zero: not at all).
-// Both count from when the source answered. Required, with a positive fresh.
+// Both count from when an entry is written into the layer (an answer of the
+// source, a copy from a layer below, a Set); a copy is never fresher or longer
+// lived than the entry it came from. Required, with a positive fresh.
 func TTL(fresh, stale time.Duration) LayerOption {
 	return func(c *layerConfig) { c.fresh, c.stale = fresh, stale }
 }
@@ -58,17 +60,21 @@ func NewLayer[T any](backend Backend[T], opts ...LayerOption) Layer[T] {
 		panic("cachex: NewLayer: TTL with a positive fresh TTL is required")
 	case cfg.stale < 0 || cfg.nfFresh < 0 || cfg.nfStale < 0:
 		panic("cachex: NewLayer: TTLs must not be negative")
+	case cfg.nfFresh == 0 && cfg.nfStale > 0:
+		panic("cachex: NewLayer: a not-found stale TTL needs a positive not-found fresh TTL")
 	case cfg.jitter < 0 || cfg.jitter >= 1:
 		panic("cachex: NewLayer: jitter must be in [0, 1)")
 	}
 	return Layer[T]{backend: backend, cfg: cfg}
 }
 
-// entry is what the layer stores for an answer the source gave at cachedAt
-// (a value, or notFound), no fresher than freshCap and no longer usable than
-// expiresCap (zero: no cap), the bounds of where the answer was found. It
-// returns false if the layer does not keep such an answer.
-func (l *Layer[T]) entry(value T, notFound bool, cachedAt, freshCap, expiresCap time.Time) (Entry[T], bool) {
+// entry is what the layer stores, from now on, for an answer the source gave
+// at cachedAt (a value, or notFound): the layer's TTLs count from now, and the
+// entry is no fresher than freshCap and no longer usable than expiresCap (zero:
+// no cap), the bounds of the entry it was copied from. So an upper layer keeps
+// a copy for its own TTL, but never past the entry below. It returns false if
+// the layer does not keep such an answer.
+func (l *Layer[T]) entry(value T, notFound bool, cachedAt, now, freshCap, expiresCap time.Time) (Entry[T], bool) {
 	fresh, stale := l.cfg.fresh, l.cfg.stale
 	if notFound {
 		fresh, stale = l.cfg.nfFresh, l.cfg.nfStale
@@ -85,8 +91,8 @@ func (l *Layer[T]) entry(value T, notFound bool, cachedAt, freshCap, expiresCap 
 		Value:      value,
 		NotFound:   notFound,
 		CachedAt:   cachedAt,
-		FreshUntil: cachedAt.Add(fresh),
-		ExpiresAt:  cachedAt.Add(fresh + stale),
+		FreshUntil: now.Add(fresh),
+		ExpiresAt:  now.Add(fresh + stale),
 	}
 	if !expiresCap.IsZero() && expiresCap.Before(e.ExpiresAt) {
 		e.ExpiresAt = expiresCap

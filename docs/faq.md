@@ -12,7 +12,7 @@ Use `WithMaxAge(func(T) time.Duration)`. It is called once when a value is fetch
 
 ### What is the difference between the fresh and the stale TTL?
 
-Both are set per layer with `TTL(fresh, stale)` and count from when the source answered, not from when the layer was written. During the fresh TTL an entry is returned as is. The stale TTL is an **additional** period: a read in it gets the entry at once while a background refresh fetches it again. After `fresh + stale` the entry is rotten and never served. `Jitter` shortens each entry's fresh period at random (by up to 10% by default) so entries written together do not expire together. Backends need no TTL of their own: they expire each entry when it turns rotten.
+Both are set per layer with `TTL(fresh, stale)` and count from when the entry is written into that layer; an entry copied from a lower layer is never fresher or longer lived than the one below. During the fresh TTL an entry is returned as is. The stale TTL is an **additional** period: a read in it gets the entry at once while a background refresh fetches it again. After `fresh + stale` the entry is rotten and never served. `Jitter` shortens each entry's fresh period at random (by up to 10% by default) so entries written together do not expire together. Backends need no TTL of their own: Redis and otter expire each entry when it turns rotten, and rotten entries are never served from any backend.
 
 ### Should I cache every database query?
 

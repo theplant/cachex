@@ -51,7 +51,7 @@ case err != nil:
 
 ## 两层
 
-内存在 Redis 前面，两者都在数据库前面。每层有自己的 TTL；条目从 Redis 复制到内存时，保留数据源回答的时间，所以年龄不会重新计时：
+内存在 Redis 前面，两者都在数据库前面。每层有自己的 TTL；条目从 Redis 复制到内存后，按内存层的 TTL 保留，但不会比 Redis 里那个条目更新鲜、更长寿：
 
 ```go
 mem, _ := ottercachex.New[*Product](ottercachex.Config[*Product]{MaximumSize: 100_000})
@@ -138,7 +138,7 @@ if errors.As(err, &be) {
 | `ottercachex` | 内存里的值 | 必须设 `MaximumSize`（条目数）或 `MaximumWeight` 加 `Weigher`；每个条目各自到期 |
 | `bigcachex` | 内存里编码后的条目 | 数百万条目、GC 在 profile 里显眼时使用；每次读取都要解码 |
 | `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline |
-| `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 需要 8.0.17 及以上，key 列为 `utf8mb4_0900_bin`；只在各数据库默认隔离级别下测过 |
+| `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 需要 8.0.17 及以上，key 列为 `utf8mb4_0900_bin`；只在各数据库默认隔离级别下测过；key 连同 `KeyPrefix` 最长 255 个字符；过期的行不会自动删除 |
 | `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock` 和给自写后端用的契约测试 `TestBackend` |
 
 自己的存储实现 `Backend[T]`，或者实现 `SingleBackend[T]` 再用 `cachex.Batched` 包一层。存字节的存储用 `cachex.EncodeEntry`/`DecodeEntry` 和一个 `Codec` 编码条目。

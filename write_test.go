@@ -462,3 +462,31 @@ func (j *jittery) Set(ctx context.Context, key string, e cachex.Entry[string]) e
 	yield()
 	return j.Backend.Set(ctx, key, e)
 }
+
+func TestCloseWaitsForTheInvalidationOfAWriteThatGaveUp(t *testing.T) {
+	ctx := context.Background()
+	mem := cachextest.NewMap[string]()
+	bs := &blockingSet{Backend: mem, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	c := cachex.New(newSource(nil), oneLayer(bs))
+	first := make(chan error)
+	go func() { first <- c.Set(ctx, "a", "first") }()
+	<-bs.entered
+	waitCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, c.Del(waitCtx, "a"), context.DeadlineExceeded)
+
+	closed := make(chan struct{})
+	go func() { _ = c.Close(); close(closed) }()
+	require.Never(t, func() bool {
+		select {
+		case <-closed:
+			return true
+		default:
+			return false
+		}
+	}, 50*time.Millisecond, time.Millisecond, "the invalidation is still due")
+	close(bs.release)
+	require.NoError(t, <-first)
+	<-closed
+	assert.Zero(t, mem.Len(), "done before Close returned, so the backend can be closed")
+}

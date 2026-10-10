@@ -39,7 +39,7 @@ flowchart TD
 |---|---|
 | `CachedAt` | 数据源回答的时间 |
 | `FreshUntil` | 之前是新鲜的 |
-| `ExpiresAt` | 之后腐烂，不再返回；后端用它做原生过期 |
+| `ExpiresAt` | 之后腐烂，不再返回；Redis 和 otter 用它做原生过期 |
 
 一层的配置是 `TTL(fresh, stale)`（值）和 `NotFoundTTL(fresh, stale)`（不存在记录），再加上 `Jitter(ratio)`。从数据源拿到一个回答时：
 
@@ -52,7 +52,7 @@ ExpiresAt  = FreshUntil + stale              // 陈旧期跟在新鲜期后面
 再按两个上限截短：
 
 - **寿命上限**：配置了 `WithMaxAge(f)` 时，回源拿到值的那一刻调用一次 `f(value)`，各层的 `ExpiresAt`、`FreshUntil` 都不晚于 `CachedAt + f(value)`。`f` 返回 0 或负数时，这个值不缓存。用于自带过期时间的值，比如 token。
-- **不比下层更新鲜、更长寿**：从下层复制到上层的条目，`CachedAt` 不变，上层的 `FreshUntil`、`ExpiresAt` 都不晚于下层那个条目的。所以年龄不会在每层重新计时，换一层也不会让旧数据多活一段。
+- **从写进这一层时起算，但不比下层更新鲜、更长寿**：从下层复制到上层的条目，`CachedAt` 不变，上层的 TTL 从复制时起算，`FreshUntil`、`ExpiresAt` 再分别截到不晚于下层那个条目的。这样上层 TTL 比下层短时，复制上来的条目仍能在上层新鲜一整个上层 TTL，而不是一复制就陈旧或腐烂；换一层也不会让旧数据多活一段。
 
 算出来已经腐烂的条目不写入，改为删除这一层的这个 key。
 
@@ -62,7 +62,7 @@ ExpiresAt  = FreshUntil + stale              // 陈旧期跟在新鲜期后面
 | `[FreshUntil, ExpiresAt)` | 陈旧 |
 | 不早于 `ExpiresAt` | 腐烂（等于没有） |
 
-因为后端用 `ExpiresAt` 做原生过期，不需要再单独给后端配置 TTL。
+Redis 和 otter 用 `ExpiresAt` 做原生过期，所以不需要再单独给后端配置 TTL；数据表和 BigCache 不会按时删除，但腐烂的条目永远不会被返回。
 
 ## 不存在记录
 

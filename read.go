@@ -493,7 +493,7 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 		sets := map[string]Entry[T]{}
 		var dels []string
 		for _, f := range ok {
-			e, keep := l.entry(f.entry.Value, f.entry.NotFound, f.entry.CachedAt, f.entry.FreshUntil, f.entry.ExpiresAt)
+			e, keep := l.entry(f.entry.Value, f.entry.NotFound, f.entry.CachedAt, now, f.entry.FreshUntil, f.entry.ExpiresAt)
 			if keep && now.Before(e.ExpiresAt) {
 				sets[f.key] = e
 			} else {
@@ -530,7 +530,7 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 	for j := origin - 1; j >= 0; j-- {
 		l := &c.layers[j]
 		var err error
-		if e, keep := l.entry(f.entry.Value, f.entry.NotFound, f.entry.CachedAt, f.entry.FreshUntil, f.entry.ExpiresAt); keep && now.Before(e.ExpiresAt) {
+		if e, keep := l.entry(f.entry.Value, f.entry.NotFound, f.entry.CachedAt, now, f.entry.FreshUntil, f.entry.ExpiresAt); keep && now.Before(e.ExpiresAt) {
 			err = l.backend.Set(ctx, f.key, e)
 		} else {
 			err = l.backend.Del(ctx, f.key)

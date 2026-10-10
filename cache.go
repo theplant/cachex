@@ -102,6 +102,10 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 		panic("cachex: New: the GetMany concurrency must be positive")
 	case o.getManyChunk < 0:
 		panic("cachex: New: the GetMany chunk size must not be negative")
+	case o.logger == nil:
+		panic("cachex: New: the logger must not be nil")
+	case o.now == nil:
+		panic("cachex: New: the clock must not be nil")
 	}
 	for i, l := range layers {
 		if l.backend == nil {
@@ -204,19 +208,37 @@ func (c *Cache[T]) Close() error {
 	return nil
 }
 
-// background runs f in a goroutine that Close waits for, if Close has not
-// been called yet.
-func (c *Cache[T]) background(f func()) {
+// track counts a piece of background work that Close must wait for, if
+// Close has not been called yet; call the returned done once when it ends.
+func (c *Cache[T]) track() (done func()) {
 	c.mu.Lock()
-	tracked := !c.closed
-	if tracked {
-		c.wg.Add(1)
+	defer c.mu.Unlock()
+	if c.closed {
+		return func() {}
 	}
-	c.mu.Unlock()
+	c.wg.Add(1)
+	return c.wg.Done
+}
+
+// background runs f in a goroutine that Close waits for.
+func (c *Cache[T]) background(f func()) {
+	done := c.track()
 	go func() {
-		if tracked {
-			defer c.wg.Done()
-		}
+		defer done()
 		f()
 	}()
+}
+
+// lock takes s for writing like stripe.Stripe.Lock; if ctx ends first, late
+// runs once s is free, and Close waits for it.
+func (c *Cache[T]) lock(ctx context.Context, s *stripe.Stripe, late func()) error {
+	done := c.track()
+	err := s.Lock(ctx, func() {
+		defer done()
+		late()
+	})
+	if err == nil {
+		done() // late never runs
+	}
+	return err
 }

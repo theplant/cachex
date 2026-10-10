@@ -45,7 +45,9 @@ type Config[T any] struct {
 	// TableName is the cache table. Required.
 	TableName string
 	// KeyPrefix is prepended to every key, so that one table can hold several
-	// caches. Change it when the value type changes incompatibly (see
+	// caches. The key column holds 255 characters, prefix included: a longer
+	// key fails to be written (a backfill only logs it, so the key misses on
+	// every read). Change it when the value type changes incompatibly (see
 	// rediscachex.Config.KeyPrefix).
 	KeyPrefix string
 	// ChunkSize is how many keys one statement carries; a larger call runs
