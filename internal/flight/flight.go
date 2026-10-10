@@ -21,22 +21,22 @@ func (f *Flight[T]) Done() <-chan struct{} { return f.done }
 func (f *Flight[T]) Result() (T, error) { return f.value, f.err }
 
 // Group registers the in-flight fetches by key. The zero value is ready to use.
-type Group[T any] struct {
+type Group[K comparable, T any] struct {
 	mu      sync.Mutex
-	flights map[string]*Flight[T]
+	flights map[K]*Flight[T]
 }
 
 // Claim returns the key's flight and whether the caller leads it (it was just
 // created). The leader must call Finish exactly once; everyone else waits on
 // Done.
-func (g *Group[T]) Claim(key string) (*Flight[T], bool) {
+func (g *Group[K, T]) Claim(key K) (*Flight[T], bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if f, ok := g.flights[key]; ok {
 		return f, false
 	}
 	if g.flights == nil {
-		g.flights = map[string]*Flight[T]{}
+		g.flights = map[K]*Flight[T]{}
 	}
 	f := &Flight[T]{done: make(chan struct{})}
 	g.flights[key] = f
@@ -47,7 +47,7 @@ func (g *Group[T]) Claim(key string) (*Flight[T], bool) {
 // registered for key), so a caller that sees the result and comes back starts
 // a new flight instead of joining a finished one; and a flight that was
 // dropped does not unregister the one that replaced it.
-func (g *Group[T]) Finish(key string, f *Flight[T], value T, err error) {
+func (g *Group[K, T]) Finish(key K, f *Flight[T], value T, err error) {
 	g.mu.Lock()
 	if g.flights[key] == f {
 		delete(g.flights, key)
@@ -60,14 +60,14 @@ func (g *Group[T]) Finish(key string, f *Flight[T], value T, err error) {
 // Drop unregisters whatever flight holds key without publishing or
 // interrupting it: its waiters still get its result, and the next Claim
 // starts a new flight.
-func (g *Group[T]) Drop(key string) {
+func (g *Group[K, T]) Drop(key K) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.flights, key)
 }
 
 // Len is the number of registered flights.
-func (g *Group[T]) Len() int {
+func (g *Group[K, T]) Len() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return len(g.flights)

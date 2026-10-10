@@ -8,7 +8,7 @@ import (
 )
 
 func TestClaimAnswersAtOnce(t *testing.T) {
-	var g Group[string]
+	var g Group[string, string]
 	f, leader := g.Claim("k")
 	require.True(t, leader, "the first claim leads")
 	f2, leader2 := g.Claim("k")
@@ -19,7 +19,7 @@ func TestClaimAnswersAtOnce(t *testing.T) {
 }
 
 func TestFinishPublishesThenAClaimStartsAnew(t *testing.T) {
-	var g Group[string]
+	var g Group[string, string]
 	f, _ := g.Claim("k")
 	g.Finish("k", f, "v", nil)
 	<-f.Done()
@@ -33,7 +33,7 @@ func TestFinishPublishesThenAClaimStartsAnew(t *testing.T) {
 }
 
 func TestDropKeepsTheOldFlightsWaitersAndItsReplacement(t *testing.T) {
-	var g Group[string]
+	var g Group[string, string]
 	old, _ := g.Claim("k")
 	g.Drop("k")
 	select {
