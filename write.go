@@ -53,15 +53,21 @@ func (c *Cache[T]) DelMany(ctx context.Context, keys []string) error {
 // bookkeeping of many.
 func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 	s := c.stripes.For(key)
-	done := func() {
+	if !s.TryLock() { // the closures cost allocations, so only when waiting
+		late := func() {
+			s.AddWrite()
+			c.dropFlights(key)
+			c.invalidate(ctx, []string{key}, len(c.layers)-1)
+		}
+		if err := c.lock(ctx, s, late); err != nil {
+			return fmt.Errorf("cachex: context done while waiting to write: %w", err)
+		}
+	}
+	defer func() {
 		s.AddWrite()
 		c.dropFlights(key)
-	}
-	if err := c.lock(ctx, s, func() { done(); c.invalidate(ctx, []string{key}, len(c.layers)-1) }); err != nil {
-		return fmt.Errorf("cachex: context done while waiting to write: %w", err)
-	}
-	defer s.Unlock()
-	defer done()
+		s.Unlock()
+	}()
 
 	var a Entry[T]
 	if value != nil {
