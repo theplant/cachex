@@ -51,5 +51,5 @@ go test -tags bench -v -run <Test> ./tools/bench/<目录>/   # 复跑实测
 - **每个在途回源恰好发布一次结果**，panic 和 Goexit 也不例外。不要让等待方去等一个永远不会来的结果。见 [ADR 0006](docs/adr/0006-goexit-publishes-an-error.md)。
 - **回源用的 ctx 不带领头请求的取消，也不带它的 GORM 事务。** 见 [ADR 0007](docs/adr/0007-detached-fetch-context.md)。
 - **批量读里，不存在不是错误**，缺席的 key 就是不存在；整批失败的错误不能被当成「全部不存在」。见 [ADR 0004](docs/adr/0004-batch-result-shape.md)。
-- **GORMCache 的 key 列条件要用 clause 构造**（`key` 是 MySQL 的保留字），**只返回 key 完全相等的行**，**批量写按字节序加锁**。见 [ADR 0009](docs/adr/0009-gorm-exact-keys-and-collation.md)、[ADR 0010](docs/adr/0010-gorm-deadlock-ordering-and-retry.md)。
+- **GORMCache 的 key 列条件要用 clause 构造**（`key` 是 MySQL 的保留字），**只返回 key 完全相等的行**，**批量写按字节序加锁**，MySQL 表的 `key` 列只认 `utf8mb4_0900_bin`，**只支持各数据库默认的隔离级别**、不在代码里设置它。见 [ADR 0009](docs/adr/0009-gorm-exact-keys-and-collation.md)、[ADR 0010](docs/adr/0010-gorm-deadlock-ordering-and-retry.md)。
 - **Redis pipeline 的错误要逐条命令判断**，连接层面的失败要设到没发出去的命令上，否则 `GET` 会把故障读成空值。见 [design/backends.md](docs/design/backends.md#批量pipeline)。

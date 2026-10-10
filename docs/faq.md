@@ -127,8 +127,16 @@ All together. Fresh values, stale values (with serve-stale) and fetched values a
 ### What does GORMCache need on MySQL?
 
 - **Creating the table** needs MySQL 8.0.17 or later: `Migrate` uses `utf8mb4_0900_bin`, so keys compare case and trailing spaces exactly, and it checks the version before creating the table.
-- Existing tables are left as they are and never return another key's value; keys that differ only in case take a shared row over from each other. The statement to convert an old table is in [design/backends.md](design/backends.md#key-必须精确比较) (Chinese).
+- **An existing table** needs its `key` column in `utf8mb4_0900_bin`; otherwise `Migrate` returns an error that includes the statement to convert it (`ALTER TABLE <table> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`). A `*_ci` table created with MySQL's defaults must be converted first. See [design/backends.md](design/backends.md#key-必须精确比较) (Chinese).
 
 ### Do concurrent writes to GORMCache from several instances deadlock?
 
-They rarely fail: writes lock rows in byte order, and the occasional deadlock (MySQL's gap locks) is retried automatically (at most 5 attempts). When the attempts run out, the error is returned; a failed backfill is only logged at WARN and the next read fetches again. Old MySQL `*_ci` tables do not lock in byte order and rely on the retry alone. Inside your own transaction (`WithGORMTx`) nothing is retried, since the deadlock has rolled the whole transaction back. See [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md) (Chinese).
+They rarely fail: writes lock rows in byte order, and the occasional deadlock (MySQL's gap locks) is retried automatically (at most 5 attempts). When the attempts run out, the error is returned; a failed backfill is only logged at WARN and the next read fetches again. Inside your own transaction (`WithGORMTx`) nothing is retried, since the deadlock has rolled the whole transaction back. See [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md) (Chinese).
+
+### Does GORMCache need a particular isolation level?
+
+Only each database's default isolation level is supported and tested (REPEATABLE READ on MySQL, READ COMMITTED on PostgreSQL, SERIALIZABLE on SQLite). cachex sets no isolation level; each chunk is written by one autocommit statement. Do not change the default isolation level of the connection the cache table uses.
+
+### My key column is already `utf8mb4_0900_bin`. Do I still need the deadlock retry?
+
+Yes. `utf8mb4_0900_bin` makes rows lock in byte order, which removes most deadlocks; the rest come from gap locks under MySQL's default isolation level, which ordering cannot remove, so they are retried. On PostgreSQL no deadlock was measured once the order is uniform. A retry happens only after a statement has failed as a deadlock victim, so it costs nothing when there is no deadlock. See [design/backends.md](design/backends.md#隔离级别) (Chinese).

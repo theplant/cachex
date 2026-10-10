@@ -3,6 +3,7 @@ package cachex
 import (
 	"cmp"
 	"context"
+	"database/sql"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -154,7 +155,11 @@ func (g *GORMCache[T]) prefixedKey(key string) string {
 func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 	tx := cmp.Or(GetGORMTx(ctx), g.db).WithContext(ctx).Table(g.tableName)
 	if tx.Name() == "mysql" {
-		if !tx.Migrator().HasTable(g.tableName) {
+		if tx.Migrator().HasTable(g.tableName) {
+			if err := g.checkMySQLKeyCollation(tx); err != nil {
+				return err
+			}
+		} else {
 			var version string
 			if err := tx.Raw("SELECT VERSION()").Scan(&version).Error; err != nil {
 				return errors.Wrap(err, "failed to read the MySQL version")
@@ -163,12 +168,27 @@ func (g *GORMCache[T]) Migrate(ctx context.Context) error {
 				return err
 			}
 		}
-		// keys compare exactly (case, trailing spaces), MySQL's defaults do not; applies
-		// only when the table is created, an existing one is left as it is
+		// keys compare exactly (case, trailing spaces), MySQL's defaults do not
 		tx = tx.Set("gorm:table_options", "CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin") // MySQL 8.0.17+
 	}
 	if err := tx.AutoMigrate(&cacheEntry{}); err != nil {
 		return errors.Wrapf(err, "failed to migrate cache table for table: %s", g.tableName)
+	}
+	return nil
+}
+
+// checkMySQLKeyCollation fails unless the existing table's key column uses
+// utf8mb4_0900_bin: under any other collation keys differing in case or
+// trailing spaces share a row, and rows are not locked in byte order.
+func (g *GORMCache[T]) checkMySQLKeyCollation(tx *gorm.DB) error {
+	var collation sql.NullString
+	if err := tx.Raw("SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+		g.tableName, "key").Scan(&collation).Error; err != nil {
+		return errors.Wrapf(err, "failed to read the key column's collation for table: %s", g.tableName)
+	}
+	if collation.String != "utf8mb4_0900_bin" {
+		return errors.Errorf("GORMCache needs the key column of table %s to use utf8mb4_0900_bin, found %q; convert it with: ALTER TABLE %s CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin",
+			g.tableName, collation.String, g.tableName)
 	}
 	return nil
 }

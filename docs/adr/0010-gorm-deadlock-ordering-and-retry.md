@@ -22,4 +22,4 @@
 ## 后果
 
 - 死锁的识别要区分驱动：PostgreSQL 用 SQLSTATE；MySQL 只能匹配错误文本 `Error 1213 (40001)`，因为 go-sql-driver 的错误类型没有 SQLState 方法。驱动如果改了错误格式，MySQL 这边的重试就会失效。
-- 老的 MySQL `*_ci` 表的索引顺序不是字节序，那里只能靠重试兜底。
+- 只支持各数据库的默认隔离级别。MySQL 的 REPEATABLE READ 下，间隙锁仍会偶发死锁，所以 MySQL 上去不掉重试；PostgreSQL 的 READ COMMITTED 下实测没有死锁，重试只是保险。没有死锁时，重试不产生任何额外开销。

@@ -127,8 +127,16 @@ TTL 是**不主动写入**时旧数据的存活上限。`Set`/`Del` 是你主动
 ### MySQL 上用 GORMCache 有什么要求？
 
 - **新建表**需要 MySQL 8.0.17 及以上：`Migrate` 会用 `utf8mb4_0900_bin`，让 key 精确比较大小写和末尾空格，建表前会检查版本。
-- 已经存在的老表不会被改动，也不会读到别的 key 的值；只差大小写的 key 会互相挤占同一行。转换老表的语句见 [design/backends.md](design/backends.md#key-必须精确比较)。
+- **已经存在的表**，`key` 列必须是 `utf8mb4_0900_bin`，否则 `Migrate` 会报错，错误里带转换语句（`ALTER TABLE <表> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`）。MySQL 默认配置下建的 `*_ci` 表要先转换。见 [design/backends.md](design/backends.md#key-必须精确比较)。
 
 ### 多个实例同时写 GORMCache 会死锁吗？
 
-极少失败：写入统一按字节序加锁，偶发的死锁（MySQL 的间隙锁）会自动重试（最多执行 5 次）。重试用尽仍会报错；回填失败只记 WARN 日志，下次读取再回源。老的 MySQL `*_ci` 表加锁顺序不是字节序，只能靠重试兜底。在你自己的事务里（`WithGORMTx`）不会重试，因为死锁已经回滚了整个事务。见 [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md)。
+极少失败：写入统一按字节序加锁，偶发的死锁（MySQL 的间隙锁）会自动重试（最多执行 5 次）。重试用尽仍会报错；回填失败只记 WARN 日志，下次读取再回源。在你自己的事务里（`WithGORMTx`）不会重试，因为死锁已经回滚了整个事务。见 [ADR 0010](adr/0010-gorm-deadlock-ordering-and-retry.md)。
+
+### GORMCache 对数据库的隔离级别有要求吗？
+
+只支持、也只测过各数据库的默认隔离级别（MySQL 的 REPEATABLE READ、PostgreSQL 的 READ COMMITTED、SQLite 的 SERIALIZABLE）。cachex 不设置隔离级别，每段写入都是一条自动提交的语句。不要改掉缓存表所用连接的默认隔离级别。
+
+### 表的 key 列已经是 `utf8mb4_0900_bin`，还需要死锁重试吗？
+
+需要。`utf8mb4_0900_bin` 让加锁顺序和字节序一致，消除了大部分死锁；剩下的来自 MySQL 默认隔离级别下的间隙锁，排序消除不了，要靠重试。PostgreSQL 上统一顺序之后实测没有死锁。重试只在语句已经因为死锁失败时才发生，没有死锁时不产生任何开销。见 [design/backends.md](design/backends.md#隔离级别)。

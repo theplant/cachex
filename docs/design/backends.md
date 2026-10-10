@@ -63,14 +63,16 @@ type cacheEntry struct {
 | 数据库 | key 列默认怎么比较 | cachex 的处理 |
 |---|---|---|
 | PostgreSQL、SQLite | 逐字节 | 不需要额外处理 |
-| MySQL | 默认排序规则（`utf8mb4_0900_ai_ci`）**不区分大小写和重音** | `Migrate` 建表时使用 `utf8mb4_0900_bin`。建表前检查版本：低于 8.0.17 的 MySQL 和 MariaDB 都没有这个排序规则，会返回写明版本号的错误。已经存在的表不会改动 |
+| MySQL | 默认排序规则（`utf8mb4_0900_ai_ci`）**不区分大小写和重音** | `Migrate` 建表时使用 `utf8mb4_0900_bin`。建表前检查版本：低于 8.0.17 的 MySQL 和 MariaDB 都没有这个排序规则，会返回写明版本号的错误。表已经存在时，检查 `key` 列的排序规则，不是 `utf8mb4_0900_bin` 就返回错误，错误里带转换语句 |
 
-即使 key 列不能精确比较（比如升级前建的老表），也**不会读到别的 key 的值**：
+`Migrate` 不替你改表。老表（比如 MySQL 默认配置下建的 `*_ci` 表）要自己转换：`ALTER TABLE <表> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`。不调 `Migrate`、自己建表时，同样要用这个排序规则。
+
+读写本身还多一道防线，万一碰上不能精确比较的表，也**不会读到别的 key 的值**：
 
 - `Get`/`GetMany` 只返回存储的 key 和请求的 key **完全相等**的那一行；
 - upsert 时连同 key 列一起改写，所以一行共享的数据只属于最后写入它的那个 key。
 
-代价是只差大小写的几个 key 会互相挤占同一行，表现为多几次未命中。把老表转成精确比较：`ALTER TABLE <表> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`。决策过程见 [ADR 0009](../adr/0009-gorm-exact-keys-and-collation.md)。
+决策过程见 [ADR 0009](../adr/0009-gorm-exact-keys-and-collation.md)。
 
 ### `key` 是 MySQL 的保留字
 
@@ -82,9 +84,16 @@ type cacheEntry struct {
 - **统一加锁顺序**：
   - `SetMany` 插入前按 key 的字节序排序。否则多个实例同时回填有重叠的 key 时，会以相反的顺序锁行而死锁。
   - PostgreSQL 的 `DelMany` 先用 `SELECT … ORDER BY key COLLATE "C" FOR UPDATE` 按字节序锁好行，再删除。`DELETE` 是按索引顺序加锁的，而索引顺序跟着列的排序规则走（官方镜像默认是 `en_US.utf8`），和 `SetMany` 的字节序不一致。
-  - MySQL 新表的 `utf8mb4_0900_bin` 按码点排序，和 UTF-8 的字节序一致，所以不需要额外处理。
+  - MySQL 的 `utf8mb4_0900_bin` 按码点排序，和 UTF-8 的字节序一致，所以不需要额外处理。
 - **死锁重试**：MySQL 的间隙锁仍可能偶发死锁，InnoDB 要求应用自行重试。所以 `Set`/`Del`/`SetMany`/`DelMany` 被数据库判为死锁牺牲者时会重试，最多执行 5 次（即重试 4 次），每次退避的时间带随机抖动，并尊重 ctx。识别方式：PostgreSQL 看 SQLSTATE `40P01`/`40001`；MySQL 匹配驱动的错误文本 `Error 1213 (40001)`，因为 go-sql-driver 的错误类型没有提供 SQLState 方法。
 - **调用方自己的事务里不重试**：用 `WithGORMTx` 把事务放进 ctx 时，死锁已经让数据库回滚了整个事务，只重试一条语句是错的，所以直接把错误返回给调用方。
+
+### 隔离级别
+
+只支持、也只测过各数据库的**默认**隔离级别：MySQL InnoDB 的 REPEATABLE READ、PostgreSQL 的 READ COMMITTED、SQLite 的 SERIALIZABLE。cachex 不设置隔离级别，每一段写入都是一条自动提交的语句，用的是连接的默认值；不要把缓存表所用连接的默认隔离级别改掉。
+
+- MySQL 上剩下的偶发死锁正是 REPEATABLE READ 的间隙锁造成的，靠重试兜住。改用 READ COMMITTED 实测死锁反而更多。
+- 统一加锁顺序之后，PostgreSQL 在默认级别下实测没有死锁，重试只是保险。
 
 这几种做法的实测对比（包括锁表）见 [research/2026-10-gorm-deadlock.md](../research/2026-10-gorm-deadlock.md)，决策见 [ADR 0010](../adr/0010-gorm-deadlock-ordering-and-retry.md)。
 

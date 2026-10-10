@@ -94,19 +94,23 @@ func TestGORMCacheOnRealDatabases(t *testing.T) {
 			})
 
 			if name == "mysql" {
-				t.Run("an existing case-insensitive table never serves another key's value", func(t *testing.T) {
+				t.Run("Migrate rejects an existing table whose keys do not compare exactly", func(t *testing.T) {
 					table := "cache_legacy_ci"
 					require.NoError(t, db.Exec("CREATE TABLE "+table+" (`key` varchar(255) NOT NULL PRIMARY KEY, `value` json NOT NULL, `updated_at` datetime(3) NOT NULL) COLLATE=utf8mb4_0900_ai_ci").Error)
 					c := NewGORMCache[string](&GORMCacheConfig{DB: db, TableName: table})
-					require.NoError(t, c.Migrate(ctx), "an existing table is left as it is")
+					err := c.Migrate(ctx)
+					require.Error(t, err)
+					assert.Contains(t, err.Error(), "utf8mb4_0900_ai_ci")
+					alter := "ALTER TABLE " + table + " CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin"
+					assert.Contains(t, err.Error(), alter, "the error says how to convert the table")
 
+					require.NoError(t, db.Exec(alter).Error)
+					require.NoError(t, c.Migrate(ctx))
 					require.NoError(t, c.Set(ctx, "ABC", "upper"))
-					_, err := c.Get(ctx, "abc")
-					assert.True(t, IsErrKeyNotFound(err), "abc does not get ABC's row: %v", err)
-					require.NoError(t, c.Set(ctx, "abc", "lower")) // takes the shared row over
+					require.NoError(t, c.Set(ctx, "abc", "lower"))
 					got, err := c.GetMany(ctx, []string{"ABC", "abc"})
 					require.NoError(t, err)
-					assert.Equal(t, map[string]string{"abc": "lower"}, got)
+					assert.Equal(t, map[string]string{"ABC": "upper", "abc": "lower"}, got)
 				})
 			}
 
