@@ -125,7 +125,7 @@ var keyColumn = clause.Column{Name: "key"}
 
 var upsert = clause.OnConflict{
 	Columns:   []clause.Column{keyColumn},
-	DoUpdates: clause.AssignmentColumns([]string{"value", "expires_at", "updated_at"}),
+	DoUpdates: clause.AssignmentColumns([]string{"key", "value", "expires_at", "updated_at"}), // the key too: on a key column that is not byte-exact, a shared row belongs to the key written last
 }
 
 func anys(keys []string) []any {

@@ -133,6 +133,11 @@ func TestOnlyTheRowOfExactlyTheKeyIsServed(t *testing.T) {
 	m, err := b.GetMany(ctx, []string{"abc"})
 	require.NoError(t, err)
 	assert.Empty(t, m)
+
+	require.NoError(t, b.Set(ctx, "abc", entry("lower"))) // lands on ABC's row
+	e, ok, err := b.Get(ctx, "ABC")
+	require.NoError(t, err)
+	assert.False(t, ok && e.Value == "lower", "ABC never reads abc's value: the upsert rewrites the key column")
 }
 
 func TestAnExpiredEntryIsNotStored(t *testing.T) {

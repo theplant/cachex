@@ -108,7 +108,7 @@ type row struct {
 
 `Migrate` 不替你改表。用 MySQL 默认配置建的表要自己转换：`ALTER TABLE <表> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`。不调 `Migrate`、自己建表时，同样要用这个排序规则。
 
-`Get`/`GetMany` 只返回存储的 key 和请求的 key **完全相等**的那一行，但这挡不住不能精确比较的表上的串值：在这样的表里写 `abc` 会落进已有的 `ABC` 那一行（upsert 只改值，不改 key 列），之后读 `ABC` 就拿到 `abc` 的值。所以只支持 `utf8mb4_0900_bin` 的表。决策过程见 [ADR 0009](../adr/0009-gorm-exact-keys-and-collation.md)。
+读写本身还多一道防线，万一碰上不能精确比较的表（比如没调 `Migrate`、自己建的表），也**不会读到别的 key 的值**：`Get`/`GetMany` 只返回存储的 key 和请求的 key **完全相等**的那一行；upsert 时连同 key 列一起改写，所以共用的一行只属于最后写入它的 key。代价是只差大小写的 key 会互相挤占同一行，表现为多几次未命中。决策过程见 [ADR 0009](../adr/0009-gorm-exact-keys-and-collation.md)。
 
 ### `key` 是 MySQL 的保留字
 
