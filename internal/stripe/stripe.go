@@ -91,6 +91,11 @@ type Set struct {
 func NewSet() *Set { return &Set{seed: maphash.MakeSeed()} }
 
 // For returns the stripe of key.
-func (s *Set) For(key string) *Stripe {
-	return &s.stripes[maphash.String(s.seed, key)%Count]
-}
+func (s *Set) For(key string) *Stripe { return &s.stripes[s.Index(key)] }
+
+// Index returns the index of key's stripe, in [0, Count). Lock stripes in
+// increasing index order to take several without deadlock.
+func (s *Set) Index(key string) int { return int(maphash.String(s.seed, key) % Count) }
+
+// At returns the stripe at index i.
+func (s *Set) At(i int) *Stripe { return &s.stripes[i] }

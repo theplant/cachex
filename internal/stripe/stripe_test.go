@@ -66,3 +66,16 @@ func TestForIsStablePerSet(t *testing.T) {
 	set := NewSet()
 	assert.Same(t, set.For("k"), set.For("k"))
 }
+
+func TestIndexAndAtAgreeWithFor(t *testing.T) {
+	s := NewSet()
+	for _, key := range []string{"a", "b", "user:1", ""} {
+		i := s.Index(key)
+		if i < 0 || i >= Count {
+			t.Fatalf("Index(%q) = %d, out of range", key, i)
+		}
+		if s.At(i) != s.For(key) {
+			t.Fatalf("At(Index(%q)) is not For(%q)", key, key)
+		}
+	}
+}

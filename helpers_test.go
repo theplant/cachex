@@ -27,6 +27,9 @@ type source struct {
 }
 
 func newSource(data map[string]string) *source {
+	if data == nil {
+		data = map[string]string{}
+	}
 	return &source{data: maps.Clone(data), fail: map[string]error{}}
 }
 
