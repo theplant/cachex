@@ -340,3 +340,15 @@ func TestRedisCacheWithStandardBinaryMarshaler(t *testing.T) {
 		assert.NotContains(t, rawValue, `"X"`, "Should be stored in binary format, not JSON")
 	})
 }
+
+func TestRedisCacheDecodeSharesTheReply(t *testing.T) {
+	cache := NewRedisCache[[]byte](&RedisCacheConfig{Client: redis.NewClient(&redis.Options{})})
+	cmd := redis.NewStringResult("payload", nil)
+	allocs := testing.AllocsPerRun(100, func() {
+		v, err := cache.decode("k", cmd)
+		if err != nil || string(v) != "payload" {
+			t.Fatal(v, err)
+		}
+	})
+	assert.Zero(t, allocs, "[]byte values reuse the reply's memory, as Get on main did via cmd.Bytes()")
+}

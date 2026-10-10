@@ -2,21 +2,25 @@ package cachex
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/sync/singleflight"
+	"github.com/theplant/cachex/internal/flight"
+	"github.com/theplant/cachex/internal/stripe"
 )
 
 var (
 	DefaultFetchTimeout     = 60 * time.Second
 	DefaultFetchConcurrency = 1
-	NowFunc                 = time.Now
+	// DefaultGetManyFetchConcurrency bounds the upstream requests one GetMany
+	// has in flight at once (see WithGetManyFetchConcurrency).
+	DefaultGetManyFetchConcurrency = 16
+	NowFunc                        = time.Now
 )
 
 // Client manages cache operations with automatic upstream fetching
@@ -31,14 +35,18 @@ type Client[T any] struct {
 	serveStale       bool
 	fetchTimeout     time.Duration
 	fetchConcurrency int
+	getManyConc      int
+	getManyChunk     int // keys per BatchUpstream call; 0 means all in one
 	logger           *slog.Logger
 
-	sfg             singleflight.Group
+	flights         flight.Group[T]
 	asyncRefreshing sync.Map
 
+	// Write ordering, see Set and backfill
+	stripes *stripe.Set
+
 	// Double-check optimization
-	doubleCheckMode   DoubleCheckMode // User configuration (immutable)
-	enableDoubleCheck bool            // Resolved execution decision
+	doubleCheckMode DoubleCheckMode // User configuration (immutable)
 
 	// Test hooks for simulating race conditions
 	testHooks *testHooks
@@ -64,8 +72,10 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 		upstream:         upstream,
 		fetchTimeout:     DefaultFetchTimeout,
 		fetchConcurrency: DefaultFetchConcurrency,
+		getManyConc:      DefaultGetManyFetchConcurrency,
 		logger:           slog.Default(),
 		doubleCheckMode:  DoubleCheckAuto, // Default: auto (smart heuristic)
+		stripes:          stripe.NewSet(),
 	}
 
 	// Apply user options
@@ -74,13 +84,18 @@ func NewClient[T any](backend Cache[T], upstream Upstream[T], opts ...ClientOpti
 	}
 
 	// Resolve double-check mode to boolean flag
-	c.enableDoubleCheck = c.resolveDoubleCheckMode()
 
 	if c.fetchTimeout <= 0 {
 		panic("fetchTimeout must be positive")
 	}
 	if c.fetchConcurrency <= 0 {
 		panic("fetchConcurrency must be positive")
+	}
+	if c.getManyChunk < 0 {
+		panic("getManyChunkSize must not be negative")
+	}
+	if c.getManyConc <= 0 {
+		panic("getManyFetchConcurrency must be positive")
 	}
 
 	return c
@@ -94,6 +109,7 @@ func (c *Client[T]) Get(ctx context.Context, key string) (T, error) {
 func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, error) {
 	var zero T
 
+	seen := c.stripe(key).Epoch() // before reading, see shouldDoubleCheck
 	// Check backend cache first
 	value, err := c.backend.Get(ctx, key)
 
@@ -110,7 +126,7 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 
 		case StateStale:
 			if c.serveStale && !doubleCheck {
-				c.asyncRefresh(context.WithoutCancel(ctx), key)
+				c.asyncRefresh(context.WithoutCancel(ctx), key, seen)
 				return value, nil
 			}
 
@@ -140,7 +156,7 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 
 			case StateStale:
 				if c.serveStale && !doubleCheck {
-					c.asyncRefresh(context.WithoutCancel(ctx), key)
+					c.asyncRefresh(context.WithoutCancel(ctx), key, seen)
 					return zero, errors.Wrapf(&ErrKeyNotFound{
 						Cached:     true,
 						CacheState: StateStale,
@@ -159,7 +175,7 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 		return zero, errors.Wrapf(&ErrKeyNotFound{}, "key not found in cache for key: %s", key)
 	}
 
-	return c.fetchFromUpstream(ctx, key)
+	return c.fetchFromUpstreamWithSFKey(ctx, key, c.makeSFKey(key), seen)
 }
 
 // Del removes a value from the cache and propagates deletion through cache layers.
@@ -179,32 +195,39 @@ func (c *Client[T]) get(ctx context.Context, key string, doubleCheck bool) (T, e
 //
 // This supports both write-through and cache-aside patterns, as the chain
 // naturally terminates when upstream is not a Cache[T] implementation.
+//
+// Order: the upstream is deleted first, then this layer, so until this layer's
+// delete lands its readers still see the deleted value. If the upstream
+// delete fails, this layer's entry is still dropped but no not-found is
+// cached, since the upstream may still hold the key. If the upstream delete
+// succeeds but this layer's fails, the error is returned and the upstream
+// stays deleted.
+// Reads after it and waiting for other writes behave as for Set.
 func (c *Client[T]) Del(ctx context.Context, key string) error {
-	if err := c.delWithoutUpstream(ctx, key); err != nil {
-		return err
-	}
-
-	if upstreamCache, ok := c.upstream.(Cache[T]); ok {
-		if err := upstreamCache.Del(ctx, key); err != nil {
-			return errors.Wrapf(err, "delete from upstream failed for key: %s", key)
-		}
-	}
-
-	return nil
+	return c.write(ctx, key,
+		func(upstream Cache[T]) error {
+			if err := upstream.Del(ctx, key); err != nil {
+				return errors.Wrapf(err, "delete from upstream failed for key: %s", key)
+			}
+			return nil
+		},
+		func() error { return c.delWithoutUpstream(ctx, key) },
+	)
 }
 
+// delWithoutUpstream records a not-found and deletes the backend entry; a
+// failed not-found write does not keep the old value.
 func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
+	var errs []error
 	if c.notFoundCache != nil {
 		if err := c.notFoundCache.Set(ctx, key, NowFunc()); err != nil {
-			return errors.Wrapf(err, "failed to set notFoundCache for key: %s", key)
+			errs = append(errs, errors.Wrapf(err, "failed to set notFoundCache for key: %s", key))
 		}
 	}
-
 	if err := c.backend.Del(ctx, key); err != nil {
-		return errors.Wrapf(err, "delete from backend failed for key: %s", key)
+		errs = append(errs, errors.Wrapf(err, "delete from backend failed for key: %s", key))
 	}
-
-	return nil
+	return stderrors.Join(errs...)
 }
 
 // Set stores a value in the cache and propagates through cache layers.
@@ -226,100 +249,219 @@ func (c *Client[T]) delWithoutUpstream(ctx context.Context, key string) error {
 //
 // The type-based propagation automatically handles both write-through (multi-level caches)
 // and cache-aside (with data source) patterns correctly.
+//
+// Order: the upstream is written first, then this layer, so a new value never
+// shows up here before it is below; until this layer's write lands, readers of
+// this layer still see the old value. If the upstream write fails, its
+// state is unknown (it may have been applied and only the reply lost), so this
+// layer's entry is dropped and the next read goes down. If the upstream write
+// succeeds but this layer's fails, the error is returned too (the upstream
+// keeps the new value) and this layer's entry is dropped. A read that starts
+// after Set returned never gets a value fetched before it. Concurrent writes to
+// one key through the same Client are applied one at a time, in the same order
+// on every layer. Waiting for another write or a backfill of the key's stripe
+// gives up when ctx is done: nothing is written upstream, and this layer's
+// entry is dropped once the stripe is free. A write that need not wait runs
+// even with a done ctx. Once started, a failed write's cleanup outlives ctx,
+// for at most the fetch timeout.
 func (c *Client[T]) Set(ctx context.Context, key string, value T) error {
-	if err := c.setWithoutUpstream(ctx, key, value); err != nil {
-		return err
+	return c.write(ctx, key,
+		func(upstream Cache[T]) error {
+			if err := upstream.Set(ctx, key, value); err != nil {
+				return errors.Wrapf(err, "set in upstream failed for key: %s", key)
+			}
+			return nil
+		},
+		func() error { return c.setWithoutUpstream(ctx, key, value) },
+	)
+}
+
+func (c *Client[T]) stripe(key string) *stripe.Stripe { return c.stripes.For(key) }
+
+// write runs a Set or Del: the upstream first (if it is a Cache), then this
+// layer. Any failure leaves this layer without an entry for the key.
+func (c *Client[T]) write(ctx context.Context, key string, toUpstream func(Cache[T]) error, toLayer func() error) error {
+	s := c.stripe(key)
+
+	// Called once the upstream is written: a backfill that read the upstream
+	// before took an older gen, so it is skipped once this lock is released, and
+	// a read that starts from now on fetches anew instead of joining a fetch
+	// that may have read the upstream before the write.
+	written := func() {
+		s.AddWrite()
+		c.dropFlights(key)
 	}
+
+	// A write that gave up waiting writes nothing upstream, but like any failed
+	// write it leaves this layer without an entry, once the stripe is free.
+	if err := s.Lock(ctx, func() { written(); c.invalidate(ctx, key) }); err != nil {
+		return errors.Wrapf(err, "context cancelled while waiting to write key: %s", key)
+	}
+	defer s.Unlock()
+	// also drop fetches claimed while this layer was being written: their
+	// double-check may have read the old value
+	defer c.dropFlights(key)
 
 	if upstreamCache, ok := c.upstream.(Cache[T]); ok {
-		if err := upstreamCache.Set(ctx, key, value); err != nil {
-			return errors.Wrapf(err, "set in upstream failed for key: %s", key)
+		if err := toUpstream(upstreamCache); err != nil {
+			written()
+			c.invalidate(ctx, key)
+			return err
 		}
 	}
 
+	written()
+	if err := toLayer(); err != nil {
+		c.invalidate(ctx, key)
+		return err
+	}
 	return nil
 }
 
-func (c *Client[T]) setWithoutUpstream(ctx context.Context, key string, value T) error {
+// dropFlights releases the in-flight fetches of key (every fetch slot) without
+// interrupting them: callers already waiting still get their result.
+func (c *Client[T]) dropFlights(key string) {
+	if c.fetchConcurrency <= 1 {
+		c.flights.Drop(key)
+		return
+	}
+	for i := range c.fetchConcurrency {
+		c.flights.Drop(fmt.Sprintf("%d:%s", i, key))
+	}
+}
+
+// invalidate drops this layer's entry and cached not-found for key, best
+// effort. It runs after a failed write, often failed by ctx itself, so it does
+// not reuse ctx's cancellation.
+func (c *Client[T]) invalidate(ctx context.Context, key string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
+	defer cancel()
 	if c.notFoundCache != nil {
 		if err := c.notFoundCache.Del(ctx, key); err != nil {
-			return errors.Wrapf(err, "delete from notFoundCache failed for key: %s", key)
+			c.logger.WarnContext(ctx, "failed to invalidate notFoundCache entry", "key", key, "error", err)
 		}
 	}
-
-	if err := c.backend.Set(ctx, key, value); err != nil {
-		return errors.Wrapf(err, "set in backend failed for key: %s", key)
+	if err := c.backend.Del(ctx, key); err != nil {
+		c.logger.WarnContext(ctx, "failed to invalidate cache entry", "key", key, "error", err)
 	}
-
-	return nil
 }
 
-func (c *Client[T]) fetchFromUpstream(ctx context.Context, key string) (T, error) {
-	return c.fetchFromUpstreamWithSFKey(ctx, key, c.makeSFKey(key))
+// backfill writes what a fetch read into this layer, unless a Set or Del of
+// the key happened since gen was taken (before reading the upstream). It holds
+// the key's stripe for reading, so a write waits for it, and the fill either
+// lands before the write or is skipped. A write in progress skips it too
+// (TryRLock): reads never wait on writes, at the cost of a spare cache miss.
+func (c *Client[T]) backfill(ctx context.Context, key string, gen uint64, fill func() error, failMsg string) {
+	s := c.stripe(key)
+	if !s.TryRLock() {
+		return
+	}
+	defer s.RUnlock()
+	if s.Generation() != gen {
+		return
+	}
+	if err := fill(); err != nil {
+		c.logger.WarnContext(ctx, failMsg, "key", key, "error", err)
+	}
+	s.AddFill()
 }
 
-func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, sfKey string) (T, error) {
+// setWithoutUpstream clears a cached not-found and writes the backend; a failed
+// not-found cleanup does not stop the write, since reads check the backend first.
+func (c *Client[T]) setWithoutUpstream(ctx context.Context, key string, value T) error {
+	var errs []error
+	if c.notFoundCache != nil {
+		if err := c.notFoundCache.Del(ctx, key); err != nil {
+			errs = append(errs, errors.Wrapf(err, "delete from notFoundCache failed for key: %s", key))
+		}
+	}
+	if err := c.backend.Set(ctx, key, value); err != nil {
+		errs = append(errs, errors.Wrapf(err, "set in backend failed for key: %s", key))
+	}
+	return stderrors.Join(errs...)
+}
+
+// fetchFromUpstreamWithSFKey fetches key through the flight group; seen is the
+// key's stripe epoch from before the caller read this layer.
+func (c *Client[T]) fetchFromUpstreamWithSFKey(ctx context.Context, key string, sfKey string, seen uint64) (T, error) {
 	var zero T
 
 	if c.testHooks != nil && c.testHooks.beforeSingleflightStart != nil {
 		c.testHooks.beforeSingleflightStart(ctx, key)
 	}
 
-	resChan := c.sfg.DoChan(sfKey, func() (result any, resultErr error) {
-		if c.testHooks != nil && c.testHooks.afterSingleflightStart != nil {
-			c.testHooks.afterSingleflightStart(ctx, key)
-		}
-
-		defer func() {
-			if r := recover(); r != nil {
-				c.logger.ErrorContext(ctx, "panic during upstream fetch",
-					"key", key,
-					"panic", r,
-					"stack", string(debug.Stack()))
-				var zero T
-				result = zero
-				resultErr = errors.Errorf("panic during upstream fetch: %v", r)
-			}
-		}()
-
-		// Double-check optimization: check cache again before fetching from upstream
-		// This handles the narrow window after a write completes but before singleflight releases
-		//
-		// Note: We use the original key (not sfKey) because:
-		// 1. fetchConcurrency allows multiple slots to fetch concurrently (exploration phase)
-		// 2. Once ANY slot completes, ALL slots should converge to reuse that result (convergence phase)
-		// 3. Using key ensures cross-slot visibility, maximizing result reuse after first completion
-		if c.enableDoubleCheck {
-			cachedValue, err := c.get(ctx, key, true)
-
-			if err == nil {
-				return cachedValue, nil
-			}
-			var e *ErrKeyNotFound
-			if errors.As(err, &e) && e.Cached && e.CacheState == StateFresh {
-				var zero T
-				return zero, err
-			}
-			// otherwise, fetch from upstream
-		}
-
-		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.fetchTimeout)
-		defer cancel()
-		return c.doFetch(fetchCtx, key)
-	})
+	f, leader := c.flights.Claim(sfKey)
+	if leader {
+		go c.runClaimed(flightCtx(ctx), key, sfKey, f, seen)
+	}
 
 	select {
 	case <-ctx.Done():
 		return zero, errors.Wrapf(ctx.Err(), "context cancelled during fetch for key: %s", key)
-	case res := <-resChan:
+	case <-f.Done():
 		if c.testHooks != nil && c.testHooks.afterSingleflightEnd != nil {
 			c.testHooks.afterSingleflightEnd(ctx, key)
 		}
-		if res.Err != nil {
-			return zero, res.Err
+		value, err := f.Result()
+		if err != nil {
+			return zero, err
 		}
-		return res.Val.(T), nil
+		return value, nil
 	}
+}
+
+// flightCtx is the ctx of a fetch claimed by one request but awaited by every
+// request of the key: it keeps ctx's values (tracing, etc.) but not its
+// cancellation, which belongs to that one request, nor its GORM transaction.
+func flightCtx(ctx context.Context) context.Context {
+	return withoutGORMTx(context.WithoutCancel(ctx))
+}
+
+// runClaimed fetches a key this request has claimed and publishes the result.
+func (c *Client[T]) runClaimed(ctx context.Context, key, sfKey string, f *flight.Flight[T], seen uint64) {
+	p := c.claimedFlights([]string{key}, []string{sfKey}, []*flight.Flight[T]{f})
+	p.run(ctx, []int{0}, func() {
+		value, err := c.fetchClaimed(ctx, key, seen)
+		p.publish(0, result[T]{value: value, err: err})
+	})
+}
+
+// fetchClaimed fetches a key this request has claimed in the flight group.
+func (c *Client[T]) fetchClaimed(ctx context.Context, key string, seen uint64) (T, error) {
+	if c.testHooks != nil && c.testHooks.afterSingleflightStart != nil {
+		c.testHooks.afterSingleflightStart(ctx, key)
+	}
+
+	// Double-check optimization: check cache again before fetching from upstream
+	// This handles the narrow window after a write completes but before singleflight releases
+	//
+	// Note: We use the original key (not sfKey) because:
+	// 1. fetchConcurrency allows multiple slots to fetch concurrently (exploration phase)
+	// 2. Once ANY slot completes, ALL slots should converge to reuse that result (convergence phase)
+	// 3. Using key ensures cross-slot visibility, maximizing result reuse after first completion
+	if c.shouldDoubleCheck(key, seen) {
+		checkCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+		cachedValue, err := c.get(checkCtx, key, true)
+		cancel()
+
+		if err == nil {
+			return cachedValue, nil
+		}
+		if isCachedFreshNotFound(err) {
+			var zero T
+			return zero, err
+		}
+		// otherwise, fetch from upstream
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, c.fetchTimeout)
+	defer cancel()
+	return c.doFetch(fetchCtx, key)
+}
+
+func isCachedFreshNotFound(err error) bool {
+	var e *ErrKeyNotFound
+	return IsErrKeyNotFound(err) && errors.As(err, &e) && e.Cached && e.CacheState == StateFresh
 }
 
 func (c *Client[T]) makeSFKey(key string) string {
@@ -330,7 +472,7 @@ func (c *Client[T]) makeSFKey(key string) string {
 	return key
 }
 
-func (c *Client[T]) asyncRefresh(ctx context.Context, key string) {
+func (c *Client[T]) asyncRefresh(ctx context.Context, key string, seen uint64) {
 	sfKey := c.makeSFKey(key)
 
 	if _, loaded := c.asyncRefreshing.LoadOrStore(sfKey, struct{}{}); loaded {
@@ -340,43 +482,40 @@ func (c *Client[T]) asyncRefresh(ctx context.Context, key string) {
 	go func() {
 		defer c.asyncRefreshing.Delete(sfKey)
 
-		if _, err := c.fetchFromUpstreamWithSFKey(ctx, key, sfKey); err != nil {
+		if _, err := c.fetchFromUpstreamWithSFKey(ctx, key, sfKey, seen); err != nil {
 			c.logger.ErrorContext(ctx, "async refresh failed", "key", key, "error", err)
 		}
 	}()
 }
 
 func (c *Client[T]) doFetch(ctx context.Context, key string) (T, error) {
+	gen := c.stripe(key).Generation()
 	value, err := c.upstream.Get(ctx, key)
 	if err != nil {
 		if IsErrKeyNotFound(err) {
-			if delErr := c.delWithoutUpstream(ctx, key); delErr != nil {
-				c.logger.WarnContext(ctx, "failed to delete cache entry", "key", key, "error", delErr)
-			}
+			c.backfill(ctx, key, gen, func() error { return c.delWithoutUpstream(ctx, key) }, "failed to delete cache entry")
 		}
 		var zero T
 		return zero, errors.Wrapf(err, "get from upstream failed for key: %s", key)
 	}
 
-	if setErr := c.setWithoutUpstream(ctx, key, value); setErr != nil {
-		c.logger.WarnContext(ctx, "failed to set cache entry", "key", key, "error", setErr)
-	}
+	c.backfill(ctx, key, gen, func() error { return c.setWithoutUpstream(ctx, key, value) }, "failed to set cache entry")
 
 	return value, nil
 }
 
-// resolveDoubleCheckMode converts the mode to a boolean decision
-func (c *Client[T]) resolveDoubleCheckMode() bool {
+// shouldDoubleCheck reports whether a claimed fetch re-reads this layer first.
+// In DoubleCheckAuto it does only if this Client wrote the key's stripe since
+// the request read the layer (seen): otherwise the re-read would find the same
+// miss. A write to another key of the stripe makes it re-read for nothing.
+func (c *Client[T]) shouldDoubleCheck(key string, seen uint64) bool {
 	switch c.doubleCheckMode {
 	case DoubleCheckEnabled:
 		return true
 	case DoubleCheckDisabled:
 		return false
-	case DoubleCheckAuto:
-		// Auto mode: enable when notFoundCache exists (can leverage it in double-check)
-		return c.notFoundCache != nil
 	default:
-		return false
+		return c.stripe(key).Epoch() != seen
 	}
 }
 
@@ -447,6 +586,28 @@ func WithFetchTimeout[T any](timeout time.Duration) ClientOption[T] {
 func WithFetchConcurrency[T any](concurrency int) ClientOption[T] {
 	return func(c *Client[T]) {
 		c.fetchConcurrency = concurrency
+	}
+}
+
+// WithGetManyFetchConcurrency sets how many upstream requests one GetMany has
+// in flight at once (default DefaultGetManyFetchConcurrency): upstream.Get
+// calls when the upstream does not implement BatchUpstream (each key fetched as
+// Get would), or chunks of a BatchUpstream call (see WithGetManyChunkSize).
+// Unlike WithFetchConcurrency, which bounds the fetches of one key, this bounds
+// the different keys (or chunks) of one GetMany.
+func WithGetManyFetchConcurrency[T any](concurrency int) ClientOption[T] {
+	return func(c *Client[T]) {
+		c.getManyConc = concurrency
+	}
+}
+
+// WithGetManyChunkSize splits the keys one GetMany sends to a BatchUpstream into
+// calls of at most size keys, run concurrently up to WithGetManyFetchConcurrency;
+// the keys of a call are answered as soon as it returns. Zero (the default)
+// sends them in one call. Use it when the upstream limits its batch size.
+func WithGetManyChunkSize[T any](size int) ClientOption[T] {
+	return func(c *Client[T]) {
+		c.getManyChunk = size
 	}
 }
 

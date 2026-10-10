@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestClientBasics(t *testing.T) {
@@ -71,11 +73,11 @@ func TestClientStaleHandling(t *testing.T) {
 	}
 
 	backend := newRistrettoCache[*testValue](t)
-	fetchCount := 0
+	var fetchCount atomic.Int64
 
 	upstream := UpstreamFunc[*testValue](func(ctx context.Context, key string) (*testValue, error) {
-		fetchCount++
-		return &testValue{Data: fmt.Sprintf("fetch-%d", fetchCount), Timestamp: NowFunc()}, nil
+		n := fetchCount.Add(1)
+		return &testValue{Data: fmt.Sprintf("fetch-%d", n), Timestamp: NowFunc()}, nil
 	})
 
 	checkStale := func(v *testValue) State {
@@ -90,7 +92,7 @@ func TestClientStaleHandling(t *testing.T) {
 	}
 
 	t.Run("without serve stale", func(t *testing.T) {
-		fetchCount = 0
+		fetchCount.Store(0)
 
 		cli := NewClient(backend, upstream, WithStale(checkStale))
 
@@ -106,7 +108,7 @@ func TestClientStaleHandling(t *testing.T) {
 	})
 
 	t.Run("with serve stale", func(t *testing.T) {
-		fetchCount = 0
+		fetchCount.Store(0)
 		err := backend.Del(ctx, "key2")
 		require.NoError(t, err)
 
@@ -118,7 +120,7 @@ func TestClientStaleHandling(t *testing.T) {
 		value, err := cli.Get(ctx, "key2")
 		require.NoError(t, err)
 		assert.Equal(t, "fetch-1", value.Data)
-		assert.Equal(t, 1, fetchCount)
+		assert.Equal(t, int64(1), fetchCount.Load())
 
 		clock.Advance(60 * time.Millisecond)
 
@@ -126,8 +128,8 @@ func TestClientStaleHandling(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "fetch-1", value.Data, "should serve stale value")
 
-		time.Sleep(10 * time.Millisecond)
-		assert.Equal(t, 2, fetchCount, "async refresh should have completed")
+		waitAsyncRefreshDone(t, cli)
+		assert.Equal(t, int64(2), fetchCount.Load(), "async refresh should have completed")
 
 		clock.Advance(60 * time.Millisecond)
 
@@ -135,15 +137,15 @@ func TestClientStaleHandling(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "fetch-2", value.Data, "should serve new stale value after async refresh")
 
-		time.Sleep(10 * time.Millisecond)
-		assert.Equal(t, 3, fetchCount, "second async refresh should have completed")
+		waitAsyncRefreshDone(t, cli)
+		assert.Equal(t, int64(3), fetchCount.Load(), "second async refresh should have completed")
 
 		clock.Advance(200 * time.Millisecond)
 
 		value, err = cli.Get(ctx, "key2")
 		require.NoError(t, err)
 		assert.Equal(t, "fetch-4", value.Data, "should refetch when rotten")
-		assert.Equal(t, 4, fetchCount)
+		assert.Equal(t, int64(4), fetchCount.Load())
 	})
 }
 
@@ -594,9 +596,9 @@ func TestNotFoundCacheStale(t *testing.T) {
 	backend := newRistrettoCache[string](t)
 	notFoundCache := newRistrettoCache[time.Time](t)
 
-	fetchCount := 0
+	var fetchCount atomic.Int64
 	upstream := UpstreamFunc[string](func(ctx context.Context, key string) (string, error) {
-		fetchCount++
+		fetchCount.Add(1)
 		if key == "not-exist" {
 			return "", &ErrKeyNotFound{}
 		}
@@ -613,7 +615,7 @@ func TestNotFoundCacheStale(t *testing.T) {
 		var e *ErrKeyNotFound
 		assert.True(t, errors.As(err, &e))
 		assert.False(t, e.Cached, "first fetch should not be cached")
-		assert.Equal(t, 1, fetchCount)
+		assert.Equal(t, int64(1), fetchCount.Load())
 	})
 
 	t.Run("second fetch serves from cache", func(t *testing.T) {
@@ -622,7 +624,7 @@ func TestNotFoundCacheStale(t *testing.T) {
 		assert.True(t, errors.As(err, &e))
 		assert.True(t, e.Cached, "second fetch should be from cache")
 		assert.Equal(t, StateFresh, e.CacheState)
-		assert.Equal(t, 1, fetchCount, "should not refetch")
+		assert.Equal(t, int64(1), fetchCount.Load(), "should not refetch")
 	})
 
 	t.Run("serve stale not found", func(t *testing.T) {
@@ -634,11 +636,10 @@ func TestNotFoundCacheStale(t *testing.T) {
 		assert.True(t, e.Cached)
 		assert.Equal(t, StateStale, e.CacheState)
 		// Should still be 1 fetch (serving stale, async refresh will happen)
-		assert.Equal(t, 1, fetchCount)
+		assert.Equal(t, int64(1), fetchCount.Load())
 
-		// Wait a bit for async refresh to complete
-		time.Sleep(50 * time.Millisecond)
-		assert.Equal(t, 2, fetchCount, "async refresh should have happened")
+		waitAsyncRefreshDone(t, cli)
+		assert.Equal(t, int64(2), fetchCount.Load(), "async refresh should have happened")
 	})
 
 	t.Run("rotten triggers immediate fetch", func(t *testing.T) {
@@ -649,7 +650,7 @@ func TestNotFoundCacheStale(t *testing.T) {
 		assert.True(t, errors.As(err, &e))
 		// After refetch, error comes from upstream (not cached)
 		assert.False(t, e.Cached, "rotten refetch returns fresh upstream error")
-		assert.Equal(t, 3, fetchCount, "should refetch immediately when rotten")
+		assert.Equal(t, int64(3), fetchCount.Load(), "should refetch immediately when rotten")
 	})
 }
 
@@ -859,4 +860,65 @@ func TestSetDelWithUpstreamCache(t *testing.T) {
 		err = cli.Del(ctx, "key5")
 		assert.NoError(t, err)
 	})
+}
+
+// waitAsyncRefreshDone waits until no serve-stale background refresh is in
+// flight, so a test can read what the refresh wrote and close the backend
+// without racing it.
+func waitAsyncRefreshDone[T any](t *testing.T, cli *Client[T]) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		idle := true
+		cli.asyncRefreshing.Range(func(any, any) bool {
+			idle = false
+			return false
+		})
+		return idle
+	}, time.Second, time.Millisecond, "background refresh should finish")
+}
+
+func TestFetchIsDetachedFromTheLeader(t *testing.T) {
+	t.Run("a leader that gives up does not fail the double-check for the others", func(t *testing.T) {
+		backend := ctxCache{NewSyncMap[string]()} // refuses a done ctx, like Redis or GORM
+		var calls atomic.Int32
+		cli := NewClient[string](ctxGetCache{backend}, UpstreamFunc[string](func(context.Context, string) (string, error) {
+			calls.Add(1)
+			return "from-upstream", nil
+		}), WithDoubleCheck[string](DoubleCheckEnabled))
+		leaderCtx, cancel := context.WithCancel(context.Background())
+		cli.testHooks = &testHooks{afterSingleflightStart: func(context.Context, string) {
+			// between the leader's miss and its double-check: another request
+			// filled the cache, and the leader's caller gave up
+			_ = backend.Set(context.Background(), "k", "filled-meanwhile")
+			cancel()
+		}}
+		_, _ = cli.Get(leaderCtx, "k")
+		require.Eventually(t, func() bool {
+			v, err := backend.Get(context.Background(), "k")
+			return err == nil && v == "filled-meanwhile"
+		}, time.Second, time.Millisecond)
+		time.Sleep(20 * time.Millisecond) // let a wrongly started fetch show up
+		assert.Zero(t, calls.Load(), "the double-check ran with the flight's ctx, found the value, and skipped the upstream")
+	})
+
+	t.Run("the fetch does not run in the leader's GORM transaction", func(t *testing.T) {
+		var sawTx atomic.Bool
+		cli := NewClient[string](NewSyncMap[string](), UpstreamFunc[string](func(ctx context.Context, _ string) (string, error) {
+			sawTx.Store(GetGORMTx(ctx) != nil)
+			return "v", nil
+		}))
+		_, err := cli.Get(WithGORMTx(context.Background(), &gorm.DB{}), "k")
+		require.NoError(t, err)
+		assert.False(t, sawTx.Load(), "the fetch serves every waiter, so it must not write inside one caller's transaction")
+	})
+}
+
+// ctxGetCache is a cache whose Get refuses a done ctx, like Redis or GORM.
+type ctxGetCache struct{ ctxCache }
+
+func (c ctxGetCache) Get(ctx context.Context, key string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return c.SyncMap.Get(ctx, key)
 }

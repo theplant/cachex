@@ -2,9 +2,13 @@ package cachex
 
 import (
 	"context"
+	"math"
+	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -12,11 +16,16 @@ import (
 )
 
 func newGORMCache[T any](tb testing.TB, tableName string) (*GORMCache[T], *gorm.DB) {
+	return newGORMCacheWith[T](tb, tableName, 0)
+}
+
+func newGORMCacheWith[T any](tb testing.TB, tableName string, chunkSize int) (*GORMCache[T], *gorm.DB) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(tb, err)
 	cache := NewGORMCache[T](&GORMCacheConfig{
 		DB:        db,
 		TableName: tableName,
+		ChunkSize: chunkSize,
 	})
 	require.NoError(tb, cache.Migrate(context.Background()))
 	return cache, db
@@ -221,4 +230,149 @@ func TestGORMCacheWithClientTransaction(t *testing.T) {
 	_, err = cache.Get(ctx, "user1")
 	assert.True(t, IsErrKeyNotFound(err), "should not find value in cache after transaction rollback")
 	assert.Equal(t, 0, fetchCount, "should not fetch from upstream during rollback test")
+}
+
+func TestGORMCacheNeverServesAnotherKeysValue(t *testing.T) {
+	// SQLite's NOCASE stands in for MySQL's default _ci collations, where "abc" and "ABC" are one row
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.Exec(`CREATE TABLE ci (key TEXT COLLATE NOCASE PRIMARY KEY, value JSON NOT NULL, updated_at DATETIME)`).Error)
+	c := NewGORMCache[string](&GORMCacheConfig{DB: db, TableName: "ci", KeyPrefix: "p:"})
+	ctx := context.Background()
+
+	requireMiss := func(key string) {
+		t.Helper()
+		_, err := c.Get(ctx, key)
+		assert.True(t, IsErrKeyNotFound(err), "Get(%q) must not see another key's row: %v", key, err)
+		got, err := c.GetMany(ctx, []string{key})
+		require.NoError(t, err)
+		assert.Empty(t, got, "GetMany(%q) must not see another key's row", key)
+	}
+	requireHit := func(key, want string) {
+		t.Helper()
+		v, err := c.Get(ctx, key)
+		require.NoError(t, err)
+		assert.Equal(t, want, v)
+		got, err := c.GetMany(ctx, []string{key})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{key: want}, got)
+	}
+
+	require.NoError(t, c.Set(ctx, "ABC", "upper"))
+	requireHit("ABC", "upper")
+	requireMiss("abc")
+
+	require.NoError(t, c.Set(ctx, "abc", "lower")) // takes the shared row over
+	requireHit("abc", "lower")
+	requireMiss("ABC")
+
+	require.NoError(t, c.SetMany(ctx, map[string]string{"ABC": "upper2"}))
+	requireHit("ABC", "upper2")
+	requireMiss("abc")
+}
+
+func TestGORMCacheGetManyCaseSensitiveKeyColumn(t *testing.T) {
+	c, _ := newGORMCache[string](t, "cs")
+	ctx := context.Background()
+	require.NoError(t, c.Set(ctx, "abc", "lower"))
+	require.NoError(t, c.Set(ctx, "ABC", "upper"))
+	got, err := c.GetMany(ctx, []string{"abc", "ABC", "Abc"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"abc": "lower", "ABC": "upper"}, got, "distinct keys stay distinct")
+}
+
+func TestGORMCacheQuotesTheKeyColumn(t *testing.T) {
+	// "key" is reserved in MySQL; SQLite accepts it bare, so check the SQL itself
+	cache, db := newGORMCache[string](t, "quoted")
+	var sqls []string
+	capture := func(tx *gorm.DB) { sqls = append(sqls, tx.Statement.SQL.String()) }
+	require.NoError(t, db.Callback().Query().After("gorm:query").Register("test:capture", capture))
+	require.NoError(t, db.Callback().Delete().After("gorm:delete").Register("test:capture", capture))
+	require.NoError(t, db.Callback().Create().After("gorm:create").Register("test:capture", capture))
+
+	ctx := context.Background()
+	require.NoError(t, cache.Set(ctx, "a", "1"))
+	_, _ = cache.Get(ctx, "a")
+	_, _ = cache.GetMany(ctx, []string{"a", "b"})
+	require.NoError(t, cache.SetMany(ctx, map[string]string{"b": "2"}))
+	require.NoError(t, cache.Del(ctx, "a"))
+	require.NoError(t, cache.DelMany(ctx, []string{"b"}))
+
+	require.Len(t, sqls, 6)
+	bare := regexp.MustCompile("(^|[^`\"])\\bkey\\b($|[^`\"])")
+	for _, sql := range sqls {
+		assert.NotRegexp(t, bare, sql, "the key column must be quoted")
+	}
+}
+
+func TestGORMCacheSetManyKeepsTheValuesThatEncode(t *testing.T) {
+	type num struct{ V float64 }
+	cache, _ := newGORMCache[num](t, "encode")
+	ctx := context.Background()
+	err := cache.SetMany(ctx, map[string]num{"ok": {1}, "bad": {math.NaN()}})
+	require.Error(t, err, "the value that cannot be encoded is reported")
+	assert.Contains(t, err.Error(), "bad")
+	v, err := cache.Get(ctx, "ok")
+	require.NoError(t, err, "like RedisCache, the others are still written")
+	assert.Equal(t, num{1}, v)
+}
+
+// sqlStateError mimics a pgx/lib/pq error.
+type sqlStateError string
+
+func (e sqlStateError) Error() string    { return "ERROR: (SQLSTATE " + string(e) + ")" }
+func (e sqlStateError) SQLState() string { return string(e) }
+
+func TestIsDeadlock(t *testing.T) {
+	assert.True(t, isDeadlock(errors.Wrap(sqlStateError("40P01"), "x")), "PostgreSQL deadlock")
+	assert.True(t, isDeadlock(sqlStateError("40001")), "serialization failure")
+	assert.True(t, isDeadlock(errors.New("Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction")), "MySQL deadlock")
+	assert.False(t, isDeadlock(sqlStateError("23505")))
+	assert.False(t, isDeadlock(errors.New("Error 1205 (HY000): Lock wait timeout exceeded")))
+	assert.False(t, isDeadlock(nil))
+}
+
+func TestGORMCacheRetriesDeadlockVictims(t *testing.T) {
+	cache, db := newGORMCache[string](t, "retry")
+	ctx := context.Background()
+	var fails atomic.Int32
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:deadlock", func(tx *gorm.DB) {
+		if fails.Add(-1) >= 0 {
+			_ = tx.AddError(sqlStateError("40P01"))
+		}
+	}))
+
+	fails.Store(2)
+	require.NoError(t, cache.Set(ctx, "k", "v"), "a deadlock victim is retried")
+	v, err := cache.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "v", v)
+
+	fails.Store(100)
+	assert.True(t, isDeadlock(cache.SetMany(ctx, map[string]string{"k": "v2"})), "retries are bounded")
+
+	fails.Store(1)
+	err = db.Transaction(func(tx *gorm.DB) error { return cache.Set(WithGORMTx(ctx, tx), "k", "v3") })
+	assert.True(t, isDeadlock(err), "inside the caller's transaction, which the deadlock rolled back, nothing is retried")
+}
+
+func TestCheckMySQLVersion(t *testing.T) {
+	for version, ok := range map[string]bool{
+		"8.0.17":                  true,
+		"8.0.36-0ubuntu0.22.04.1": true,
+		"8.4.2":                   true,
+		"9.1.0":                   true,
+		"8.0.16":                  false,
+		"5.7.44-log":              false,
+		"10.11.6-MariaDB":         false,
+		"11.4.2-MariaDB-ubu2404":  false,
+		"garbage":                 false,
+	} {
+		err := checkMySQLVersion(version)
+		if ok {
+			assert.NoError(t, err, version)
+		} else {
+			assert.ErrorContains(t, err, "MySQL 8.0.17 or later", version)
+		}
+	}
 }

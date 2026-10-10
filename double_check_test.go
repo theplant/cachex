@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +22,6 @@ func TestWithDoubleCheckValidation(t *testing.T) {
 	t.Run("default auto mode", func(t *testing.T) {
 		client := NewClient(backend, upstream)
 		assert.Equal(t, DoubleCheckAuto, client.doubleCheckMode)
-		assert.False(t, client.enableDoubleCheck, "should be disabled when no notFoundCache")
 	})
 
 	t.Run("explicitly disabled", func(t *testing.T) {
@@ -29,7 +29,6 @@ func TestWithDoubleCheckValidation(t *testing.T) {
 			WithDoubleCheck[string](DoubleCheckDisabled),
 		)
 		assert.Equal(t, DoubleCheckDisabled, client.doubleCheckMode)
-		assert.False(t, client.enableDoubleCheck)
 	})
 
 	t.Run("explicitly enabled", func(t *testing.T) {
@@ -37,25 +36,13 @@ func TestWithDoubleCheckValidation(t *testing.T) {
 			WithDoubleCheck[string](DoubleCheckEnabled),
 		)
 		assert.Equal(t, DoubleCheckEnabled, client.doubleCheckMode)
-		assert.True(t, client.enableDoubleCheck)
 	})
 
-	t.Run("auto mode without notFoundCache", func(t *testing.T) {
+	t.Run("explicit auto mode", func(t *testing.T) {
 		client := NewClient(backend, upstream,
 			WithDoubleCheck[string](DoubleCheckAuto),
 		)
 		assert.Equal(t, DoubleCheckAuto, client.doubleCheckMode, "should preserve original config")
-		assert.False(t, client.enableDoubleCheck, "should be disabled when no notFoundCache")
-	})
-
-	t.Run("auto mode with notFoundCache", func(t *testing.T) {
-		notFoundCache := newRistrettoCache[time.Time](t)
-		client := NewClient(backend, upstream,
-			NotFoundWithTTL[string](notFoundCache, 1*time.Second, 0),
-			WithDoubleCheck[string](DoubleCheckAuto),
-		)
-		assert.Equal(t, DoubleCheckAuto, client.doubleCheckMode, "should preserve original config")
-		assert.True(t, client.enableDoubleCheck, "should be enabled when notFoundCache exists")
 	})
 }
 
@@ -339,4 +326,44 @@ func TestDoubleCheckRaceWindowProbability(t *testing.T) {
 		t.Logf("  4. Previous test failed because all requests started simultaneously")
 		t.Logf("  5. Two-wave pattern simulates real-world traffic bursts")
 	})
+}
+
+// readCounter counts backend reads, single and batch.
+type readCounter struct {
+	*SyncMap[string]
+	gets, getManys atomic.Int32
+}
+
+func (r *readCounter) Get(ctx context.Context, key string) (string, error) {
+	r.gets.Add(1)
+	return r.SyncMap.Get(ctx, key)
+}
+
+func (r *readCounter) GetMany(ctx context.Context, keys []string) (map[string]string, error) {
+	r.getManys.Add(1)
+	return r.SyncMap.GetMany(ctx, keys)
+}
+
+func TestDoubleCheckAutoSkipsWhenNothingWasWritten(t *testing.T) {
+	ctx := context.Background()
+	up := UpstreamFunc[string](func(_ context.Context, key string) (string, error) { return "v-" + key, nil })
+	for _, tc := range []struct {
+		mode  DoubleCheckMode
+		reads int32
+	}{
+		{DoubleCheckAuto, 1},    // nothing written since the miss: re-reading is useless
+		{DoubleCheckEnabled, 2}, // always re-reads
+	} {
+		backend := &readCounter{SyncMap: NewSyncMap[string]()}
+		cli := NewClient[string](backend, up, WithDoubleCheck[string](tc.mode))
+		_, err := cli.Get(ctx, "cold")
+		require.NoError(t, err)
+		assert.Equal(t, tc.reads, backend.gets.Load(), "Get, mode %d", tc.mode)
+
+		batchBackend := &readCounter{SyncMap: NewSyncMap[string]()}
+		batchCli := NewClient[string](batchBackend, &batchUpstream{data: map[string]string{"a": "1"}}, WithDoubleCheck[string](tc.mode))
+		_, err = batchCli.GetMany(ctx, []string{"a", "b"})
+		require.NoError(t, err)
+		assert.Equal(t, tc.reads, batchBackend.getManys.Load(), "GetMany, mode %d", tc.mode)
+	}
 }

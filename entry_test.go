@@ -2,6 +2,7 @@ package cachex
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -176,9 +177,9 @@ func TestEntryWithClient(t *testing.T) {
 		defer func() { _ = cache.Close() }()
 
 		// Mock upstream data source
-		fetchCount := 0
+		var fetchCount atomic.Int64
 		upstream := UpstreamFunc[*Entry[string]](func(ctx context.Context, key string) (*Entry[string], error) {
-			fetchCount++
+			fetchCount.Add(1)
 			return &Entry[string]{
 				Data:     "value-" + key,
 				CachedAt: NowFunc(),
@@ -199,13 +200,13 @@ func TestEntryWithClient(t *testing.T) {
 		entry1, err := client.Get(ctx, "test-key")
 		assert.NoError(t, err)
 		assert.Equal(t, "value-test-key", entry1.Data)
-		assert.Equal(t, 1, fetchCount)
+		assert.Equal(t, int64(1), fetchCount.Load())
 
 		// Second call: cache hit (fresh)
 		entry2, err := client.Get(ctx, "test-key")
 		assert.NoError(t, err)
 		assert.Equal(t, "value-test-key", entry2.Data)
-		assert.Equal(t, 1, fetchCount) // No additional fetch
+		assert.Equal(t, int64(1), fetchCount.Load()) // No additional fetch
 
 		// Wait for data to become stale
 		time.Sleep(150 * time.Millisecond)
@@ -217,12 +218,12 @@ func TestEntryWithClient(t *testing.T) {
 		// fetchCount might be 1 or 2 depending on async refresh timing
 
 		// Wait for async refresh to complete
-		time.Sleep(100 * time.Millisecond)
+		waitAsyncRefreshDone(t, client)
 
 		// Fourth call: should have fresh data again
 		entry4, err := client.Get(ctx, "test-key")
 		assert.NoError(t, err)
 		assert.Equal(t, "value-test-key", entry4.Data)
-		assert.GreaterOrEqual(t, fetchCount, 2) // At least 2 fetches (initial + refresh)
+		assert.GreaterOrEqual(t, fetchCount.Load(), int64(2)) // At least 2 fetches (initial + refresh)
 	})
 }

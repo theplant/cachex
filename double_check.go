@@ -10,60 +10,39 @@ const (
 	// DoubleCheckEnabled always performs double-check before upstream fetch
 	DoubleCheckEnabled
 
-	// DoubleCheckAuto enables double-check based on configuration (default):
-	// - Enabled when notFoundCache exists (can leverage it to catch not-found in race window)
-	// - Disabled when no notFoundCache (cost limited to backend only)
+	// DoubleCheckAuto (default) double-checks only when it can find something:
+	// when this Client wrote this layer for a key of the same stripe (a Set,
+	// Del or backfill) since the request read it. Otherwise the re-read would
+	// find the same miss, so it is skipped.
 	DoubleCheckAuto
 )
 
 // WithDoubleCheck configures the double-check optimization mode.
 //
-// Default: DoubleCheckAuto (smart detection based on notFoundCache configuration)
+// Default: DoubleCheckAuto.
 //
-// Background: Double-check works together with singleflight to reduce redundant upstream calls:
-//   - Singleflight: Deduplicates concurrent requests for the same key (same moment)
-//   - Double-check: Handles slightly staggered requests in race window (near-miss timing)
+// Singleflight merges the requests that miss a key at the same moment. A
+// request that read the layer (a miss) just before another request's fetch
+// wrote it, but claims the key only after that fetch has finished, would
+// start a fetch of its own. The double-check re-reads this layer (and the
+// not-found cache) after claiming the key and returns what it finds instead.
 //
-// Double-check queries backend (and notFoundCache if configured) one more time
-// before going to upstream. This addresses the race window where:
-//  1. Request A writes to cache
-//  2. Request B misses cache (A's write not yet visible or in-flight)
-//  3. Request B enters fetch path and would normally query upstream
-//  4. Double-check catches A's write, avoiding redundant upstream query
-//
-// Effectiveness (see TestDoubleCheckRaceWindowProbability for controlled test):
-//   - Test simulates worst-case scenario: two-wave concurrent pattern with precise timing
-//   - Test results: ~40% redundant fetches without double-check, 0% with double-check
-//   - Real-world impact: typically much lower race window probability, actual benefit varies
-//
-// Effectiveness depends on:
-//   - Concurrent access patterns (higher concurrency = more benefit)
-//   - Race window duration (network latency, cache propagation delay)
-//   - Cost ratio between double-check and upstream query
+// How much it saves depends on that window: roughly how long a read of this
+// layer takes to come back, times how many requests the key gets. Measured
+// with a key requested 20 times per ms that expires every 20 ms, a 5 ms
+// upstream and a layer that answers in 1 ms: 18 upstream calls with the
+// double-check, 30 without; with a layer that answers at once (memory), no
+// difference. Its cost is one more read of this layer per fetch.
 //
 // Modes:
-//   - DoubleCheckDisabled: Skip double-check
-//     Use when: backend query cost >= upstream cost, or backend is unreliable/slow,
-//     or without notFoundCache in scenarios where upstream frequently returns not-found
-//     (double-check cannot catch not-found without notFoundCache, reducing effectiveness)
-//   - DoubleCheckEnabled: Always double-check (adds query cost, reduces upstream calls)
-//     Use when: upstream is significantly more expensive than backend queries
-//   - DoubleCheckAuto: Smart detection based on notFoundCache (default)
-//     Enables when notFoundCache exists (double-check covers both found and not-found scenarios),
-//     disables otherwise (double-check only covers found scenario, limited effectiveness)
-//
-// Cost-benefit analysis:
-//
-//	Cost = backend_query [+ notFoundCache_query if configured]
-//	Benefit = Avoid upstream_query when hitting race window
-//
-//	Worth enabling when: upstream_cost >> (backend_cost + notFoundCache_cost)
-//
-// Recommendations by scenario:
-//   - Memory cache -> DB: DoubleCheckEnabled (DB ≫ memory, ~10000x difference)
-//   - Redis -> DB: DoubleCheckEnabled (DB ≫ Redis, ~10-50x difference)
-//   - Redis (+ notFoundCache) -> Redis: DoubleCheckDisabled (cost ≈ benefit)
-//   - Default/Uncertain: DoubleCheckAuto (smart heuristic)
+//   - DoubleCheckAuto: re-reads only when this Client wrote the key's stripe
+//     since the request read the layer. Hot keys get the saving above; keys
+//     fetched with nothing written in between (a long tail of cold keys, keys
+//     that do not exist) skip the useless re-read. Writes made by other
+//     processes to a shared layer are not seen.
+//   - DoubleCheckEnabled: always re-reads, also catching writes by other
+//     processes to a shared layer, at one more read per fetch.
+//   - DoubleCheckDisabled: never re-reads.
 func WithDoubleCheck[T any](mode DoubleCheckMode) ClientOption[T] {
 	return func(c *Client[T]) {
 		c.doubleCheckMode = mode

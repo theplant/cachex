@@ -31,3 +31,32 @@ type UpstreamFunc[T any] func(ctx context.Context, key string) (T, error)
 func (f UpstreamFunc[T]) Get(ctx context.Context, key string) (T, error) {
 	return f(ctx, key)
 }
+
+// BatchUpstream is an optional interface for an Upstream (or Cache) that can
+// retrieve many keys in one call. Client.GetMany uses it when available and
+// falls back to calling Get per key otherwise.
+//
+// Keys absent from the returned map do not exist (the batch form of
+// ErrKeyNotFound). A non-nil error fails the whole batch, unless it is a
+// *BatchError returned as is (not wrapped), which fails only the keys it lists
+// while the map still carries the rest. A whole-batch error fails every key
+// even if it wraps an ErrKeyNotFound: errors.Is and errors.As still see it,
+// but IsErrKeyNotFound reports false.
+type BatchUpstream[T any] interface {
+	GetMany(ctx context.Context, keys []string) (map[string]T, error)
+}
+
+// BatchCache is an optional interface for a Cache that can read and write many
+// keys in one call. Client.GetMany uses it for the backend and the not-found
+// cache when available, and falls back to Get/Set/Del per key otherwise.
+// Its GetMany follows the BatchUpstream contract: missing keys are absent, and
+// a whole-batch error is a failure of every key, not a batch of misses.
+// SetMany and DelMany are best effort: they apply every key they can, and
+// report the keys that failed in a *BatchError returned as is; any other error
+// means it is unknown which keys were applied.
+type BatchCache[T any] interface {
+	Cache[T]
+	BatchUpstream[T]
+	SetMany(ctx context.Context, values map[string]T) error
+	DelMany(ctx context.Context, keys []string) error
+}
