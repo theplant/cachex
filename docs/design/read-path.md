@@ -41,13 +41,15 @@ flowchart TD
 | `FreshUntil` | 之前是新鲜的 |
 | `ExpiresAt` | 之后腐烂，不再返回；Redis 和 otter 用它做原生过期 |
 
-一层的配置是 `TTL(fresh, stale)`（值）和 `NotFoundTTL(fresh, stale)`（不存在记录），再加上 `Jitter(ratio)`。从数据源拿到一个回答时：
+一层的配置是 `TTL(fresh, stale)`（值）和 `NotFoundTTL(fresh, stale)`（不存在记录），再加上 `Jitter(ratio)`。一个条目写进这一层时（数据源的回答、从下层复制上来、`Set`），记 `now` 为写入的时刻：
 
 ```
 fresh' = fresh − rand[0, ratio) × fresh      // 抖动只缩短，不延长
-FreshUntil = CachedAt + fresh'
+FreshUntil = now + fresh'
 ExpiresAt  = FreshUntil + stale              // 陈旧期跟在新鲜期后面
 ```
+
+数据源的回答写进各层时，`now` 就是 `CachedAt`。
 
 再按两个上限截短：
 
@@ -173,13 +175,15 @@ sequenceDiagram
     L1-->>K: 没有
     K->>S: Get(k)（另一个 WithFetchTimeout）
     S-->>K: v
+    K-->>C1: v（发布）
+    K-->>C2: 同一个 v
     K->>L1: 回填 v（持分片读锁、核对写入代数）
     K->>L0: 回填 v
-    K-->>C1: v
-    K-->>C2: 同一个 v
+    K->>K: 回填完成，移除在途登记
 ```
 
-- **先回填，再发布**：等待方拿到结果时，回填已经写进去了，紧接着的读会命中。
+- **先发布，再回填**：数据源一回答，等待方就拿到结果，不用等各层写完。在途回源的登记要等回填完成才移除，这期间来的读会加入这个已经有答案的回源，立刻拿到同一个结果，不会再回源一次。
+- 所以 `Get` 返回时，各层**不一定已经写好**这个值；紧接着直接读后端可能还读不到。`Close` 会等这些回填完成。
 - 回填**从下往上**写：先写离数据源近的层，再写上面的层，和写入顺序一致。
 - 回填只写**找到结果的那一层上面**的层：第二层命中，就只回填第一层。
 - 回填受分片锁和写入代数保护：回源期间这个 key 发生过写入，或者此刻正在写，这次回填就跳过，结果照常返回。详见 [write-order.md](write-order.md)。
