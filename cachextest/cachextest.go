@@ -72,7 +72,9 @@ func (m *Map[T]) Len() int {
 	return n
 }
 
-// Clock is a manual clock: pass its Now to cachex.WithNow.
+// Clock is a manual clock: pass its Now to cachex.WithNow. With a backend
+// that expires entries by the wall clock, start it at time.Now() (see
+// cachex.WithNow).
 type Clock struct {
 	mu  sync.Mutex
 	now time.Time

@@ -29,14 +29,15 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 | `WithGetManyChunkSize`, `WithFetchTimeout`, `WithLogger`, `WithDoubleCheck` | same names, no type parameter |
 | `NowFunc`, `MockClock` | `WithNow(func() time.Time)`, `cachextest.Clock` |
 | `DefaultFetchTimeout` and other `Default*` variables | constants |
-| `Transform`, `JSONTransform`, `StringJSONTransform` | removed: byte-storing backends take a `Codec[T]` (default `DefaultCodec`) |
+| `Transform`, `JSONTransform`, `StringJSONTransform` | removed: byte-storing backends take a `Codec[T]` (default `DefaultCodec`); your own store of bytes implements `ByteBackend` and is wrapped with `Encoded(b, codec, logger)` |
 | `RistrettoCache` | `ottercachex.Backend` (`MaximumSize` or `MaximumWeight` required) |
-| `BigCache` | `bigcachex.Backend` |
-| `RedisCache`, `RedisCacheConfig.TTL` | `rediscachex.Backend`; no TTL setting, see below |
-| `GORMCache` | `gormcachex.Backend`, `Migrate` |
+| `BigCache` | `bigcachex.New`, which returns a `cachex.Backend[T]` |
+| `RedisCache`, `RedisCacheConfig.TTL` | `rediscachex.New`, which returns a `cachex.Backend[T]`; no TTL setting, see below |
+| `GORMCache` | `gormcachex.New`, which returns a `*gormcachex.Backend[T]` with `Migrate` |
 | `WithGORMTx`, `GetGORMTx` | `gormcachex.WithTx`, `gormcachex.TxFrom` |
 | `SyncMap` | `cachextest.Map`, for tests only (unbounded) |
 | — | `Cache.SetMany`, `Cache.DelMany`, `Cache.Close`, `IsShared` |
+| — | `cachextest.TestBackend(t, newBackend, values)` and `cachextest.TestByteBackend(t, newBackend)`, contract tests for your own backends |
 
 ## Behavior
 
@@ -48,17 +49,21 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **Writes go bottom up and never write the source.** † `Set`, `Del`, `SetMany` and `DelMany` write the lowest layer first. If a layer fails, the key is dropped from that layer and every layer above it, and the error is returned. *What to do:* change the source first, then write through the same `Cache`.
 
-**`Del` only invalidates.** v1 recorded a "does not exist" on `Del` when a not-found cache was configured, so a `Del` after an update hid the updated row until that record expired. v2 drops the key from every layer; the next read asks the source. *What to do:* nothing; if you relied on `Del` meaning "deleted", the next read records it.
+**`Del` only invalidates.** v1 recorded a "does not exist" on `Del` when `WithNotFound` was configured, so a `Del` after an update hid the updated row until that record expired. v2 drops the key from every layer; the next read asks the source. *What to do:* nothing; if you relied on `Del` meaning "deleted", the next read records it.
 
 **Fetches outlive their caller.** † A fetch is shared by every request of the key, so it does not end with the caller that started it; its ctx keeps the caller's values but not its cancellation, and `IsShared(ctx)` reports it. `gormcachex` does not use the caller's transaction in such a ctx. *What to do:* nothing; don't expect a backfill to join your transaction.
 
 **A fetch that panics or calls `runtime.Goexit` answers every waiter with an error.** † In v1, waiters of a Goexit'ed fetch waited until their own ctx ended.
 
-**`DoubleCheckAuto` re-reads the first layer only if this `Cache` wrote the key's stripe since the request read it.** † In v1 it was on whenever a not-found cache was configured. Use `DoubleCheckEnabled` to see what other processes wrote to a shared first layer.
+**`DoubleCheckAuto` re-reads the first layer only if this `Cache` wrote the key's stripe since the request read it.** † In v1 it was on whenever `WithNotFound` was configured. Use `DoubleCheckEnabled` to see what other processes wrote to a shared first layer.
 
-**Data that does not decode is a miss.** In v1, a value the codec could not read (after a type change, say) failed every `Get` until it expired. v2 backends drop it, log a warning, and the read fetches anew.
+**Data that does not decode is a miss.** In v1, a value the codec could not read (after a type change, say) failed every `Get` until it expired. v2's byte-storing backends (through `cachex.Encoded`) drop it, log a warning, and the read fetches anew.
 
 **The storage format changed.** v1 data in Redis or a table is not readable by v2 and reads as misses. *What to do:* use a new `KeyPrefix` (or Redis database), and a new table for `gormcachex` (its columns changed: `value` holds the encoded entry, `expires_at` was added); run `Migrate`.
+
+**`gormcachex.Migrate` never runs in your transaction.** It runs on `Config.DB` even if ctx carries a transaction from `WithTx`: on MySQL, DDL would commit it. *What to do:* nothing; call `Migrate` outside your transaction.
+
+**Backends expire entries by the wall clock.** `WithNow` (v1's `NowFunc`) sets the clock the `Cache` judges entries by, but Redis, otter and the byte-storing backends drop an entry once its `ExpiresAt` has passed by `time.Now`. *What to do:* in tests that use a `cachextest.Clock` with such a backend, start the clock at `time.Now()`.
 
 **MySQL needs 8.0.17 or later; MariaDB is not supported.** † `Migrate` creates the table with a `utf8mb4_0900_bin` key column and rejects an existing table whose key column uses another collation, with the `ALTER TABLE` statement that converts it. Only each database's default isolation level is supported.
 
@@ -66,7 +71,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **`GetMany` claims every key up front.** With a source that is not a `BatchSource`, a concurrent `Get` of a key queued in a large `GetMany` waits for its turn. *What to do:* implement `BatchSource` on sources used with `GetMany`.
 
-**`Close` waits for fetches, their backfills and background refreshes.** *What to do:* call it before closing the backends.
+**`Close` waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.** *What to do:* call it before closing the backends.
 
 **A read returns before its backfill.** A fetch answers its callers first and writes the layers above afterwards; a read that comes meanwhile gets the same answer without fetching again. So right after `Get` returns, a layer may not hold the value yet. *What to do:* nothing, unless a test looks at a backend right after a read, or the process exits right after a read (a command-line tool): call `Close` first.
 

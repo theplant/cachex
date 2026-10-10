@@ -122,15 +122,15 @@ if errors.As(err, &be) {
 |---|---|---|
 | `TTL(fresh, stale)` (layer) | required | How long an entry is fresh, then how long it is still served while refreshed |
 | `NotFoundTTL(fresh, stale)` (layer) | `0, 0`: not recorded | The same for "does not exist" |
-| `Jitter(ratio)` (layer) | `0.1` | Shortens each entry's fresh period by up to this share, so entries written together do not expire together |
-| `WithMaxAge(func(T) time.Duration)` | none | Caps how long a value is kept, in every layer |
-| `WithFetchTimeout(d)` | 60s | Bounds each call a fetch makes: a lower layer read, a source call, a backfill |
+| `Jitter(ratio)` (layer) | `0.1` | Shortens each entry's fresh period by up to this share, so entries written together do not turn stale or rotten together |
+| `WithMaxAge(func(T) time.Duration)` | none | Caps how long a value is kept, in every layer; called for fetched values and for those `Set`/`SetMany` write |
+| `WithFetchTimeout(d)` | 60s | Bounds, each on its own: a fetch's double check, each lower layer read with its backfill, each source call with its backfill, and the invalidation after a failed write |
 | `WithFetchesPerKey(n)` | 1 | How many fetches of one key may run at once; 1 merges every concurrent miss |
 | `WithGetManyConcurrency(n)` | 16 | How many source requests one `GetMany` has in flight |
 | `WithGetManyChunkSize(n)` | 0: one call | Splits a `BatchSource` call into chunks of at most n keys |
 | `WithDoubleCheck(mode)` | `DoubleCheckAuto` | When a request that claimed a fetch re-reads the first layer first |
-| `WithLogger(l)` | `slog.Default()` | Logs failures that do not fail a call (a backfill, a background refresh) |
-| `WithNow(f)` | `time.Now` | The clock; `cachextest.Clock` is a manual one for tests |
+| `WithLogger(l)` | `slog.Default()` | Logs failures that do not fail a call (a backfill, an invalidation, a background refresh) and panics in fetches |
+| `WithNow(f)` | `time.Now` | The clock entries are computed and judged by (backends still expire entries by the wall clock); `cachextest.Clock` is a manual one for tests |
 
 ## Backends
 
@@ -140,9 +140,11 @@ if errors.As(err, &be) {
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
 | `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys |
 | `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL needs 8.0.17+ and a `utf8mb4_0900_bin` key column; tested at each database's default isolation level only; keys up to 255 characters including `KeyPrefix`; expired rows are not deleted for you |
-| `cachextest` | values in memory, unbounded | For tests only, with `Clock` and `TestBackend`, a contract test for your own backends |
+| `cachextest` | values in memory, unbounded | For tests only, with `Clock`, and `TestBackend` and `TestByteBackend`, contract tests for your own backends |
 
-Your own store implements `Backend[T]`, or `SingleBackend[T]` wrapped with `cachex.Batched`. A store of bytes encodes entries with `cachex.EncodeEntry`/`DecodeEntry` and a `Codec`.
+`rediscachex.New` and `bigcachex.New` return a `cachex.Backend[T]`; `gormcachex.New` returns a `*gormcachex.Backend[T]`, which is one and adds `Migrate`.
+
+Your own store implements `Backend[T]`, or `SingleBackend[T]` wrapped with `cachex.Batched`. A store of bytes implements `cachex.ByteBackend` and is wrapped with `cachex.Encoded`, which encodes entries with a `Codec`, treats data that does not decode as a miss, and deletes an entry already rotten instead of writing it.
 
 ## Pitfalls
 
@@ -178,13 +180,13 @@ Each item: the mistake, what happens, what to do.
 - **Changing a value type incompatibly and keeping `KeyPrefix`.** JSON decodes leniently: a renamed field reads back as a zero value. Change `KeyPrefix` with the type.
 - **`ottercachex` without a bound.** `New` fails: set `MaximumSize`, or `MaximumWeight` with a `Weigher`.
 - **`bigcachex` with a `LifeWindow` shorter than the layer's TTLs.** Entries disappear early. Use it only for millions of entries where GC shows in profiles; every read decodes.
-- **`gormcachex` without `Migrate`, or a MySQL table not in `utf8mb4_0900_bin`.** `Migrate` creates the table, and rejects an existing MySQL table whose key column compares case-insensitively. Keys, `KeyPrefix` included, are at most 255 characters. Expired rows are not deleted for you. Only each database's default isolation level is supported.
-- **`gormcachex.WithTx` expecting every write to join the transaction.** `Set`/`Del` with that ctx do; the backfill of a fetch never does.
-- **`cachex.NewLayer(backend, …)` failing to compile with a concrete backend.** Go cannot infer `T` from it: write `cachex.NewLayer[*Product](backend, …)`.
+- **`gormcachex` without `Migrate`, or a MySQL table not in `utf8mb4_0900_bin`.** `Migrate` creates the table, and rejects an existing MySQL table whose key column uses any other collation. Keys, `KeyPrefix` included, are at most 255 characters. Expired rows are not deleted for you. Only each database's default isolation level is supported.
+- **`gormcachex.WithTx` expecting every write to join the transaction.** `Set`/`Del` with that ctx do; the backfill of a fetch never does, and neither does `Migrate`, which always runs on `Config.DB`.
+- **A `cachextest.Clock` far behind the wall clock, with a backend that expires entries.** Backends expire entries by the wall clock whatever `WithNow` says, so they drop entries computed by such a clock at once and every read misses. Start the clock at `time.Now()`, or use `cachextest.Map`.
 
 **Lifecycle**
 
-- **Closing the backends while the `Cache` still works.** Call `Close` first: it waits for the fetches, their backfills, background refreshes and the invalidations of writes that gave up.
+- **Closing the backends while the `Cache` still works.** Call `Close` first: it waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.
 - **Exiting right after a read** (a command-line tool, a cron job). A read returns before its answer is written into the layers, so the process can end before Redis or the table is filled, and the next run fetches again. Call `Close` before exiting.
 
 ## Documentation

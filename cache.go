@@ -132,8 +132,10 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 	return c
 }
 
-// WithFetchTimeout bounds each call a fetch makes below the first layer: a
-// lower layer read, a source call, a backfill. Default DefaultFetchTimeout.
+// WithFetchTimeout bounds, each on its own: a fetch's double check, each
+// lower layer read together with the backfill of what it found, each source
+// call together with the backfill of its answers, and the invalidation after
+// a failed write. Default DefaultFetchTimeout.
 func WithFetchTimeout(timeout time.Duration) Option {
 	return func(o *options) { o.fetchTimeout = timeout }
 }
@@ -160,12 +162,16 @@ func WithGetManyChunkSize(size int) Option {
 }
 
 // WithLogger sets the logger for failures that do not fail a call (a failed
-// backfill, a failed background refresh). Default slog.Default().
+// backfill, invalidation or background refresh) and for panics in fetches.
+// Default slog.Default().
 func WithLogger(logger *slog.Logger) Option {
 	return func(o *options) { o.logger = logger }
 }
 
-// WithNow sets the clock. Default time.Now.
+// WithNow sets the clock the Cache computes and judges entries by. Default
+// time.Now. A backend that expires entries natively does so by the wall
+// clock, whatever this clock says (see Encoded): with a clock far behind the
+// wall clock, it drops every entry at once.
 func WithNow(now func() time.Time) Option {
 	return func(o *options) { o.now = now }
 }
@@ -173,8 +179,9 @@ func WithNow(now func() time.Time) Option {
 // WithMaxAge caps how long a value from the source is kept, in every layer:
 // maxAge is called once when the value is fetched, and the entry is never
 // served after that much time (zero or less: the value is not cached). Use it
-// for values that expire on their own, such as tokens. Its argument type must
-// be the Cache's T, or New panics.
+// for values that expire on their own, such as tokens. Set and SetMany call it
+// too, for the values they write. Its argument type must be the Cache's T, or
+// New panics.
 func WithMaxAge[T any](maxAge func(T) time.Duration) Option {
 	return func(o *options) { o.maxAge = maxAge }
 }
@@ -200,7 +207,8 @@ func sharedCtx(ctx context.Context) context.Context {
 }
 
 // Close waits for the fetches and background refreshes in progress (and
-// their backfills), so that the backends can be closed after it, and starts
+// their backfills) and for the invalidations of writes that gave up waiting,
+// so that the backends can be closed after it, and starts
 // no more background refreshes. It does not close the backends. The Cache
 // still serves reads and writes.
 func (c *Cache[T]) Close() error {

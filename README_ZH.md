@@ -121,15 +121,15 @@ if errors.As(err, &be) {
 |---|---|---|
 | `TTL(fresh, stale)`（层） | 必填 | 条目新鲜多久，之后还能边刷新边返回多久 |
 | `NotFoundTTL(fresh, stale)`（层） | `0, 0`：不记录 | 「不存在」的同样两个时长 |
-| `Jitter(ratio)`（层） | `0.1` | 把每个条目的新鲜期最多缩短这个比例，让同时写入的条目不在同一时刻过期 |
-| `WithMaxAge(func(T) time.Duration)` | 无 | 按值限制在每一层保存多久 |
-| `WithFetchTimeout(d)` | 60s | 回源的每一次调用的上限：读下层、问数据源、回填 |
+| `Jitter(ratio)`（层） | `0.1` | 把每个条目的新鲜期最多缩短这个比例，让同时写入的条目不在同一时刻变陈旧、腐烂 |
+| `WithMaxAge(func(T) time.Duration)` | 无 | 按值限制在每一层保存多久；回源拿到的值和 `Set`/`SetMany` 写入的值都会经过它 |
+| `WithFetchTimeout(d)` | 60s | 各自限时：回源的二次检查、读下面每一层连同它的回填、每次问数据源连同它的回填、写入失败后的失效 |
 | `WithFetchesPerKey(n)` | 1 | 同一个 key 最多同时几次回源；1 表示并发未命中全部合并 |
 | `WithGetManyConcurrency(n)` | 16 | 一次 `GetMany` 最多同时向数据源发几个请求 |
 | `WithGetManyChunkSize(n)` | 0：一次调用 | 把一次 `BatchSource` 调用切成最多 n 个 key 的分段 |
 | `WithDoubleCheck(mode)` | `DoubleCheckAuto` | 认领回源的请求什么时候先再读一次第一层 |
-| `WithLogger(l)` | `slog.Default()` | 记录不让调用失败的错误（回填、后台刷新） |
-| `WithNow(f)` | `time.Now` | 时钟；测试用 `cachextest.Clock` 手动推进 |
+| `WithLogger(l)` | `slog.Default()` | 记录不让调用失败的错误（回填、失效、后台刷新）和回源里的 panic |
+| `WithNow(f)` | `time.Now` | 计算和判断条目所用的时钟（后端的原生过期仍按真实时钟）；测试用 `cachextest.Clock` 手动推进 |
 
 ## 后端
 
@@ -139,9 +139,11 @@ if errors.As(err, &be) {
 | `bigcachex` | 内存里编码后的条目 | 数百万条目、GC 在 profile 里显眼时使用；每次读取都要解码 |
 | `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline |
 | `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 需要 8.0.17 及以上，key 列为 `utf8mb4_0900_bin`；只在各数据库默认隔离级别下测过；key 连同 `KeyPrefix` 最长 255 个字符；过期的行不会自动删除 |
-| `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock` 和给自写后端用的契约测试 `TestBackend` |
+| `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`，以及给自写后端用的契约测试 `TestBackend`、`TestByteBackend` |
 
-自己的存储实现 `Backend[T]`，或者实现 `SingleBackend[T]` 再用 `cachex.Batched` 包一层。存字节的存储用 `cachex.EncodeEntry`/`DecodeEntry` 和一个 `Codec` 编码条目。
+`rediscachex.New` 和 `bigcachex.New` 返回 `cachex.Backend[T]`；`gormcachex.New` 返回 `*gormcachex.Backend[T]`，它也是一个 `cachex.Backend[T]`，另有 `Migrate`。
+
+自己的存储实现 `Backend[T]`，或者实现 `SingleBackend[T]` 再用 `cachex.Batched` 包一层。存字节的存储实现 `cachex.ByteBackend`，再用 `cachex.Encoded` 包一层：它用 `Codec` 编码条目，把解不出来的数据当作未命中，已经腐烂的条目不写、改为删除。
 
 ## 注意事项
 
@@ -177,13 +179,13 @@ if errors.As(err, &be) {
 - **值的类型有不兼容的改动，却不换 `KeyPrefix`。** JSON 解码很宽松：改了名的字段会读成零值。改类型时一起换 `KeyPrefix`。
 - **`ottercachex` 没设上限。** `New` 会失败：设置 `MaximumSize`，或者 `MaximumWeight` 加 `Weigher`。
 - **`bigcachex` 的 `LifeWindow` 比层的 TTL 短。** 条目会提前消失。只在内存层有数百万条、profile 里 GC 明显时才用它；每次读取都要解码。
-- **`gormcachex` 不调 `Migrate`，或者 MySQL 表不是 `utf8mb4_0900_bin`。** `Migrate` 会建表，并拒绝 key 列不区分大小写的已有 MySQL 表。key 连同 `KeyPrefix` 最长 255 个字符。过期的行不会自动删除。只支持各数据库默认的隔离级别。
-- **用 `gormcachex.WithTx` 时以为所有写入都在事务里。** 带这个 ctx 的 `Set`/`Del` 在；回源的回填永远不在。
-- **传入具体的后端类型时，`cachex.NewLayer(backend, …)` 编译不过。** Go 推导不出 `T`：要写成 `cachex.NewLayer[*Product](backend, …)`。
+- **`gormcachex` 不调 `Migrate`，或者 MySQL 表不是 `utf8mb4_0900_bin`。** `Migrate` 会建表，并拒绝 key 列用其他任何排序规则的已有 MySQL 表。key 连同 `KeyPrefix` 最长 255 个字符。过期的行不会自动删除。只支持各数据库默认的隔离级别。
+- **用 `gormcachex.WithTx` 时以为所有写入都在事务里。** 带这个 ctx 的 `Set`/`Del` 在；回源的回填永远不在，`Migrate` 也不在，它总是在 `Config.DB` 上执行。
+- **`cachextest.Clock` 远远落后于真实时钟，后端又会让条目过期。** 不管 `WithNow` 怎么设，后端都按真实时钟让条目过期，所以按这个时钟算出的条目会被当场丢掉，每次读取都未命中。让时钟从 `time.Now()` 开始，或者用 `cachextest.Map`。
 
 **生命周期**
 
-- **`Cache` 还在工作时就关闭后端。** 先调用 `Close`：它会等回源、回源的回填、后台刷新，以及放弃等待的写入要补做的失效。
+- **`Cache` 还在工作时就关闭后端。** 先调用 `Close`：它会等正在进行的回源和它们的回填、后台刷新，以及放弃等待的写入要补做的失效。
 - **读完马上退出进程**（命令行工具、定时任务）。读取在结果写进各层之前就返回了，进程可能在 Redis 或数据表写好之前就结束，下次运行又得回源。退出前调用 `Close`。
 
 ## 文档

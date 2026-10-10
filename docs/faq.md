@@ -8,11 +8,11 @@ Each answer gives the conclusion first, then the reasoning. The design notes, [d
 
 ### Some values expire on their own, such as tokens. How do I keep them from being served too long?
 
-Use `WithMaxAge(func(T) time.Duration)`. It is called once when a value is fetched, and caps how long the value is kept in every layer; zero or less means the value is not cached. It takes a function rather than a method on `T`, so it works on types from other packages. For "everything older than version N is invalid", put the version into the key instead.
+Use `WithMaxAge(func(T) time.Duration)`. It is called once when a value is fetched (and for each value `Set` or `SetMany` writes), and caps how long the value is kept in every layer; zero or less means the value is not cached. It takes a function rather than a method on `T`, so it works on types from other packages. For "everything older than version N is invalid", put the version into the key instead.
 
 ### What is the difference between the fresh and the stale TTL?
 
-Both are set per layer with `TTL(fresh, stale)` and count from when the entry is written into that layer; an entry copied from a lower layer is never fresher or longer lived than the one below. During the fresh TTL an entry is returned as is. The stale TTL is an **additional** period: a read in it gets the entry at once while a background refresh fetches it again. After `fresh + stale` the entry is rotten and never served. `Jitter` shortens each entry's fresh period at random (by up to 10% by default) so entries written together do not expire together. Backends need no TTL of their own: Redis and otter expire each entry when it turns rotten, and rotten entries are never served from any backend.
+Both are set per layer with `TTL(fresh, stale)` and count from when the entry is written into that layer; an entry copied from a lower layer is never fresher or longer lived than the one below. During the fresh TTL an entry is returned as is. The stale TTL is an **additional** period: a read in it gets the entry at once while a background refresh fetches it again. After `fresh + stale` the entry is rotten and never served. `Jitter` shortens each entry's fresh period at random (by up to 10% by default) so entries written together do not turn stale or rotten together. Backends need no TTL of their own: Redis and otter expire each entry when it turns rotten, and rotten entries are never served from any backend.
 
 ### Should I cache every database query?
 
@@ -53,7 +53,7 @@ Both report the same three outcomes, each in its own way. `Get` returns a single
 
 ### Do I need to call `Close`?
 
-Call it at shutdown, before closing the backends. It waits for the fetches and background refreshes in progress, whose backfills still write the backends, and starts no more refreshes. It does not close the backends. A `Cache` that is never closed leaks nothing once its last fetch ends.
+Call it at shutdown, before closing the backends. It waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting, all of which still write the backends; it starts no more refreshes. It does not close the backends. A `Cache` that is never closed leaks nothing once its last fetch ends.
 
 ### What happens to cached data from v1 after upgrading?
 
@@ -142,7 +142,7 @@ An in-memory layer without a bound grows with every key ever read, until the pro
 
 ### When should I use `bigcachex` instead of `ottercachex`?
 
-When the memory layer holds millions of entries and the garbage collector shows in CPU profiles. The garbage collector scans every live pointer, so millions of cached structs cost it work on every cycle; `bigcachex` stores encoded bytes it does not scan. The price is decoding on every read, which `ottercachex` does not do. Below a few hundred thousand entries, use `ottercachex`. See [BENCHMARK.md](../BENCHMARK.md).
+When the memory layer holds millions of entries and the garbage collector shows in CPU profiles. The garbage collector scans every live pointer, so millions of cached structs cost it work on every cycle; `bigcachex` stores encoded bytes it does not scan. The price is decoding on every read, which `ottercachex` does not do. Below a few hundred thousand entries, use `ottercachex`.
 
 ### What does `gormcachex` need on MySQL?
 
