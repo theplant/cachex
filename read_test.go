@@ -51,12 +51,14 @@ func TestFreshness(t *testing.T) {
 		require.NoError(t, err)
 
 		src.set("a", "2")
+		src.gate = make(chan struct{}) // holds the refresh until the reads are done
 		clock.Advance(2 * time.Minute)
 		for range 20 {
 			v, err := c.Get(ctx, "a")
 			require.NoError(t, err)
 			assert.Equal(t, "1", v, "the stale value is returned at once")
 		}
+		close(src.gate)
 		require.NoError(t, c.Close()) // waits for the refresh
 		assert.EqualValues(t, 2, src.calls.Load(), "20 stale reads, one refresh")
 		e, _ := stored(t, mem, "a")
