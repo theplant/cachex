@@ -89,31 +89,41 @@ v2 重写了读写路径（见 [ADR 0012](../adr/0012-one-cache-over-layers.md)�
 
 ### v1 → v2
 
+代码是提交 0a3f039。`Get/miss` 和 `Get/hit/l2` 每轮都调用 `cachex.Settle`，等回填完成（原因见下文「先发布、再回填」）。
+
 | 基准 | Linux v1 | Linux v2 | macOS v1 | macOS v2 | 分配 v1 → v2 |
 |---|---|---|---|---|---|
-| `Get/hit/map/serial` | 17.8ns | 86.3ns | 17.7ns | 58.7ns | 0 → 0 |
-| `Get/hit/map/parallel` | 2.5ns | 11.3ns | 2.4ns | 11.4ns | 0 → 0 |
-| `Get/hit/otter/serial` | 38.8ns | 203ns | 36.6ns | 165ns | 0 → 0 |
-| `Get/hit/otter/parallel` | 126ns | 28.2ns | 105ns | 23.6ns | 0 → 0 |
-| `Get/notfound-hit` | 552ns | 86.0ns | 500ns | 57.9ns | 12 → 0 |
-| `Get/stale-hit` | 105ns | 74.0ns | 88.4ns | 70.7ns | 2 → 1 |
-| `Get/miss` | 2.82µs | 2.13µs | 2.78µs | 2.06µs | 26 → 21 |
-| `Get/miss/x-sync-baseline` | 274ns | 160ns | 263ns | 142ns | 7 → 4 |
-| `Get/hit/l2` | 2.61µs | 3.90µs | 2.61µs | 3.92µs | 23 → 24 |
-| `GetMany/hit/n=100/GetMany` | 11.6µs | 12.2µs | 10.1µs | 11.0µs | 14 → 14 |
-| `GetMany/hit/n=100/loop-Get` | 2.40µs | 8.80µs | 2.40µs | 6.40µs | 0 → 0 |
-| `GetMany/half-miss/n=100/GetMany` | 66.8µs | 55.2µs | 56.5µs | 43.2µs | 598 → 210 |
-| `GetMany/half-miss/n=100/loop-Get` | 155µs | 108µs | 159µs | 105µs | 1500 → 900 |
-| `HotKeyStampede`（每轮，数据源调用 1 次） | 85.7µs | 66.3µs | 65.9µs | 50.3µs | 546 → 151 |
-| `SetDel/spread` | 339ns | 267ns | 371ns | 244ns | 4 → 4 |
-| `SetDel/same-stripe` | 370ns | 528ns | 283ns | 351ns | 6 → 7 |
-| `ZipfMixed/map` | 262ns | 224ns | 182ns | 149ns | 4 → 2 |
-| `ZipfMixed/otter`（只有 v2） | | 230ns | | 194ns | 2 |
+| `Get/hit/map/serial` | 16.9ns | 80.6ns | 16.9ns | 57.6ns | 0 → 0 |
+| `Get/hit/map/parallel` | 2.2ns | 10.7ns | 2.4ns | 12.4ns | 0 → 0 |
+| `Get/hit/otter/serial` | 37.6ns | 192ns | 36.8ns | 167ns | 0 → 0 |
+| `Get/hit/otter/parallel` | 114ns | 24.3ns | 91.8ns | 20.6ns | 0 → 0 |
+| `Get/notfound-hit` | 535ns | 81.4ns | 501ns | 56.9ns | 12 → 0 |
+| `Get/stale-hit` | 104ns | 73.8ns | 87.9ns | 71.7ns | 2 → 1 |
+| `Get/miss` | 2.74µs | 2.11µs | 2.74µs | 2.33µs | 26 → 22 |
+| `Get/miss/x-sync-baseline` | 277ns | 134ns | 244ns | 127ns | 7 → 4 |
+| `Get/hit/l2` | 2.49µs | 3.41µs | 2.55µs | 3.75µs | 23 → 24 |
+| `GetMany/hit/n=100/GetMany` | 10.6µs | 11.8µs | 9.59µs | 10.5µs | 14 → 14 |
+| `GetMany/hit/n=100/loop-Get` | 2.30µs | 8.55µs | 2.38µs | 6.15µs | 0 → 0 |
+| `GetMany/half-miss/n=100/GetMany` | 66.2µs | 52.5µs | 55.5µs | 44.8µs | 598 → 约 200 |
+| `GetMany/half-miss/n=100/loop-Get` | 154µs | 108µs | 157µs | 119µs | 1500 → 950 |
+| `HotKeyStampede`（每轮） | 85.5µs | 70.7µs | 61.0µs | 51.2µs | 546 → 151 |
+| `SetDel/spread` | 334ns | 168ns | 350ns | 202ns | 4 → 1 或 2 |
+| `SetDel/same-stripe` | 374ns | 391ns | 270ns | 285ns | 6 → 4 |
+| `ZipfMixed/map` | 202ns | 176ns | 153ns | 145ns | 4 → 1 |
+| `ZipfMixed/otter`（只有 v2） | | 191ns | | 163ns | 1 |
 
-- **命中变贵了，主要是读时钟**：v2 每次命中都按条目的时间判断新鲜度，而 v1 的命中基准存的是不带新鲜度判断的值。时钟约占命中耗时的一半，剩下约 25ns 是找分片（命中前要记下分片纪元，见 ADR 0008）和复制条目。把分片纪元挪到读取之后试过：远端的第一层读得慢时，读取期间的回填会被漏掉，`TestDoubleCheck` 失败，所以没有采用。
+- **命中变贵了，主要是读时钟**：v2 每次命中都按条目的时间判断新鲜度，而 v1 的命中基准存的是不带新鲜度判断的值。在 Mac 上做了公平比较：
+
+  | | 每次命中 |
+  |---|---|
+  | v1，不带新鲜度（基准里的写法） | 19ns |
+  | v1，`EntryWithTTL`（和 v2 一样要读时钟） | 43ns |
+  | v2 | 59ns |
+
+  剩下的 16ns 里，约 7ns 是读第一层之前先读分片纪元（`DoubleCheckAuto` 需要它，见 ADR 0008），去掉这一步实测过。把分片纪元挪到读取之后也试过：远端的第一层读得慢时，读取期间的回填会被漏掉，`TestDoubleCheck` 失败，所以没有采用。
 - **不存在命中几乎不花钱**：只读一层、只读一次，`ErrNotFound` 原样返回。
 - **otter 单 key 串行慢**：profile 显示约 80% 的时间在 `pthread_cond_signal/wait`，即 otter 的读缓冲攒满后唤醒维护 goroutine；cachex 自己约占 13%。并行、分散到很多 key 时，它比 v1 的 ristretto 快 4 到 5 倍。
-- **`Get/hit/l2` 慢 50%**：profile 里约 90% 是 goroutine 交接（线程唤醒和休眠），cachex 自身约 5%。v1 同样要起一个 goroutine，差别来自分配和调度的波动，没有继续追。
+- **`Get/hit/l2` 慢 37% 到 47%**：profile 里约 90% 是 goroutine 交接（线程唤醒和休眠），cachex 自身约 5%。
 
 ### 移植后做的性能修复
 
@@ -127,15 +137,23 @@ v2 重写了读写路径（见 [ADR 0012](../adr/0012-one-cache-over-layers.md)�
 | `SetDel/spread` | 493ns，849B，8 次分配 | 239ns，218B，4 次分配 | 单个 key 的 `Set`/`Del` 走单独的快路径，不建批量写用的 map 和切片 |
 | `SetDel/same-stripe` | 1185ns | 约 430ns | 同上 |
 
+### 先发布、再回填（c847c12、77cfd47）
+
+回源现在先把结果交给等待方，再回填各层；回填完成之前，这次在途回源一直保持登记，所以紧接着的读取会加入它，而不是再回源一次。调用方因此不再等回填，上面的层在远端时，这能省下一次 Redis 或数据库的写入延迟。`Get/miss` 和 `Get/hit/l2` 改成每轮调用 `cachex.Settle` 等回填完成，测的总工作量和 v1 一样（v1 先回填再返回），所以这一项改动在这组内存基准里看不出收益：Linux 上 `Get/miss` 2.13µs → 2.11µs，`Get/hit/l2` 3.90µs → 3.41µs。
+
+### 不用等待的写入不再分配（0a3f039）
+
+分片空闲时，写入用 `TryLock` 直接拿到分片锁，不再为等锁准备 goroutine 和闭包。Mac 上：同一分片的 `Set`/`Del` 从约 435ns 降到约 296ns，分散的从约 239ns 降到约 200ns。交替测量的结果：同一分片和 v1 持平（Linux 374ns 对 391ns，macOS 270ns 对 285ns），分散的比 v1 快 42% 到 50%。
+
 ### 移植时发现的 bug
 
 数据源实现了 `BatchSource`、而要找的 key 全在下层命中时，`askSource` 拿到空的 key 列表，`slices.Chunk(…, 0)` panic。panic 被接住了，而且结果已经发布，所以调用方照样拿到值，只是多一条 ERROR 日志。已有测试没覆盖「多层 + 批量数据源 + 下层命中」这个组合。修复时补了回归测试，并让 `Close` 等待它之前开始的回源结束（否则测试断言日志时 panic 还没发生）。
 
 ### 没解决的
 
-- 同一分片里的写入比 v1 慢 24% 到 43%：排队等锁时 `Lock` 要起一个 goroutine，每次写入还要为抖动取一个随机数。
+- `BenchmarkHotKeyStampede` 偶尔断言失败（每轮回源 0.9995 次，而不是 1 次）：先发布、再回填之后，上一轮的回填可能落在下一轮开头的 `mem.Del` 之后，这一轮就读到了值、不回源。是基准的问题，不是 cachex 的：每轮结束时要调用 `cachex.Settle`。这一轮交替测量里 v2 有 2 到 4 个样本因此缺失，耗时数字仍然可用。
 - otter 单 key 串行读的开销来自它的维护 goroutine，不在 cachex 里。
-- 内存层全命中时，`GetMany` 每个 key 约 110 到 120ns，比循环 `Get` 慢；它的分配（去重、结果 map）是固定的。
+- 内存层全命中时，`GetMany` 每个 key 约 105 到 118ns，比循环 `Get` 慢；它的分配（去重、结果 map）是固定的。
 
 ## 复跑
 
