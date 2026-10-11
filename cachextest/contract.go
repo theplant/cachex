@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,6 +154,49 @@ func TestBackend[T any](t *testing.T, newBackend func(t *testing.T) cachex.Backe
 		assert.Len(t, m, 1)
 	})
 
+	t.Run("concurrent calls", func(t *testing.T) {
+		// the Cache calls a backend from many goroutines at once: each owns
+		// its keys and checks them, and all of them write one shared key
+		b := newBackend(t)
+		var wg sync.WaitGroup
+		for g := range 8 {
+			wg.Go(func() {
+				keys := make([]string, 10)
+				entries := map[string]cachex.Entry[T]{}
+				for i := range keys {
+					keys[i] = fmt.Sprintf("g%d-%d", g, i)
+					entries[keys[i]] = entry(g + i)
+				}
+				for range 20 {
+					assert.NoError(t, b.SetMany(ctx, entries))
+					assert.NoError(t, b.Set(ctx, "shared", entry(g)))
+					m, err := b.GetMany(ctx, keys)
+					if assert.NoError(t, err) && assert.Len(t, m, len(keys)) {
+						for _, k := range keys {
+							assert.Equal(t, entries[k].Value, m[k].Value, "key %q", k)
+						}
+					}
+					e, ok, err := b.Get(ctx, keys[0])
+					if assert.NoError(t, err) && assert.True(t, ok) {
+						assert.Equal(t, entries[keys[0]].Value, e.Value)
+					}
+					assert.NoError(t, b.DelMany(ctx, keys[:5]))
+					assert.NoError(t, b.Del(ctx, keys[5]))
+					m, err = b.GetMany(ctx, keys)
+					if assert.NoError(t, err) {
+						assert.Len(t, m, 4, "the deleted keys are gone, the others stay")
+					}
+					_, _, err = b.Get(ctx, "shared")
+					assert.NoError(t, err)
+				}
+			})
+		}
+		wg.Wait()
+		e, ok := get(t, b, "shared")
+		require.True(t, ok)
+		assert.Contains(t, values, e.Value, "the shared key holds one of the values written")
+	})
+
 	t.Run("empty batches", func(t *testing.T) {
 		b := newBackend(t)
 		m, err := b.GetMany(ctx, nil)
@@ -260,6 +304,45 @@ func TestByteBackend(t *testing.T, newBackend func(t *testing.T) cachex.ByteBack
 		require.NoError(t, b.Del(ctx, "k9"))
 		_, ok := get(t, b, "k9")
 		assert.False(t, ok)
+	})
+
+	t.Run("concurrent calls", func(t *testing.T) {
+		b := newBackend(t)
+		var wg sync.WaitGroup
+		for g := range 8 {
+			wg.Go(func() {
+				keys := make([]string, 10)
+				entries := map[string]cachex.ByteEntry{}
+				for i := range keys {
+					keys[i] = fmt.Sprintf("g%d-%d", g, i)
+					entries[keys[i]] = cachex.ByteEntry{Data: []byte(keys[i]), ExpiresAt: later}
+				}
+				for range 20 {
+					assert.NoError(t, b.SetMany(ctx, entries))
+					assert.NoError(t, b.Set(ctx, "shared", []byte(fmt.Sprint(g)), later))
+					m, err := b.GetMany(ctx, keys)
+					if assert.NoError(t, err) && assert.Len(t, m, len(keys)) {
+						for _, k := range keys {
+							assert.Equal(t, k, string(m[k]))
+						}
+					}
+					data, ok, err := b.Get(ctx, keys[0])
+					if assert.NoError(t, err) && assert.True(t, ok) {
+						assert.Equal(t, keys[0], string(data))
+					}
+					assert.NoError(t, b.DelMany(ctx, keys[:5]))
+					assert.NoError(t, b.Del(ctx, keys[5]))
+					m, err = b.GetMany(ctx, keys)
+					if assert.NoError(t, err) {
+						assert.Len(t, m, 4, "the deleted keys are gone, the others stay")
+					}
+				}
+			})
+		}
+		wg.Wait()
+		data, ok := get(t, b, "shared")
+		require.True(t, ok)
+		assert.Contains(t, []string{"0", "1", "2", "3", "4", "5", "6", "7"}, string(data))
 	})
 
 	t.Run("empty batches", func(t *testing.T) {
