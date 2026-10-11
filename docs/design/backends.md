@@ -169,7 +169,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 
 - `Map[T]`：基于 `sync.Map`、没有容量上限、从不清理的 `Backend`，只用于测试。
 - `Clock`：手动时钟，`Now` 传给 `cachex.WithNow`，`Advance` 拨动它。
-- `TestBackend[T](t, newBackend, values)`：`Backend` 的契约测试。`values` 至少 3 个不同的值；用 `string` 和一个结构体各跑一遍，编码值的后端就覆盖了编解码器的主要分支。检查未命中不是错误、条目原样读回（包括不存在记录）、值和不存在记录互相覆盖、写入一个已经腐烂的条目不会让旧值还能读到、key 精确比较（大小写、末尾空格、重音）、批量操作、批量里重复的 key、空批量。只测顺序调用。
-- `TestByteBackend(t, newBackend)`：`ByteBackend` 的契约测试：未命中不是错误、字节原样读回并能覆盖、key 精确比较、批量操作、空批量。
+- `TestBackend[T](t, newBackend, values)`：`Backend` 的契约测试。`values` 至少 3 个不同的值；用 `string` 和一个结构体各跑一遍，编码值的后端就覆盖了编解码器的主要分支。检查未命中不是错误、条目原样读回（包括不存在记录）、值和不存在记录互相覆盖、写入一个已经腐烂的条目不会让旧值还能读到、key 精确比较（大小写、末尾空格、重音）、批量操作、批量里重复的 key、空批量，以及多个 goroutine 同时读写（各自的 key 读回正确、共享 key 最后是写过的某个值，配合 `-race`）。
+- `TestByteBackend(t, newBackend)`：`ByteBackend` 的契约测试：未命中不是错误、字节原样读回并能覆盖、传进去和拿出来的字节归调用方、key 精确比较、批量操作、空批量、多个 goroutine 同时读写。
 
 自写后端可以直接拿它们来测。
