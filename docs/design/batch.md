@@ -38,7 +38,7 @@ sequenceDiagram
     L1-->>K: k4 是新鲜的不存在记录
     K->>G: 发布 k4
     K->>L0: 回填 k4
-    K->>S: GetMany(k3, k5)（一次，或分段）
+    K->>S: GetMany(k3, k5)（每段一次）
     S-->>K: k3 = v，k5 不在 map 里
     K->>G: 发布 k3、k5（k4 已在读第二层后发布）
     K->>L1: 回填：k3 写值，k5 按不存在记录处理
@@ -51,20 +51,30 @@ sequenceDiagram
 
 1. **去重**：重复的 key 只处理一次，每层也只收到一次。
 2. **读第一层**：一次 `GetMany`。新鲜的放进结果；陈旧的也放进结果，同时这些 key 在后台合成一批刷新；腐烂的和没有的继续往下走，后面查到的也放进同一份结果。**整份结果最后一次性返回。** 第一层整体读失败时，所有 key 都按失败处理，不往下走。
-3. **合并回源**：未命中的 key 全部当场认领。别人正在回源的 key 直接等结果，自己领头的 key 交给一个回源 goroutine。见 [singleflight.md](singleflight.md#批量认领)。
-4. **二次检查**：只对需要的 key 再读一次第一层（默认的 `DoubleCheckAuto` 下，只检查读取之后本 `Cache` 写过其分片的 key）。
-5. **读下面各层**：每层一次调用（只剩一个 key 时用 `Get`）。可用的 key 立刻发布，再回填它上面的层，其余的继续往下。
-6. **问数据源**：见下一节。
-7. **发布并回填**：每次数据源调用返回后，马上发布它这些 key，再回填，最后注销（见 [singleflight.md](singleflight.md#发布与注销)）。
+3. **分段**：未命中的 key 按 `WithGetManyChunkSize` 切成若干段（默认 0，全部算一段）。下面 4–8 步每一段各走一遍，段与段并发；一段只在数据源请求的并发名额（`WithGetManyConcurrency`）够用时才开始。
+4. **合并回源**：一段开始时，当场认领它的 key。别人正在回源的 key 直接等结果，自己领头的 key 交给一个回源 goroutine。**还没开始的段，它的 key 没有被认领**：别的请求读到其中的 key 会自己回源，不用等这次 `GetMany` 轮到它；调用方的 ctx 结束后，不再开始新的段。见 [singleflight.md](singleflight.md#批量认领)。
+5. **二次检查**：只对需要的 key 再读一次第一层（默认的 `DoubleCheckAuto` 下，只检查读取之后本 `Cache` 写过其分片的 key；前面的段的回填也算，所以分段时后面的段更常做二次检查，也正好能接住别的请求刚查到的结果）。
+6. **读下面各层**：这一段每层一次调用（只剩一个 key 时用 `Get`）。可用的 key 立刻发布，再回填它上面的层，其余的继续往下。
+7. **问数据源**：见下一节。
+8. **发布并回填**：每次数据源调用返回后，马上发布它这些 key，再回填，最后注销（见 [singleflight.md](singleflight.md#发布与注销)）。
 
 ## 回源怎么发
 
 | 数据源 | 怎么发 | 每个请求的超时 | key 什么时候拿到结果 |
 |---|---|---|---|
-| 实现了 `BatchSource` | 一次 `GetMany`；设置了 `WithGetManyChunkSize(n)` 时，切成每段最多 n 个 key、并发执行 | 每段一个 `WithFetchTimeout`，覆盖这次调用和随后的回填（见 [singleflight.md](singleflight.md#回源用的-ctx)） | 这一段返回时，一起拿到 |
-| 没有实现 | 每个 key 一次 `Get`，并发执行 | 每个 key 一个 `WithFetchTimeout` | 自己那个 key 返回时 |
+| 实现了 `BatchSource` | 每段一次 `GetMany`；默认只有一段 | 每段一个 `WithFetchTimeout`，覆盖这次调用和随后的回填（见 [singleflight.md](singleflight.md#回源用的-ctx)） | 这一段返回时，一起拿到 |
+| 没有实现 | 每个 key 一次 `Get`，一段之内并发执行 | 每个 key 一个 `WithFetchTimeout` | 自己那个 key 返回时 |
 
-两种情况的并发上限都是 `WithGetManyConcurrency`（默认 16），它的含义是「一个回源 goroutine 同时向数据源发出的请求数」。不要和 `WithFetchesPerKey` 混淆，后者是同一个 key 同时最多几个在途回源。
+两种情况的并发上限都是 `WithGetManyConcurrency`（默认 16），它的含义是「一次 `GetMany` 同时向数据源发出的请求数」：批量数据源每段占一个名额，普通数据源每段占 `min(分段大小, 并发数)` 个名额，名额不够时下一段等着，不认领。不要和 `WithFetchesPerKey` 混淆，后者是同一个 key 同时最多几个在途回源。
+
+分段大小是一个取舍：
+
+| 分段大小 | 读下面各层的调用次数 | 并发的 `Get` 碰上这次 `GetMany` 要回源的 key，最多等多久 |
+|---|---|---|
+| 0（默认，全部一段） | 每层 1 次 | 等这个 key 轮到：普通数据源要在每次 `WithGetManyConcurrency` 个的队列里排到 |
+| n | 每层 ⌈未命中数 / n⌉ 次，段与段并发 | 这个 key 所在的段正在处理：等这一段；还没开始：不用等，自己回源 |
+
+一个大 `GetMany` 配普通数据源，又有并发的 `Get` 时，把分段大小设成 `WithGetManyConcurrency` 左右：一段的 key 同时问数据源，`Get` 最多等一次查询。
 
 只剩一个 key 要问数据源时，总是用 `Get`，即使数据源实现了 `BatchSource`。
 

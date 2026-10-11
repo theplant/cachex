@@ -165,7 +165,7 @@ _避免_：分段（分段指 chunk）、桶、segment
 能一次回答多个 key 的数据源。
 
 **分段（chunk）**：
-大批量被切成的一部分，每一段单独发出一次调用或一条语句。
+大批量被切成的一部分。`GetMany` 的一段（`WithGetManyChunkSize`）开始时才认领，单独读下面各层、问数据源、回填；后端的一段（各后端的 `ChunkSize`）是一次 pipeline 或一条语句。
 _避免_：批（单独说「批」时指整个批量读）、分片（分片指 stripe）
 
 **整批失败（whole-batch failure）**：

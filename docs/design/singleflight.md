@@ -150,7 +150,7 @@ sequenceDiagram
 
 ## 批量认领
 
-`GetMany` 一次性认领全部未命中的 key，把自己领头的 key 交给一个回源 goroutine，别人正在回源的 key 就等别人的结果：
+`GetMany` 按段认领未命中的 key（分段大小是 `WithGetManyChunkSize`，默认全部一段）：一段开始时当场认领它的 key，把自己领头的交给一个回源 goroutine，别人正在回源的就等别人的结果。下图是只有一段的情况：
 
 ```mermaid
 sequenceDiagram
@@ -171,7 +171,9 @@ sequenceDiagram
     G-->>M: k1、k2、k3 全部到齐
 ```
 
-认领**当场**给出答案，所以总是先发出自己的回源，再去等别人的。两个互相重叠的 `GetMany` 不会互相等待而死锁。代价是：数据源不支持批量时，一个普通 `Get` 碰上 `GetMany` 队列里还没轮到的 key，要等它轮到。详见 [batch.md](batch.md)。
+认领**当场**给出答案，所以总是先发出自己的回源，再去等别人的；处理一段的 goroutine 只回源自己领头的 key，从不在持有认领时等别人，别人领头的 key 由调用方最后统一等。所以两个互相重叠的 `GetMany` 不会互相等待而死锁，分段也不例外。
+
+还没开始的段，它的 key 没有被认领。所以一个普通 `Get` 碰上 `GetMany` 还没轮到的 key，会自己认领、自己回源，不用等；这次 `GetMany` 轮到这一段时，要么加入这个 `Get` 的回源，要么在二次检查里读到它刚回填的结果。分段大小为 0 时只有一段，全部 key 一开始就被认领，`Get` 要等这次 `GetMany` 轮到它。怎么选分段大小见 [batch.md](batch.md#回源怎么发)，决策见 [ADR 0018](../adr/0018-getmany-claims-a-chunk-at-a-time.md)。
 
 ## 后台刷新
 

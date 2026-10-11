@@ -128,7 +128,7 @@ if errors.As(err, &be) {
 | `WithFetchTimeout(d)` | 60s | Bounds, each on its own: a fetch's double check, each lower layer read with its backfill, each source call with its backfill, and the invalidation after a failed write |
 | `WithFetchesPerKey(n)` | 1 | How many fetches of one key may run at once; 1 merges every concurrent miss |
 | `WithGetManyConcurrency(n)` | 16 | How many source requests one `GetMany` has in flight |
-| `WithGetManyChunkSize(n)` | 0: one call | Splits a `BatchSource` call into chunks of at most n keys |
+| `WithGetManyChunkSize(n)` | 0: one chunk | Fetches a `GetMany`'s misses in chunks of at most n keys, each claimed when it starts; a `Get` of a key whose chunk has not started does not wait |
 | `WithDoubleCheck(mode)` | `DoubleCheckAuto` | When a request that claimed a fetch re-reads the first layer first |
 | `WithLogger(l)` | `slog.Default()` | Logs failures that do not fail a call (a backfill, an invalidation, a background refresh) and panics in fetches |
 | `WithNow(f)` | `time.Now` | The clock entries are computed and judged by (backends still expire entries by the wall clock); `cachextest.Clock` is a manual one for tests |
@@ -157,7 +157,7 @@ Each item: the mistake, what happens, what to do.
 - **Returning `ErrNotFound` from `BatchSource.GetMany`.** Every key of the call reads as missing but nothing is cached, so each read asks again. Leave missing keys out of the map; for some keys failing, return a `*cachex.BatchError` as is, not wrapped.
 - **Relying on the caller's cancellation inside the source.** A fetch is shared by every caller waiting for the key, so its ctx does not end when one caller leaves; it is bounded by `WithFetchTimeout` instead, and keeps the caller's values. Do not use caller state from it, such as a database transaction (`cachex.IsShared(ctx)` tells you it is a fetch).
 - **Calling the same `Cache` for the same key from inside the source.** The call waits for the fetch it is part of and fails at the fetch timeout.
-- **A source without `GetMany` behind large `GetMany` calls.** Keys are fetched one by one (`WithGetManyConcurrency` at a time), and a concurrent `Get` of a queued key waits for its turn. Implement `BatchSource`.
+- **A source without `GetMany` behind large `GetMany` calls.** Keys are fetched one by one (`WithGetManyConcurrency` at a time), and by default a concurrent `Get` of a queued key waits for its turn. Implement `BatchSource`, or set `WithGetManyChunkSize` to about `WithGetManyConcurrency`.
 
 **Reads**
 

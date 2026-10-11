@@ -127,7 +127,7 @@ if errors.As(err, &be) {
 | `WithFetchTimeout(d)` | 60s | 各自限时：回源的二次检查、读下面每一层连同它的回填、每次问数据源连同它的回填、写入失败后的失效 |
 | `WithFetchesPerKey(n)` | 1 | 同一个 key 最多同时几次回源；1 表示并发未命中全部合并 |
 | `WithGetManyConcurrency(n)` | 16 | 一次 `GetMany` 最多同时向数据源发几个请求 |
-| `WithGetManyChunkSize(n)` | 0：一次调用 | 把一次 `BatchSource` 调用切成最多 n 个 key 的分段 |
+| `WithGetManyChunkSize(n)` | 0：全部一段 | 把 `GetMany` 未命中的 key 切成最多 n 个一段回源，每段开始时才认领；所在段还没开始的 key，`Get` 不用等 |
 | `WithDoubleCheck(mode)` | `DoubleCheckAuto` | 认领回源的请求什么时候先再读一次第一层 |
 | `WithLogger(l)` | `slog.Default()` | 记录不让调用失败的错误（回填、失效、后台刷新）和回源里的 panic |
 | `WithNow(f)` | `time.Now` | 计算和判断条目所用的时钟（后端的原生过期仍按真实时钟）；测试用 `cachextest.Clock` 手动推进 |
@@ -156,7 +156,7 @@ if errors.As(err, &be) {
 - **`BatchSource.GetMany` 返回 `ErrNotFound`。** 这次调用的所有 key 都会读成不存在，但什么也不缓存，所以每次读取都会再回源。不存在的 key 不放进 map 就行；部分 key 失败时，原样返回 `*cachex.BatchError`，不要再包装。
 - **在数据源里依赖调用方的取消。** 一次回源由等这个 key 的所有调用方共用，所以它的 ctx 不会因为某个调用方离开而结束，而是由 `WithFetchTimeout` 限时，并保留调用方的值。不要使用里面属于某个调用方的状态，比如数据库事务（`cachex.IsShared(ctx)` 能判断这是回源用的 ctx）。
 - **在数据源里对同一个 key 调用同一个 `Cache`。** 这次调用会等它自己所在的那次回源，直到回源超时才失败。
-- **数据源没有 `GetMany`，却有大批量的 `GetMany` 调用。** key 会逐个回源（同时最多 `WithGetManyConcurrency` 个），并发的 `Get` 碰上还在排队的 key，要等它轮到。请实现 `BatchSource`。
+- **数据源没有 `GetMany`，却有大批量的 `GetMany` 调用。** key 会逐个回源（同时最多 `WithGetManyConcurrency` 个），默认情况下并发的 `Get` 碰上还在排队的 key，要等它轮到。请实现 `BatchSource`，或者把 `WithGetManyChunkSize` 设成 `WithGetManyConcurrency` 左右。
 
 **读取**
 

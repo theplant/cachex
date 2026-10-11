@@ -103,7 +103,7 @@ No. A read's backfill holds the stripe for reading only, and is skipped (a spare
 - a large batch backfill holds the stripes of all its keys while it writes (about 22% for 1,000 keys), and writes to those stripes queue behind it;
 - reads never wait.
 
-For batches well over 1,000 keys from a `BatchSource`, `WithGetManyChunkSize` makes each chunk backfill on its own and hold only its own stripes; chunks run concurrently, so to limit the stripes held at once, also lower `WithGetManyConcurrency`. A smaller backend `ChunkSize` does not help. See [design/write-order.md](design/write-order.md) (Chinese).
+For batches well over 1,000 keys, `WithGetManyChunkSize` makes each chunk backfill on its own and hold only its own stripes; chunks run concurrently, so to limit the stripes held at once, also lower `WithGetManyConcurrency`. A smaller backend `ChunkSize` does not help. See [design/write-order.md](design/write-order.md) (Chinese).
 
 ### With several instances deployed, is the write order still guaranteed?
 
@@ -122,12 +122,12 @@ All together. Fresh values, stale values and fetched values all go into one resu
 
 ### How long does a concurrent `Get` wait for a key that `GetMany` is fetching?
 
-`GetMany` claims every key it fetches at once, so a `Get` of one of them waits for that key's result:
+`GetMany` claims its keys a chunk at a time (`WithGetManyChunkSize`; by default all of them are one chunk, claimed at once). A `Get` of a key it fetches:
 
-- with a `BatchSource`, until the call (or, with `WithGetManyChunkSize`, the chunk) that carries the key returns;
-- without one, until the key's turn comes among `WithGetManyConcurrency` source calls at a time.
+- if the key's chunk has started, waits for that key's result: with a `BatchSource`, until the chunk's call returns; without one, until the key's turn comes among `WithGetManyConcurrency` source calls at a time;
+- if the key's chunk has not started, fetches the key itself, without waiting; the `GetMany` then takes that result.
 
-Implement `BatchSource` on sources you use with large `GetMany` calls.
+For large `GetMany` calls next to concurrent `Get`s, implement `BatchSource`, or set `WithGetManyChunkSize` to about `WithGetManyConcurrency` so that a `Get` waits for one source call at most.
 
 ### What is the difference between `WithFetchesPerKey` and `WithGetManyConcurrency`?
 

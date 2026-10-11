@@ -68,7 +68,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **Batch writes are best effort.** `SetMany`/`DelMany` of the `Cache` and of every backend try every key and list the failed ones in a `*BatchError`.
 
-**`GetMany` claims every key up front.** With a source that is not a `BatchSource`, a concurrent `Get` of a key queued in a large `GetMany` waits for its turn. *What to do:* implement `BatchSource` on sources used with `GetMany`.
+**`GetMany` claims its keys a chunk at a time.** By default all of a `GetMany`'s misses are one chunk, claimed up front: with a source that is not a `BatchSource`, a concurrent `Get` of a key queued in a large `GetMany` waits for its turn. *What to do:* implement `BatchSource` on sources used with `GetMany`, or set `WithGetManyChunkSize` to about `WithGetManyConcurrency`: a key whose chunk has not started is not claimed, so a `Get` of it fetches it at once.
 
 **`Close` waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.** *What to do:* call it before closing the backends.
 

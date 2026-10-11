@@ -68,7 +68,7 @@ import "github.com/theplant/cachex/v2"
 
 **批量写是尽力而为。** `Cache` 和每个后端的 `SetMany`/`DelMany` 都会尝试每个 key，把失败的列进 `*BatchError`。
 
-**`GetMany` 一开始就认领全部 key。** 数据源不是 `BatchSource` 时，并发的 `Get` 碰上一次大 `GetMany` 里排着队的 key，要等它排到。*怎么做：* 用在 `GetMany` 里的数据源实现 `BatchSource`。
+**`GetMany` 按段认领 key。** 默认 `GetMany` 未命中的 key 全部算一段，一开始就全部认领：数据源不是 `BatchSource` 时，并发的 `Get` 碰上一次大 `GetMany` 里排着队的 key，要等它排到。*怎么做：* 用在 `GetMany` 里的数据源实现 `BatchSource`，或者把 `WithGetManyChunkSize` 设成 `WithGetManyConcurrency` 左右：所在段还没开始的 key 没有被认领，`Get` 会当场自己回源。
 
 **`Close` 会等正在进行的回源和它们的回填、后台刷新，以及放弃等待的写入要补做的失效。** *怎么做：* 先调用它，再关闭后端。
 

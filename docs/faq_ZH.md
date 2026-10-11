@@ -103,7 +103,7 @@ TTL 是**不主动写入**时旧数据的存活上限。`Set`/`Del` 是你主动
 - 一次大批量回填会在回填期间占住它所有 key 的分片（1000 个 key 约 22%），这些分片上的写入要排队；
 - 读永远不等。
 
-来自 `BatchSource` 的批量远超 1000 个 key 时，用 `WithGetManyChunkSize` 让每段各自回填、只占自己的分片；各段是并发的，要限制同时占住的分片，还要调小 `WithGetManyConcurrency`。调小后端的 `ChunkSize` 没有这个效果。见 [design/write-order.md](design/write-order.md)。
+批量远超 1000 个 key 时，用 `WithGetManyChunkSize` 让每段各自回填、只占自己的分片；各段是并发的，要限制同时占住的分片，还要调小 `WithGetManyConcurrency`。调小后端的 `ChunkSize` 没有这个效果。见 [design/write-order.md](design/write-order.md)。
 
 ### 多个实例部署时，还保证写入顺序吗？
 
@@ -122,12 +122,12 @@ TTL 是**不主动写入**时旧数据的存活上限。`Set`/`Del` 是你主动
 
 ### 并发的 `Get` 碰上 `GetMany` 正在回源的 key，要等多久？
 
-`GetMany` 一开始就认领它要回源的全部 key，所以这些 key 的 `Get` 要等这个 key 的结果：
+`GetMany` 按段认领它要回源的 key（`WithGetManyChunkSize`；默认全部算一段，一开始就全部认领）。一个 `Get` 碰上其中的 key：
 
-- 数据源是 `BatchSource` 时，等带着这个 key 的那次调用（设置了 `WithGetManyChunkSize` 时是那一段）返回；
-- 不是时，等它在每次最多 `WithGetManyConcurrency` 个数据源调用里排到。
+- 这个 key 所在的段已经开始，就等这个 key 的结果：数据源是 `BatchSource` 时，等这一段的调用返回；不是时，等它在每次最多 `WithGetManyConcurrency` 个数据源调用里排到；
+- 这个 key 所在的段还没开始，就自己回源，不用等；之后 `GetMany` 直接用这个结果。
 
-用在大批量 `GetMany` 里的数据源，请实现 `BatchSource`。
+大批量的 `GetMany` 旁边还有并发的 `Get` 时，数据源实现 `BatchSource`，或者把 `WithGetManyChunkSize` 设成 `WithGetManyConcurrency` 左右，这样 `Get` 最多等一次数据源调用。
 
 ### `WithFetchesPerKey` 和 `WithGetManyConcurrency` 有什么区别？
 
