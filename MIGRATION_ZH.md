@@ -50,6 +50,8 @@ import "github.com/theplant/cachex/v2"
 
 **`Del` 只做失效。** v1 配置了 `WithNotFound` 时，`Del` 会记下「不存在」，于是更新之后的 `Del` 会让更新过的行在这条记录过期前都读不到。v2 只从每一层删掉这个 key，下次读取去问数据源。*怎么做：* 不用处理；如果你依赖 `Del` 表示「已删除」，下次读取会把它记下来。
 
+**含 `}` 却没有 hash tag 的 key 不再支持。** 比如 `a}b`：它在 Redis Cluster 上没法和自己的租约落在同一个 slot。不管用哪些层，`Get`、`GetMany`、`Set`、`SetMany` 对它返回 `ErrUnsupportedKey`，`Del`、`DelMany` 什么也不做。带 hash tag 的（`{user:1}:profile`）和只含 `{` 的 key 不受影响。*怎么做：* 换掉 key 里的 `}`，或者让它带上 hash tag。
+
 **回源比发起它的调用方活得更久。** 一次回源被这个 key 的所有请求共用，所以不会随发起它的调用方结束；它的 ctx 保留调用方的值，但不带它的取消，`IsShared(ctx)` 能识别它。*怎么做：* 不用处理；你自己写的后端不能使用这样的 ctx 里属于调用方的状态，比如事务。
 
 **回源 panic 或调用 `runtime.Goexit` 时，每个等待方都会收到错误。** v1 里 Goexit 的回源的等待方要一直等到自己的 ctx 结束。

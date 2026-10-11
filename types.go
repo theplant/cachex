@@ -15,6 +15,28 @@ import (
 // errors.Is.
 var ErrNotFound = errors.New("cachex: not found")
 
+// ErrUnsupportedKey reports a key that holds a "}" but no hash tag: a "{"
+// followed, later, by a "}" with something between them, as Redis Cluster
+// reads it. Such a key cannot share its Redis Cluster slot with the key of its
+// lease, so the Cache rejects it whatever its layers, and a key that works now
+// keeps working when a layer moves to Redis: Get, GetMany, Set and SetMany fail
+// it, Del and DelMany do nothing (it was never stored). Test with errors.Is.
+var ErrUnsupportedKey = errors.New("cachex: unsupported key: it holds a \"}\" but no hash tag")
+
+// supportedKey reports whether key has a hash tag or no "}" (see
+// ErrUnsupportedKey).
+func supportedKey(key string) bool {
+	if strings.IndexByte(key, '}') < 0 { // most keys: one scan
+		return true
+	}
+	open := strings.IndexByte(key, '{')
+	return open >= 0 && strings.IndexByte(key[open+1:], '}') > 0
+}
+
+func unsupportedKey(key string) error {
+	return fmt.Errorf("cachex: key %q: %w", key, ErrUnsupportedKey)
+}
+
 // Entry is what a layer stores for one key: a value, or a record that the
 // source does not have the key, and when it stops being fresh and usable.
 // The Cache computes every field and never serves an entry past ExpiresAt;

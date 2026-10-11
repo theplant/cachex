@@ -50,6 +50,8 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **`Del` only invalidates.** v1 recorded a "does not exist" on `Del` when `WithNotFound` was configured, so a `Del` after an update hid the updated row until that record expired. v2 drops the key from every layer; the next read asks the source. *What to do:* nothing; if you relied on `Del` meaning "deleted", the next read records it.
 
+**A key with a `}` but no hash tag is no longer supported.** For example `a}b`: on Redis Cluster it cannot share a slot with its lease. Whatever the layers, `Get`, `GetMany`, `Set` and `SetMany` fail it with `ErrUnsupportedKey`, and `Del` and `DelMany` do nothing. Keys with a hash tag (`{user:1}:profile`) and keys with only a `{` are not affected. *What to do:* replace the `}` in the key, or give it a hash tag.
+
 **Fetches outlive their caller.** A fetch is shared by every request of the key, so it does not end with the caller that started it; its ctx keeps the caller's values but not its cancellation, and `IsShared(ctx)` reports it. *What to do:* nothing; a backend you write must not use caller state, such as a transaction, from such a ctx.
 
 **A fetch that panics or calls `runtime.Goexit` answers every waiter with an error.** In v1, waiters of a Goexit'ed fetch waited until their own ctx ended.

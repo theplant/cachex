@@ -166,6 +166,7 @@ if errors.As(err, &be) {
 - **自带过期时间的值（token、签名 URL）按层的 TTL 缓存。** 用 `WithMaxAge`，让条目不会比值本身活得更久。
 - **以为读不了的层会被跳过。** 某一层读失败时，这次读取直接失败，而不是把所有请求都打到数据源。
 - **`Get` 刚返回就检查后端。** 结果是先返回、再写进各层的。测试里先调用 `Close`。
+- **key 里有 `}` 却没有 hash tag**（比如 `a}b`）。这种 key 不支持：读写返回 `ErrUnsupportedKey`。带 hash tag（`{user:1}:profile`）或者不用 `}`。
 
 **写入**
 

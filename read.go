@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"runtime/debug"
+	"slices"
 	"sync"
 
 	"github.com/theplant/cachex/v2/internal/flight"
@@ -37,6 +38,10 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 			}
 		}
 	}
+	if !supportedKey(key) { // checked on a miss only: no layer stores such a key
+		var zero T
+		return zero, unsupportedKey(key)
+	}
 	fk := c.flightKey(key, false)
 	f, leader := c.flights.Claim(fk)
 	if leader {
@@ -56,9 +61,15 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 // holds every other key and the error is a *BatchError listing the failed
 // ones.
 func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, error) {
-	keys = uniqueKeys(keys)
-	out := make(map[string]T, len(keys))
 	errs := map[string]error{}
+	keys = slices.DeleteFunc(uniqueKeys(keys), func(key string) bool {
+		if !supportedKey(key) {
+			errs[key] = unsupportedKey(key)
+			return true
+		}
+		return false
+	})
+	out := make(map[string]T, len(keys))
 
 	seen := make([]uint64, len(keys))
 	missKeys, missSeen := keys, seen

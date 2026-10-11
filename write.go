@@ -51,6 +51,12 @@ func (c *Cache[T]) DelMany(ctx context.Context, keys []string) error {
 // writeOne is write for one key (deleting it if value is nil), without the
 // bookkeeping of many.
 func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
+	if !supportedKey(key) {
+		if value == nil {
+			return nil // never stored
+		}
+		return unsupportedKey(key)
+	}
 	if err := c.lockWrite(ctx, key); err != nil {
 		return err
 	}
@@ -80,6 +86,17 @@ func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 // write sets values and deletes dels in every layer, bottom up, holding the
 // stripes of all their keys.
 func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string) error {
+	errs := map[string]error{}
+	dels = slices.DeleteFunc(dels, func(key string) bool { return !supportedKey(key) }) // never stored
+	for key := range values {
+		if !supportedKey(key) {
+			if len(errs) == 0 {
+				values = maps.Clone(values)
+			}
+			errs[key] = unsupportedKey(key)
+			delete(values, key)
+		}
+	}
 	keys := slices.AppendSeq(make([]string, 0, len(values)+len(dels)), maps.Keys(values))
 	unlock, err := c.lockWrites(ctx, append(keys, dels...))
 	if err != nil {
@@ -91,7 +108,6 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 	for key, value := range values {
 		answers[key] = c.answer(value, false)
 	}
-	errs := map[string]error{}
 	failedAt := map[string]int{}
 	now := c.opts.now()
 	for j := len(c.layers) - 1; j >= 0; j-- {

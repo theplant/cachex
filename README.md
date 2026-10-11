@@ -167,6 +167,7 @@ Each item: the mistake, what happens, what to do.
 - **Values that expire on their own (tokens, signed URLs) cached for the layer TTL.** Use `WithMaxAge` so an entry never outlives the value.
 - **Expecting a broken layer to be skipped.** If a layer cannot be read, the read fails rather than sending every request to the source.
 - **Checking a backend right after `Get` returns.** The answer is returned before it is written into the layers. Call `Close` first in tests.
+- **A key with a `}` but no hash tag** (such as `a}b`). Such keys are not supported: reads and writes fail with `ErrUnsupportedKey`. Give it a hash tag (`{user:1}:profile`) or drop the `}`.
 
 **Writes**
 
