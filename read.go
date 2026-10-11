@@ -266,8 +266,9 @@ type claimed[T any] struct {
 type claimedKey[T any] struct {
 	fk     flightKey
 	flight *flight.Flight[T]
-	seen   uint64 // stripe epoch from before the caller read the first layer
-	gen    uint64 // write generation from before the fetch read below it
+	seen   uint64     // stripe epoch from before the caller read the first layer
+	gen    uint64     // write generation from before the fetch read below it
+	leases *keyLeases // nil: none taken or refused (see Leaser)
 }
 
 func (c *Cache[T]) claim(refresh bool) *claimed[T] { return &claimed[T]{c: c, refresh: refresh} }
@@ -297,11 +298,11 @@ func (p *claimed[T]) settle(ctx context.Context, origin int, idxs []int, entries
 	}
 	if origin > 0 {
 		if len(idxs) == 1 {
-			p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[idxs[0]], gen: p.ks[idxs[0]].gen, entry: entries[0]})
+			p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[idxs[0]], gen: p.ks[idxs[0]].gen, entry: entries[0], leases: p.ks[idxs[0]].leases})
 		} else {
 			fills := make([]fill[T], len(idxs))
 			for j, i := range idxs {
-				fills[j] = fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[j]}
+				fills[j] = fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[j], leases: p.ks[i].leases}
 			}
 			p.c.backfill(ctx, origin, fills)
 		}
@@ -312,7 +313,8 @@ func (p *claimed[T]) settle(ctx context.Context, origin int, idxs []int, entries
 }
 
 // run runs body, which resolves flights idxs, and publishes an error for each
-// of them still unanswered if body panics or calls runtime.Goexit.
+// of them still unanswered if body panics or calls runtime.Goexit. Then it
+// releases the leases they hold still.
 func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
 	returned := false
 	defer func() {
@@ -330,6 +332,9 @@ func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
 				p.c.flights.Publish(p.ks[i].flight, zero, err) // does nothing if answered
 			}
 			p.forget(i)
+		}
+		if p.c.leasers != nil {
+			p.release(ctx, idxs)
 		}
 	}()
 	body()
@@ -350,7 +355,13 @@ func (c *Cache[T]) resolve(ctx context.Context, p *claimed[T], conc int) {
 		for _, i := range pending { // a write after this voids the backfill
 			p.ks[i].gen = c.generation(p.keys[i])
 		}
+		if c.leasers != nil {
+			c.lease(ctx, p, 0, pending)
+		}
 		pending = c.readBelow(ctx, p, pending)
+		if p.refresh && c.leasers != nil {
+			pending = p.skipLeased(pending)
+		}
 		c.askSource(ctx, p, pending, conc)
 	})
 }
@@ -410,9 +421,10 @@ func (c *Cache[T]) doubleCheck(ctx context.Context, p *claimed[T], idxs []int) [
 // or the source's answer), and the key's write generation from before it was
 // read.
 type fill[T any] struct {
-	key   string
-	gen   uint64
-	entry Entry[T]
+	key    string
+	gen    uint64
+	entry  Entry[T]
+	leases *keyLeases // the fetch's leases (see claimedKey)
 }
 
 // readBelow reads the layers below the first for the flights idxs, settles
@@ -450,6 +462,9 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], idxs []int) []i
 		cancel()
 		if len(staleKeys) > 0 {
 			c.refresh(ctx, staleKeys, nil)
+		}
+		if c.leasers != nil {
+			c.lease(ctx, p, li, next)
 		}
 		idxs = next
 	}
@@ -542,6 +557,10 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	}
 	now := c.opts.now()
 	for j := origin - 1; j >= 0; j-- {
+		if c.leasers != nil && c.leasers[j] != nil {
+			c.putLeased(ctx, j, fills, ok, now)
+			continue
+		}
 		if failed := c.layers[j].putMany(ctx, answers, nil, nil, now); len(failed) > 0 {
 			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", batchError(failed))
 		}
@@ -556,6 +575,10 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 	defer c.endFill(f.key)
 	now := c.opts.now()
 	for j := origin - 1; j >= 0; j-- {
+		if c.leasers != nil && c.leasers[j] != nil {
+			c.putLeasedOne(ctx, j, &f, now)
+			continue
+		}
 		if err := c.layers[j].put(ctx, f.key, f.entry, now); err != nil {
 			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 		}
@@ -603,7 +626,7 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 		wg.Wait()
 		for i, f := range flights {
 			<-f.Done()
-			if _, err := f.Result(); err != nil && err != ErrNotFound { //nolint:errorlint // see claimed
+			if _, err := f.Result(); err != nil && err != ErrNotFound && err != errLeased { //nolint:errorlint // see claimed
 				c.opts.logger.ErrorContext(ctx, "cachex: background refresh failed", "key", own[i], "error", err)
 			}
 		}

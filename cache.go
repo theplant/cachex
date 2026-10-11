@@ -45,6 +45,7 @@ type Cache[T any] struct {
 	source      Source[T]
 	batchSource BatchSource[T] // the source, if it answers many keys at once
 	layers      []Layer[T]
+	leasers     []Leaser[T] // by layer, nil for one that does not lease; nil if none does
 	opts        options
 	maxAge      func(T) time.Duration
 
@@ -124,6 +125,14 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 		stripes: stripe.NewSet(),
 	}
 	c.batchSource, _ = source.(BatchSource[T])
+	for i, l := range layers {
+		if leaser := leaserOf(l.backend); leaser != nil {
+			if c.leasers == nil {
+				c.leasers = make([]Leaser[T], len(layers))
+			}
+			c.leasers[i] = leaser
+		}
+	}
 	if o.maxAge != nil {
 		f, ok := o.maxAge.(func(T) time.Duration)
 		if !ok {
