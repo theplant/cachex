@@ -218,6 +218,9 @@ func TestARefreshDoesNotJoinAFetchThatAcceptsAStaleEntry(t *testing.T) {
 	assert.Equal(t, "old", v, "served stale; a refresh starts")
 	require.Eventually(t, func() bool { return src.calls.Load() == 1 }, time.Second, time.Millisecond,
 		"the refresh asks the source instead of taking the stale entry of the fetch in progress")
+	// the source being asked is not the refill being done: wait for that too
+	require.Eventually(t, func() bool { e, _, _ := m1.Get(ctx, "a"); return e.Value == "new" }, time.Second, time.Millisecond,
+		"the refresh refills layer 1")
 
 	close(g1.release)
 	assert.Equal(t, "new", <-got, "the first fetch reads layer 1 after the refresh refilled it")
