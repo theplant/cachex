@@ -304,8 +304,16 @@ func TestGetManyInChunks(t *testing.T) {
 		m, err := c.GetMany(ctx, keys)
 		require.NoError(t, err)
 		assert.Equal(t, values, m)
-		assert.Equal(t, [][]string{{"k1", "k2"}, {"k3", "k4"}, {"k5", "k6"}}, reads)
-		assert.Equal(t, [][]string{{"k1", "k2"}, {"k3", "k4"}, {"k5", "k6"}}, src.batchCalls())
+		// within a chunk, a key whose stripe an earlier chunk's backfill wrote
+		// is double-checked and comes after the others
+		sorted := func(chunks [][]string) [][]string {
+			for _, c := range chunks {
+				slices.Sort(c)
+			}
+			return chunks
+		}
+		assert.Equal(t, [][]string{{"k1", "k2"}, {"k3", "k4"}, {"k5", "k6"}}, sorted(reads))
+		assert.Equal(t, [][]string{{"k1", "k2"}, {"k3", "k4"}, {"k5", "k6"}}, sorted(src.batchCalls()))
 	})
 
 	t.Run("overlapping GetManys in chunks do not wait on each other", func(t *testing.T) {
