@@ -26,6 +26,10 @@ No. Cache data that is read often and changes rarely. Poor candidates are:
 
 No; the striped lock is internal and you cannot take it. Just keep one order: **change the source first, then call `Set` or `Del` through the same `Cache`**. In the opposite order (`Del` first, then change the source), a read that fetches in between gets the old value and legitimately backfills it. See [design/write-order.md](design/write-order.md) (Chinese).
 
+### One change must invalidate many keys, and I cannot list them. What do I do?
+
+Change what you cache: cache lists and query results as ids, and each entity under its own id; read the ids, then the entities with one `GetMany`. Changing an entity then needs only a `Del` of its own key, and a list is invalidated only when its members change. One change touching many keys usually means assembled results are cached, with one entity's data copied into many keys. To never miss a `Del`, drive it from the database's change log: a CDC tool subscribed to the binlog deletes the key of each entity whose row changed, without relying on application code to call it. The library has no invalidation by pattern or tag: deleting by a key pattern is slow, cannot reach other instances' memory layers, and cannot stop a key being fetched from backfilling an old value; tags need someone to keep track of what data each cached value depends on, and in a data cache, keys of the right granularity cover most cases.
+
 ### A cached value is nil. How do I tell it from "does not exist"?
 
 A cached nil (a nil pointer, for example) is a hit:
