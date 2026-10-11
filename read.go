@@ -45,7 +45,8 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 	fk := c.flightKey(key, false)
 	f, leader := c.flights.Claim(fk)
 	if leader {
-		p := c.claim([]string{key}, []flightKey{fk}, []*flight.Flight[T]{f}, []uint64{seen}, false)
+		p := c.claim(false)
+		p.add(key, fk, f, seen)
 		fctx := sharedCtx(ctx)
 		c.background(func() { c.resolve(fctx, p, 1) })
 	}
@@ -182,26 +183,22 @@ func (c *Cache[T]) fetchChunks(ctx context.Context, stop <-chan struct{}, keys [
 				<-slots
 			}
 		}
-		var ownKeys []string
-		var ownFKs []flightKey
-		var ownFlights []*flight.Flight[T]
-		var ownSeen []uint64
+		var p *claimed[T]
 		for i := start; i < end; i++ {
 			fk := c.flightKey(keys[i], refresh)
 			f, leader := c.flights.Claim(fk)
 			flights[i] = f
 			if leader {
-				ownKeys = append(ownKeys, keys[i])
-				ownFKs = append(ownFKs, fk)
-				ownFlights = append(ownFlights, f)
-				ownSeen = append(ownSeen, seen[i])
+				if p == nil {
+					p = c.claim(refresh)
+				}
+				p.add(keys[i], fk, f, seen[i])
 			}
 		}
-		if len(ownKeys) == 0 {
+		if p == nil {
 			release()
 			continue
 		}
-		p := c.claim(ownKeys, ownFKs, ownFlights, ownSeen, refresh)
 		spawn(func() {
 			defer release()
 			c.resolve(ctx, p, conc)
@@ -260,22 +257,34 @@ func (c *Cache[T]) dropFlights(key string) {
 // classified in askSourceOne and askSourceChunk, nowhere else.
 type claimed[T any] struct {
 	c       *Cache[T]
-	keys    []string
-	fks     []flightKey
-	flights []*flight.Flight[T]
-	seen    []uint64 // stripe epochs from before the caller read the first layer
-	gens    []uint64 // write generations from before the fetch read below it
-	refresh bool     // stale entries below do not count
+	keys    []string        // the keys, for the backends' calls
+	ks      []claimedKey[T] // what the fetch knows of each key, in the same order
+	refresh bool            // stale entries below do not count
 }
 
-func (c *Cache[T]) claim(keys []string, fks []flightKey, flights []*flight.Flight[T], seen []uint64, refresh bool) *claimed[T] {
-	return &claimed[T]{c: c, keys: keys, fks: fks, flights: flights, seen: seen, gens: make([]uint64, len(keys)), refresh: refresh}
+// claimedKey is what a fetch knows of one key it leads.
+type claimedKey[T any] struct {
+	fk     flightKey
+	flight *flight.Flight[T]
+	seen   uint64 // stripe epoch from before the caller read the first layer
+	gen    uint64 // write generation from before the fetch read below it
 }
+
+func (c *Cache[T]) claim(refresh bool) *claimed[T] { return &claimed[T]{c: c, refresh: refresh} }
+
+// add makes p lead the flight f of key.
+func (p *claimed[T]) add(key string, fk flightKey, f *flight.Flight[T], seen uint64) {
+	p.keys = append(p.keys, key)
+	p.ks = append(p.ks, claimedKey[T]{fk: fk, flight: f, seen: seen})
+}
+
+// forget unregisters the flight i.
+func (p *claimed[T]) forget(i int) { p.c.flights.Forget(p.ks[i].fk, p.ks[i].flight) }
 
 // publish answers flight i with value or err, which is not backfilled.
 func (p *claimed[T]) publish(i int, value T, err error) {
-	p.c.flights.Publish(p.flights[i], value, err)
-	p.c.flights.Forget(p.fks[i], p.flights[i])
+	p.c.flights.Publish(p.ks[i].flight, value, err)
+	p.forget(i)
 }
 
 // settle answers flights idxs with entries, found at layer origin
@@ -284,21 +293,21 @@ func (p *claimed[T]) publish(i int, value T, err error) {
 func (p *claimed[T]) settle(ctx context.Context, origin int, idxs []int, entries []Entry[T]) {
 	for j, i := range idxs {
 		value, err := entries[j].result()
-		p.c.flights.Publish(p.flights[i], value, err)
+		p.c.flights.Publish(p.ks[i].flight, value, err)
 	}
 	if origin > 0 {
 		if len(idxs) == 1 {
-			p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[idxs[0]], gen: p.gens[idxs[0]], entry: entries[0]})
+			p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[idxs[0]], gen: p.ks[idxs[0]].gen, entry: entries[0]})
 		} else {
 			fills := make([]fill[T], len(idxs))
 			for j, i := range idxs {
-				fills[j] = fill[T]{key: p.keys[i], gen: p.gens[i], entry: entries[j]}
+				fills[j] = fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[j]}
 			}
 			p.c.backfill(ctx, origin, fills)
 		}
 	}
 	for _, i := range idxs {
-		p.c.flights.Forget(p.fks[i], p.flights[i])
+		p.forget(i)
 	}
 }
 
@@ -318,9 +327,9 @@ func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
 		var zero T
 		for _, i := range idxs {
 			if err != nil {
-				p.c.flights.Publish(p.flights[i], zero, err) // does nothing if answered
+				p.c.flights.Publish(p.ks[i].flight, zero, err) // does nothing if answered
 			}
-			p.c.flights.Forget(p.fks[i], p.flights[i])
+			p.forget(i)
 		}
 	}()
 	body()
@@ -339,7 +348,7 @@ func (c *Cache[T]) resolve(ctx context.Context, p *claimed[T], conc int) {
 	p.run(ctx, all, func() {
 		pending := c.doubleCheck(ctx, p, all)
 		for _, i := range pending { // a write after this voids the backfill
-			p.gens[i] = c.generation(p.keys[i])
+			p.ks[i].gen = c.generation(p.keys[i])
 		}
 		pending = c.readBelow(ctx, p, pending)
 		c.askSource(ctx, p, pending, conc)
@@ -370,7 +379,7 @@ func (c *Cache[T]) doubleCheck(ctx context.Context, p *claimed[T], idxs []int) [
 	}
 	var check, pending []int
 	for _, i := range idxs {
-		if c.shouldDoubleCheck(p.keys[i], p.seen[i]) {
+		if c.shouldDoubleCheck(p.keys[i], p.ks[i].seen) {
 			check = append(check, i)
 		} else {
 			pending = append(pending, i)
