@@ -30,7 +30,15 @@ golangci-lint run ./...                             # 本机和 CI 都用 v2.14.
 go test -tags bench -v -run <Test> ./tools/bench/<目录>/   # 复跑实测
 ```
 
-并发相关的测试用 channel 或包装后端控制时序，不靠 `sleep` 碰运气；新加的时序测试用 `-race -count=20` 以上跑几遍确认稳定。修 bug 时先写能复现的测试，确认它在旧代码上失败。先写了实现的地方，用「故意改坏实现、确认测试会失败」补验证。性能改动用 `go test -run '^$' -bench . -benchmem -count=10` 加 benchstat 前后对比。
+并发相关的测试用 channel 或包装后端控制时序，不靠 `sleep` 碰运气。改了并发代码或时序测试，光跑 `-race -count=20` 不够：时序问题多半只在机器满载时出现。要在负载下压测，同时开多个进程，每个都设超时，这样卡死会以失败的形式报出来、带着 goroutine 栈：
+
+```sh
+go test -c -race -o /tmp/cachex.test .
+for i in $(seq 12); do /tmp/cachex.test -test.count=30 -test.timeout=8m -test.failfast > /tmp/stress-$i.out 2>&1 || echo "FAIL $i" & done; wait
+grep -h -- "--- FAIL\|test timed out" /tmp/stress-*.out
+```
+
+压出来的失败要查到根因：先判断是实现的问题还是测试的时序假设不对，再用人为加延迟把窗口撑大，让它稳定复现，修完再压一遍。修 bug 时先写能复现的测试，确认它在旧代码上失败。先写了实现的地方，用「故意改坏实现、确认测试会失败」补验证。性能改动用 `go test -run '^$' -bench . -benchmem -count=10` 加 benchstat 前后对比。
 
 ## 协作约定
 
