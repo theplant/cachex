@@ -116,6 +116,16 @@ if errors.As(err, &be) {
 }
 ```
 
+## 多个实例
+
+几个进程共用一个 Redis 层时，可能出现这种情况：一个进程从数据源读到一个值，另一个进程随后改了数据源并调用 `Set`，第一个进程在这次写入之后才把它的旧值写进 Redis。于是每个实例都会把旧值复制进自己的内存层，直到 Redis 里的条目腐烂。打开租约就能避免：
+
+```go
+shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
+```
+
+一次回源在 Redis 未命中的每个 key 上领租约，写入这个 key 会结束租约，回源只有还持有租约时才写 Redis。别的实例持有租约时，未命中照样返回结果，只是不写 Redis；后台刷新则把这个 key 交给那个实例。租约管不到其他实例的内存层：写入要等它们的条目腐烂才看得到，所以内存层的 TTL 要短，Redis 层的 TTL 可以长。
+
 ## 选项
 
 | 选项 | 默认值 | 作用 |
@@ -138,9 +148,9 @@ if errors.As(err, &be) {
 |---|---|---|
 | `ottercachex` | 内存里的值 | 必须设 `MaximumSize`（条目数）或 `MaximumWeight` 加 `Weigher`；每个条目各自到期 |
 | `bigcachex` | 内存里编码后的条目 | 数百万条目、GC 在 profile 里显眼时使用；每次读取都要解码 |
-| `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline |
+| `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline；多个实例共用时打开 `Leases` |
 | `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 只支持 8.0.17 及以上；key、隔离级别、过期的行见注意事项 |
-| `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`，以及给自写后端用的契约测试 `TestBackend`、`TestByteBackend` |
+| `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`、`NewLeasingMap`（打开了租约的 map，几个代表不同实例的 `Cache` 共用它），以及给自写后端用的契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser` |
 
 `rediscachex.New` 和 `bigcachex.New` 返回 `cachex.Backend[T]`；`gormcachex.New` 返回 `*gormcachex.Backend[T]`，它也是一个 `cachex.Backend[T]`，另有 `Migrate`。
 
@@ -171,7 +181,7 @@ if errors.As(err, &be) {
 **写入**
 
 - **先写缓存再写数据源，或者只写缓存。** `Set` 和 `Del` 从不写数据源。先改数据源，再对同一个 `Cache` 调用 `Set` 或 `Del`；顺序反过来，中间的读取可能把旧值重新缓存进去。
-- **以为一个进程的写入会到达另一个进程的内存层。** 不会；跨实例只靠 TTL 限制旧数据活多久。每层的 TTL 按能接受的程度来设。
+- **以为一个进程的写入会到达另一个进程的内存层。** 不会；那里只靠 TTL 限制旧数据活多久。内存层的 TTL 按能接受的程度来设；共用的 Redis 要打开租约（见「多个实例」），否则它的 TTL 也决定旧数据能活多久。
 - **以为 `Del` 会记下「这个 key 已经不存在」。** 它只删除条目；下次读取会去问数据源。
 - **忽略 `Set` 或 `Del` 的错误。** 失败那一层下面的层可能已经是新值；失败的层和它上面的层会删掉这个 key（尽力而为）。数据源保持你改过的样子。
 

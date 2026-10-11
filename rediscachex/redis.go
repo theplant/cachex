@@ -32,6 +32,13 @@ type Config[T any] struct {
 	KeyPrefix string
 	// ChunkSize is how many keys one pipeline carries. Default DefaultChunkSize.
 	ChunkSize int
+	// Leases turns leases on (see cachex.Leaser), for a Redis that several
+	// instances share: a fetch leases a key it misses, with SET NX PX on a
+	// lease key in the key's Cluster slot, a write deletes the lease first,
+	// and a backfill writes the key, with a Lua script, only if its lease
+	// still holds the fetch's token. So a value read from the source before
+	// another instance wrote the key is never written over that write.
+	Leases bool
 	// Codec encodes values. Default cachex.DefaultCodec.
 	Codec cachex.Codec[T]
 	// Logger reports dropped entries that do not decode. Default slog.Default().
@@ -44,7 +51,7 @@ func New[T any](cfg Config[T]) cachex.Backend[T] {
 	if cfg.Client == nil {
 		panic("rediscachex: Client is required")
 	}
-	b := &byteBackend{client: cfg.Client, prefix: cfg.KeyPrefix, chunkSize: cfg.ChunkSize}
+	b := &byteBackend{client: cfg.Client, prefix: cfg.KeyPrefix, chunkSize: cfg.ChunkSize, leases: cfg.Leases}
 	if b.chunkSize <= 0 {
 		b.chunkSize = DefaultChunkSize
 	}
@@ -55,9 +62,13 @@ type byteBackend struct {
 	client    redis.UniversalClient
 	prefix    string
 	chunkSize int
+	leases    bool
 }
 
-var _ cachex.ByteBackend = (*byteBackend)(nil)
+var (
+	_ cachex.ByteBackend = (*byteBackend)(nil)
+	_ cachex.ByteLeasing = (*byteBackend)(nil)
+)
 
 // ttl is how long to keep data expiring at expiresAt: at least a millisecond,
 // as go-redis takes a negative TTL as "keep the current one".
@@ -100,54 +111,64 @@ func (b *byteBackend) GetMany(ctx context.Context, keys []string) (map[string][]
 }
 
 func (b *byteBackend) Set(ctx context.Context, key string, data []byte, expiresAt time.Time) error {
-	if err := b.client.Set(ctx, b.prefix+key, data, ttl(expiresAt)).Err(); err != nil {
-		return fmt.Errorf("rediscachex: set %q: %w", key, err)
-	}
-	return nil
+	return b.write(ctx, []string{key}, map[string]cachex.ByteEntry{key: {Data: data, ExpiresAt: expiresAt}})[key]
 }
 
 // SetMany stores entries with a TTL up to their ExpiresAt.
 func (b *byteBackend) SetMany(ctx context.Context, entries map[string]cachex.ByteEntry) error {
-	errs := map[string]error{}
-	for chunk := range slices.Chunk(slices.Collect(maps.Keys(entries)), b.chunkSize) {
-		pipe := b.client.Pipeline()
-		cmds := make([]*redis.StatusCmd, len(chunk))
-		for i, key := range chunk {
-			cmds[i] = pipe.Set(ctx, b.prefix+key, entries[key].Data, ttl(entries[key].ExpiresAt))
-		}
-		execPipe(ctx, pipe)
-		for i, cmd := range cmds {
-			if err := cmd.Err(); err != nil {
-				errs[chunk[i]] = fmt.Errorf("rediscachex: set %q: %w", chunk[i], err)
-			}
-		}
-	}
-	return cachex.NewBatchError(errs)
+	return cachex.NewBatchError(b.write(ctx, slices.Collect(maps.Keys(entries)), entries))
 }
 
 func (b *byteBackend) Del(ctx context.Context, key string) error {
-	if err := b.client.Del(ctx, b.prefix+key).Err(); err != nil {
-		return fmt.Errorf("rediscachex: delete %q: %w", key, err)
-	}
-	return nil
+	return b.write(ctx, []string{key}, nil)[key]
 }
 
 func (b *byteBackend) DelMany(ctx context.Context, keys []string) error {
+	return cachex.NewBatchError(b.write(ctx, keys, nil))
+}
+
+// write sets the keys that have an entry in entries and deletes the others,
+// in pipelines of ChunkSize keys; with leases on, each key's lease is deleted
+// first (see endLease).
+func (b *byteBackend) write(ctx context.Context, keys []string, entries map[string]cachex.ByteEntry) map[string]error {
 	errs := map[string]error{}
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
 		pipe := b.client.Pipeline()
-		cmds := make([]*redis.IntCmd, len(chunk))
+		cmds := make([][2]redis.Cmder, len(chunk))
 		for i, key := range chunk {
-			cmds[i] = pipe.Del(ctx, b.prefix+key)
+			e, set := entries[key]
+			end, err := b.endLease(ctx, pipe, key)
+			if err != nil && set {
+				errs[key] = err
+				continue
+			}
+			if end != nil {
+				cmds[i][0] = end
+			}
+			if set {
+				cmds[i][1] = pipe.Set(ctx, b.prefix+key, e.Data, ttl(e.ExpiresAt))
+			} else {
+				cmds[i][1] = pipe.Del(ctx, b.prefix+key)
+			}
+		}
+		if pipe.Len() == 0 {
+			continue
 		}
 		execPipe(ctx, pipe)
-		for i, cmd := range cmds {
-			if err := cmd.Err(); err != nil {
-				errs[chunk[i]] = fmt.Errorf("rediscachex: delete %q: %w", chunk[i], err)
+		for i, key := range chunk {
+			op := "set"
+			if _, set := entries[key]; !set {
+				op = "delete"
+			}
+			for _, cmd := range cmds[i] {
+				if cmd != nil && cmd.Err() != nil {
+					errs[key] = fmt.Errorf("rediscachex: %s %q: %w", op, key, cmd.Err())
+					break
+				}
 			}
 		}
 	}
-	return cachex.NewBatchError(errs)
+	return errs
 }
 
 // execPipe runs a pipeline so that every command carries its own outcome.
