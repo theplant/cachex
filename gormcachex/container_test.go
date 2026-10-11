@@ -21,6 +21,28 @@ import (
 	"github.com/theplant/cachex/v2/cachextest"
 )
 
+// startContainer runs start, up to three times, and returns the DSN it gives.
+// Docker Desktop hands out host ports in sequence without checking the Mac: a
+// process listening on [::] at the port it picks fails the port forward, and
+// the start fails (the port is "not found", or the reaper times out). Another
+// try gets another port.
+func startContainer(t *testing.T, start func() (string, testcontainers.Container, error)) string {
+	t.Helper()
+	var err error
+	for try := 1; try <= 3; try++ {
+		var dsn string
+		var c testcontainers.Container
+		dsn, c, err = start()
+		testcontainers.CleanupContainer(t, c)
+		if err == nil {
+			return dsn
+		}
+		t.Logf("starting the container, try %d: %v", try, err)
+	}
+	require.NoError(t, err)
+	return ""
+}
+
 // TestOnRealDatabases runs the backend against MySQL and PostgreSQL in
 // containers (skipped without Docker): SQLite accepts things they do not, such
 // as the bare reserved word "key", and compares keys byte-exactly by default.
@@ -30,20 +52,24 @@ func TestOnRealDatabases(t *testing.T) {
 
 	dbs := map[string]func(t *testing.T) gorm.Dialector{
 		"mysql": func(t *testing.T) gorm.Dialector {
-			c, err := tcmysql.Run(ctx, "mysql:8.4")
-			testcontainers.CleanupContainer(t, c)
-			require.NoError(t, err)
-			dsn, err := c.ConnectionString(ctx, "parseTime=true")
-			require.NoError(t, err)
-			return mysql.Open(dsn)
+			return mysql.Open(startContainer(t, func() (string, testcontainers.Container, error) {
+				c, err := tcmysql.Run(ctx, "mysql:8.4")
+				if err != nil {
+					return "", c, err
+				}
+				dsn, err := c.ConnectionString(ctx, "parseTime=true")
+				return dsn, c, err
+			}))
 		},
 		"postgres": func(t *testing.T) gorm.Dialector {
-			c, err := tcpostgres.Run(ctx, "postgres:16", tcpostgres.BasicWaitStrategies())
-			testcontainers.CleanupContainer(t, c)
-			require.NoError(t, err)
-			dsn, err := c.ConnectionString(ctx, "sslmode=disable")
-			require.NoError(t, err)
-			return postgres.Open(dsn)
+			return postgres.Open(startContainer(t, func() (string, testcontainers.Container, error) {
+				c, err := tcpostgres.Run(ctx, "postgres:16", tcpostgres.BasicWaitStrategies())
+				if err != nil {
+					return "", c, err
+				}
+				dsn, err := c.ConnectionString(ctx, "sslmode=disable")
+				return dsn, c, err
+			}))
 		},
 	}
 	for name, open := range dbs {

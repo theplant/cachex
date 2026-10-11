@@ -38,6 +38,8 @@ for i in $(seq 12); do /tmp/cachex.test -test.count=30 -test.timeout=8m -test.fa
 grep -h -- "--- FAIL\|test timed out" /tmp/stress-*.out
 ```
 
+gormcachex 的容器测试偶尔启动失败（`port "3306/tcp" not found`，或者等 reaper 约 60 秒后超时），是 Docker Desktop 按顺序分配宿主机端口、撞上了 Mac 上某个监听 `[::]` 的进程；`startContainer` 会换端口重试，不是代码问题。
+
 压出来的失败要查到根因：先判断是实现的问题还是测试的时序假设不对，再用人为加延迟把窗口撑大，让它稳定复现，修完再压一遍。修 bug 时先写能复现的测试，确认它在旧代码上失败。先写了实现的地方，用「故意改坏实现、确认测试会失败」补验证。性能改动用 `go test -run '^$' -bench . -benchmem -count=10` 加 benchstat 前后对比。
 
 ## 协作约定
