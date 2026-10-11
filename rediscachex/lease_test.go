@@ -173,3 +173,42 @@ func TestAnUnreachableRedisFailsEveryLease(t *testing.T) {
 	require.ErrorAs(t, l.PutLeased(ctx, map[string]string{"a": "t"}, nil), &be)
 	require.ErrorAs(t, l.Release(ctx, map[string]string{"a": "t"}), &be)
 }
+
+func TestTwoInstancesDoNotBackfillAnOldValue(t *testing.T) {
+	ctx := context.Background()
+	_, client := newRedis(t)
+	asked, gate := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	data := "v1"
+	src := cachex.SourceFunc[string](func(context.Context, string) (string, error) {
+		mu.Lock()
+		v := data
+		mu.Unlock()
+		asked <- struct{}{}
+		<-gate
+		return v, nil
+	})
+	newInstance := func() *cachex.Cache[string] {
+		b := New[string](Config[string]{Client: client, KeyPrefix: "p:", Leases: true})
+		return cachex.New(src, []cachex.Layer[string]{cachex.NewLayer(b, cachex.TTL(time.Hour, 0))})
+	}
+	a, b := newInstance(), newInstance()
+	got := make(chan string)
+	go func() {
+		v, _ := a.Get(ctx, "k")
+		got <- v
+	}()
+	<-asked // a read v1
+	mu.Lock()
+	data = "v2"
+	mu.Unlock()
+	require.NoError(t, b.Set(ctx, "k", "v2"))
+	close(gate)
+	assert.Equal(t, "v1", <-got)
+	require.NoError(t, a.Close()) // waits for its backfill
+	shared := New[string](Config[string]{Client: client, KeyPrefix: "p:"})
+	e, ok, err := shared.Get(ctx, "k")
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "v2", e.Value, "b's write stands in Redis")
+}
