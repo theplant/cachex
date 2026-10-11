@@ -167,7 +167,7 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (
 }
 
 func (c *Cache[T]) flightKey(key string, refresh bool) flightKey {
-	if refresh || c.opts.fetchesPerKey == 1 { // a key has one refresh at a time
+	if refresh || c.opts.fetchesPerKey == 1 { // refreshing allows one refresh of a key at a time
 		return flightKey{key: key, refresh: refresh}
 	}
 	return flightKey{key: key, slot: rand.IntN(c.opts.fetchesPerKey), refresh: refresh}
@@ -500,21 +500,18 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 }
 
 // refresh refetches keys in the background (stale entries below the first
-// layer do not count): it leads a refresh flight for each key that has none,
-// and skips the others. seen, if not nil, is each key's stripe epoch from
-// before the caller read the first layer.
+// layer do not count), one refresh per key at a time. seen, if not nil, is
+// each key's stripe epoch from before the caller read the first layer. It
+// claims the refresh flights before it returns and resolves them in the one
+// goroutine Close waits for, so that Close also waits for their backfills.
 func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 	var own []string
-	var ownFKs []flightKey
-	var ownFlights []*flight.Flight[T]
 	var ownSeen []uint64
 	for i, key := range keys {
-		fk := c.flightKey(key, true)
-		f, leader := c.flights.Claim(fk)
-		if !leader {
+		if _, loaded := c.refreshing.LoadOrStore(key, struct{}{}); loaded {
 			continue
 		}
-		own, ownFKs, ownFlights = append(own, key), append(ownFKs, fk), append(ownFlights, f)
+		own = append(own, key)
 		if seen != nil {
 			ownSeen = append(ownSeen, seen[i])
 		} else {
@@ -524,28 +521,35 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 	if len(own) == 0 {
 		return
 	}
-	p := c.claim(own, ownFKs, ownFlights, ownSeen, true)
-	done, ok := c.track()
-	if !ok { // closed: no more refreshes; nobody waits for a refresh flight
-		var zero T
-		for i := range own {
-			p.publish(i, zero, errClosed)
+	forget := func() {
+		for _, key := range own {
+			c.refreshing.Delete(key)
 		}
+	}
+	done, ok := c.track()
+	if !ok { // closed: no more refreshes
+		forget()
 		return
 	}
-	ctx = sharedCtx(ctx)
+	fks := make([]flightKey, len(own))
+	flights := make([]*flight.Flight[T], len(own))
+	for i, key := range own {
+		// a key in refreshing has no refresh flight, so this one leads
+		fks[i] = c.flightKey(key, true)
+		flights[i], _ = c.flights.Claim(fks[i])
+	}
+	ctx, p := sharedCtx(ctx), c.claim(own, fks, flights, ownSeen, true)
 	go func() {
 		defer done()
+		defer forget()
 		c.resolve(ctx, p)
-		for i, f := range ownFlights {
+		for i, f := range flights {
 			if _, err := f.Result(); err != nil && err != ErrNotFound { //nolint:errorlint // see claimed
 				c.opts.logger.ErrorContext(ctx, "cachex: background refresh failed", "key", own[i], "error", err)
 			}
 		}
 	}()
 }
-
-var errClosed = errors.New("cachex: closed")
 
 // readLayer reads keys idxs from b, and returns what it found for a key:
 // one Get for one key, which spares the common single-key miss a map.

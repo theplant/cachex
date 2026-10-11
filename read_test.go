@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -479,6 +480,44 @@ func TestCloseWaitsForTheFetchesInProgress(t *testing.T) {
 	close(src.gate)
 	<-closed
 	assert.Equal(t, 1, mem.Len(), "the backfill is done before Close returns")
+}
+
+func TestCloseWaitsForTheBackfillOfARefreshStartedBeforeIt(t *testing.T) {
+	// one P: the refresh goroutine a stale read starts runs only once Close
+	// is already waiting
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	ctx := context.Background()
+	src := newSource(map[string]string{"a": "1"})
+	clock, now := newClock()
+	held := newBlocker("-") // a key never written, until it is set below
+	mem := cachextest.NewMap[string]()
+	c := cachex.New(src, []cachex.Layer[string]{
+		cachex.NewLayer(held.wrap(mem), cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
+	}, now)
+	_, err := c.Get(ctx, "a")
+	require.NoError(t, err)
+	cachex.Settle(c)
+
+	src.set("a", "2")
+	held.key = "a" // hold the refresh's backfill
+	clock.Advance(2 * time.Minute)
+	_, err = c.Get(ctx, "a") // stale: starts a refresh
+	require.NoError(t, err)
+	closed := make(chan struct{})
+	go func() {
+		assert.NoError(t, c.Close())
+		close(closed)
+	}()
+	<-held.entered
+	select {
+	case <-closed:
+		t.Fatal("Close returned while the refresh's backfill was still writing")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(held.release)
+	<-closed
+	e, _ := stored(t, mem, "a")
+	assert.Equal(t, "2", e.Value)
 }
 
 func TestAReadDoesNotWaitForTheBackfill(t *testing.T) {

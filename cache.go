@@ -48,8 +48,9 @@ type Cache[T any] struct {
 	opts        options
 	maxAge      func(T) time.Duration
 
-	flights flight.Group[flightKey, T]
-	stripes *stripe.Set
+	flights    flight.Group[flightKey, T]
+	stripes    *stripe.Set
+	refreshing sync.Map // keys being refreshed in the background
 
 	mu     sync.Mutex // guards closed and adding to wg
 	closed bool
@@ -57,9 +58,8 @@ type Cache[T any] struct {
 }
 
 // flightKey is a key and one of its fetch slots (see WithFetchesPerKey). A
-// background refresh has flights of its own, always in slot 0 so that a key
-// has one refresh at a time: it must not join a fetch that takes a stale entry
-// from below.
+// background refresh has flights of its own, in slot 0: it must not join a
+// fetch that takes a stale entry from below.
 type flightKey struct {
 	key     string
 	slot    int
