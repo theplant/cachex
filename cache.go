@@ -105,6 +105,8 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 		panic("cachex: New: the GetMany concurrency must be positive")
 	case o.getManyChunk < 0:
 		panic("cachex: New: the GetMany chunk size must not be negative")
+	case o.doubleCheck < DoubleCheckAuto || o.doubleCheck > DoubleCheckDisabled:
+		panic(fmt.Sprintf("cachex: New: unknown double-check mode %d", o.doubleCheck))
 	case o.logger == nil:
 		panic("cachex: New: the logger must not be nil")
 	case o.now == nil:

@@ -9,6 +9,10 @@ import (
 // DefaultJitter is the jitter of a layer that does not set one (see Jitter).
 const DefaultJitter = 0.1
 
+// maxTTL bounds fresh plus stale, so an entry's times stay within what a
+// time.Duration and the entry encoding (UnixNano, up to the year 2262) hold.
+const maxTTL = 100 * 365 * 24 * time.Hour
+
 // Layer is one level of a Cache: a backend and how long its entries stay
 // fresh and usable. Build it with NewLayer.
 type Layer[T any] struct {
@@ -29,7 +33,8 @@ type LayerOption func(*layerConfig)
 // served stale while being refreshed in the background (zero: not at all).
 // Both count from when an entry is written into the layer (an answer of the
 // source, a copy from a layer below, a Set); a copy is never fresher or longer
-// lived than the entry it came from. Required, with a positive fresh.
+// lived than the entry it came from. Required, with a positive fresh; fresh
+// plus stale is at most 100 years.
 func TTL(fresh, stale time.Duration) LayerOption {
 	return func(c *layerConfig) { c.fresh, c.stale = fresh, stale }
 }
@@ -63,7 +68,9 @@ func NewLayer[T any](backend Backend[T], opts ...LayerOption) Layer[T] {
 		panic("cachex: NewLayer: TTLs must not be negative")
 	case cfg.nfFresh == 0 && cfg.nfStale > 0:
 		panic("cachex: NewLayer: a not-found stale TTL needs a positive not-found fresh TTL")
-	case cfg.jitter < 0 || cfg.jitter >= 1:
+	case cfg.fresh > maxTTL-cfg.stale || cfg.nfFresh > maxTTL-cfg.nfStale:
+		panic("cachex: NewLayer: fresh plus stale must be at most 100 years")
+	case !(cfg.jitter >= 0 && cfg.jitter < 1): // also rejects NaN
 		panic("cachex: NewLayer: jitter must be in [0, 1)")
 	}
 	return Layer[T]{backend: backend, cfg: cfg}
