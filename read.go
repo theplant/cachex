@@ -123,16 +123,7 @@ func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64) 
 	if len(keys) == 0 {
 		return nil
 	}
-	flights := make([]*flight.Flight[T], len(keys))
-	fctx := sharedCtx(ctx)
-	c.fetchChunks(ctx.Done(), keys, seen, false,
-		func(i int, f *flight.Flight[T]) { flights[i] = f },
-		func(p *claimed[T], conc int, release func()) {
-			c.background(func() {
-				defer release()
-				c.resolve(fctx, p, conc)
-			})
-		})
+	flights := c.fetchChunks(sharedCtx(ctx), ctx.Done(), keys, seen, false, c.background)
 	results := make([]result[T], len(keys))
 	for i, f := range flights {
 		if f == nil { // its chunk never started
@@ -145,21 +136,22 @@ func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64) 
 }
 
 // fetchChunks claims keys a chunk at a time (see WithGetManyChunkSize) and
-// hands each chunk's own flights to resolve, with the number of source requests
-// it may make at once and the release of its share of them. A chunk starts
-// only when the source has room for its requests (one call for a BatchSource,
-// a Get per key otherwise, up to WithGetManyConcurrency in all), and none
-// starts once stop is closed. So the keys of a chunk not started yet are not
-// claimed, and another request of one of them fetches it instead of waiting.
-// onClaim learns each key's flight as its chunk starts.
-func (c *Cache[T]) fetchChunks(stop <-chan struct{}, keys []string, seen []uint64, refresh bool,
-	onClaim func(i int, f *flight.Flight[T]), resolve func(p *claimed[T], conc int, release func())) {
+// resolves each chunk's own flights with ctx, in a goroutine started by spawn.
+// A chunk starts only when the source has room for its requests (one call for
+// a BatchSource, a Get per key otherwise, up to WithGetManyConcurrency in
+// all), and none starts once stop is closed. So the keys of a chunk not
+// started yet are not claimed, and another request of one of them fetches it
+// instead of waiting. It returns each key's flight, nil for a key whose chunk
+// never started.
+func (c *Cache[T]) fetchChunks(ctx context.Context, stop <-chan struct{}, keys []string, seen []uint64, refresh bool,
+	spawn func(func())) []*flight.Flight[T] {
+	flights := make([]*flight.Flight[T], len(keys))
 	size := cmp.Or(c.opts.getManyChunk, len(keys))
 	slots := make(chan struct{}, c.opts.getManyConc)
 	for start := 0; start < len(keys); start += size {
 		select {
 		case <-stop:
-			return
+			return flights
 		default:
 		}
 		end := min(start+size, len(keys))
@@ -171,7 +163,7 @@ func (c *Cache[T]) fetchChunks(stop <-chan struct{}, keys []string, seen []uint6
 			select {
 			case slots <- struct{}{}:
 			case <-stop:
-				return
+				return flights
 			}
 		}
 		release := func() {
@@ -186,7 +178,7 @@ func (c *Cache[T]) fetchChunks(stop <-chan struct{}, keys []string, seen []uint6
 		for i := start; i < end; i++ {
 			fk := c.flightKey(keys[i], refresh)
 			f, leader := c.flights.Claim(fk)
-			onClaim(i, f)
+			flights[i] = f
 			if leader {
 				ownKeys = append(ownKeys, keys[i])
 				ownFKs = append(ownFKs, fk)
@@ -198,8 +190,13 @@ func (c *Cache[T]) fetchChunks(stop <-chan struct{}, keys []string, seen []uint6
 			release()
 			continue
 		}
-		resolve(c.claim(ownKeys, ownFKs, ownFlights, ownSeen, refresh), conc, release)
+		p := c.claim(ownKeys, ownFKs, ownFlights, ownSeen, refresh)
+		spawn(func() {
+			defer release()
+			c.resolve(ctx, p, conc)
+		})
 	}
+	return flights
 }
 
 // await waits for f, the flight of key, or for ctx.
@@ -581,16 +578,8 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 	go func() {
 		defer done()
 		defer forget()
-		flights := make([]*flight.Flight[T], len(own))
 		var wg sync.WaitGroup
-		c.fetchChunks(nil, own, ownSeen, true,
-			func(i int, f *flight.Flight[T]) { flights[i] = f },
-			func(p *claimed[T], conc int, release func()) {
-				wg.Go(func() {
-					defer release()
-					c.resolve(ctx, p, conc)
-				})
-			})
+		flights := c.fetchChunks(ctx, nil, own, ownSeen, true, wg.Go)
 		wg.Wait()
 		for i, f := range flights {
 			<-f.Done()
