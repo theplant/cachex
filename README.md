@@ -125,7 +125,7 @@ When several processes share a Redis layer, one of them may read a value from th
 shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
 ```
 
-A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. Leases do not reach other instances' memory layers: a write still shows there only when their entries rot, so keep the memory layer's TTLs short, and the Redis layer's TTLs can be long.
+`gormcachex` has the same `Leases` option, for a table several instances share (after `Migrate`). A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. Leases do not reach other instances' memory layers: a write still shows there only when their entries rot, so keep the memory layer's TTLs short, and the Redis layer's TTLs can be long.
 
 ## Options
 
@@ -150,7 +150,7 @@ A fetch leases each key it misses in Redis, a write of the key ends the lease, a
 | `ottercachex` | values in memory | `MaximumSize` (entries) or `MaximumWeight` with `Weigher` is required; each entry expires at its own time |
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
 | `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys; `Leases` for a Redis several instances share |
-| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL 8.0.17+ only; see Pitfalls for keys, isolation and expired rows |
+| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL 8.0.17+ only; see Pitfalls for keys, isolation and expired rows; `Leases` for a table several instances share |
 | `cachextest` | values in memory, unbounded | For tests only, with `Clock`, `NewLeasingMap` (a map with leases, to share between Caches standing for instances), and `TestBackend`, `TestByteBackend` and `TestLeaser`, contract tests for your own backends |
 
 `rediscachex.New` and `bigcachex.New` return a `cachex.Backend[T]`; `gormcachex.New` returns a `*gormcachex.Backend[T]`, which is one and adds `Migrate`.

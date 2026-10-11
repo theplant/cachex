@@ -124,7 +124,7 @@ if errors.As(err, &be) {
 shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
 ```
 
-一次回源在 Redis 未命中的每个 key 上领租约，写入这个 key 会结束租约，回源只有还持有租约时才写 Redis。别的实例持有租约时，未命中照样返回结果，只是不写 Redis；后台刷新则把这个 key 交给那个实例。租约管不到其他实例的内存层：写入要等它们的条目腐烂才看得到，所以内存层的 TTL 要短，Redis 层的 TTL 可以长。
+`gormcachex` 也有同样的 `Leases` 选项，给多个实例共用的表用（要先调 `Migrate`）。一次回源在 Redis 未命中的每个 key 上领租约，写入这个 key 会结束租约，回源只有还持有租约时才写 Redis。别的实例持有租约时，未命中照样返回结果，只是不写 Redis；后台刷新则把这个 key 交给那个实例。租约管不到其他实例的内存层：写入要等它们的条目腐烂才看得到，所以内存层的 TTL 要短，Redis 层的 TTL 可以长。
 
 ## 选项
 
@@ -149,7 +149,7 @@ shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, Ke
 | `ottercachex` | 内存里的值 | 必须设 `MaximumSize`（条目数）或 `MaximumWeight` 加 `Weigher`；每个条目各自到期 |
 | `bigcachex` | 内存里编码后的条目 | 数百万条目、GC 在 profile 里显眼时使用；每次读取都要解码 |
 | `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline；多个实例共用时打开 `Leases` |
-| `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 只支持 8.0.17 及以上；key、隔离级别、过期的行见注意事项 |
+| `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 只支持 8.0.17 及以上；key、隔离级别、过期的行见注意事项；多个实例共用时打开 `Leases` |
 | `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`、`NewLeasingMap`（打开了租约的 map，几个代表不同实例的 `Cache` 共用它），以及给自写后端用的契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser` |
 
 `rediscachex.New` 和 `bigcachex.New` 返回 `cachex.Backend[T]`；`gormcachex.New` 返回 `*gormcachex.Backend[T]`，它也是一个 `cachex.Backend[T]`，另有 `Migrate`。

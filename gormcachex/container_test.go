@@ -101,6 +101,13 @@ func TestOnRealDatabases(t *testing.T) {
 				})
 			})
 
+			t.Run("leases", func(t *testing.T) {
+				testLeases(t, func(t *testing.T, chunkSize int) *Backend[string] {
+					table := newB(t).bytes.table
+					return New[string](Config[string]{DB: db, TableName: table, KeyPrefix: "p:", Leases: true, ChunkSize: chunkSize})
+				})
+			})
+
 			t.Run("a key it cannot store fails alone", func(t *testing.T) {
 				testUnstorableKeys(t, newB(t))
 			})

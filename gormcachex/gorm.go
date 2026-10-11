@@ -65,6 +65,13 @@ type Config[T any] struct {
 	Codec cachex.Codec[T]
 	// Logger reports dropped entries that do not decode. Default slog.Default().
 	Logger *slog.Logger
+	// Leases turns leases on (see cachex.Leaser), for a table that several
+	// instances share; they need the lease columns Migrate creates. A fetch
+	// leases a key it misses (a row holding only the lease if the key is
+	// missing), a write clears the lease in the same statement, and a
+	// backfill updates the row only if its lease still holds the fetch's
+	// token. Leases expire by each instance's clock.
+	Leases bool
 }
 
 // Backend is a GORM-backed cachex.Backend: its entries are encoded by
@@ -81,6 +88,7 @@ type byteBackend struct {
 	table     string
 	prefix    string
 	chunkSize int
+	leases    bool
 }
 
 var _ cachex.ByteBackend = (*byteBackend)(nil)
@@ -92,6 +100,17 @@ type row struct {
 	UpdatedAt time.Time `gorm:"not null"`
 }
 
+// leasedRow is row with its lease (see Config.Leases), as Migrate creates
+// the table. A row holding only a lease has an empty value: a read skips it.
+type leasedRow struct {
+	Key        string    `gorm:"not null;primaryKey;size:255"`
+	Value      []byte    `gorm:"not null"`
+	ExpiresAt  time.Time `gorm:"not null;index"`
+	UpdatedAt  time.Time `gorm:"not null"`
+	LeaseToken *string   `gorm:"size:32"`
+	LeaseUntil *time.Time
+}
+
 // New returns a Backend on cfg.TableName; call Migrate to create the table.
 func New[T any](cfg Config[T]) *Backend[T] {
 	if cfg.DB == nil {
@@ -101,7 +120,7 @@ func New[T any](cfg Config[T]) *Backend[T] {
 		panic("gormcachex: TableName is required")
 	}
 	b := &byteBackend{db: cfg.DB, table: cfg.TableName, prefix: cfg.KeyPrefix,
-		chunkSize: min(cmp.Or(max(cfg.ChunkSize, 0), DefaultChunkSize), maxChunkSize)}
+		chunkSize: min(cmp.Or(max(cfg.ChunkSize, 0), DefaultChunkSize), maxChunkSize), leases: cfg.Leases}
 	return &Backend[T]{Backend: cachex.Encoded(b, cfg.Codec, cfg.Logger), bytes: b}
 }
 
@@ -122,6 +141,13 @@ var keyColumn = clause.Column{Name: "key"}
 var upsert = clause.OnConflict{
 	Columns:   []clause.Column{keyColumn},
 	DoUpdates: clause.AssignmentColumns([]string{"key", "value", "expires_at", "updated_at"}), // the key too: on a key column that is not byte-exact, a shared row belongs to the key written last
+}
+
+// upsertLeased is upsert that also ends the row's lease, in the same
+// statement as the write.
+var upsertLeased = clause.OnConflict{
+	Columns:   []clause.Column{keyColumn},
+	DoUpdates: clause.AssignmentColumns([]string{"key", "value", "expires_at", "updated_at", "lease_token", "lease_until"}),
 }
 
 func anys(keys []string) []any {
@@ -157,7 +183,7 @@ func (b *byteBackend) migrate(ctx context.Context) error {
 		}
 		db = db.Set("gorm:table_options", "CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin")
 	}
-	if err := db.AutoMigrate(&row{}); err != nil {
+	if err := db.AutoMigrate(&leasedRow{}); err != nil {
 		return fmt.Errorf("gormcachex: migrate table %s: %w", b.table, err)
 	}
 	return nil
@@ -258,7 +284,9 @@ func (b *byteBackend) getMany(ctx context.Context, keys []string) (map[string][]
 		}
 		byKey := make(map[string][]byte, len(rows))
 		for _, r := range rows {
-			byKey[r.Key] = r.Value
+			if len(r.Value) > 0 { // empty: a lease of a missing key
+				byKey[r.Key] = r.Value
+			}
 		}
 		for i, key := range chunk {
 			if data, ok := byKey[prefixed[i]]; ok {
@@ -303,6 +331,13 @@ func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.Byt
 			batch[i] = p.row
 		}
 		if err := b.write(ctx, func(db *gorm.DB) error {
+			if b.leases {
+				leased := make([]leasedRow, len(batch))
+				for i, r := range batch {
+					leased[i] = leasedRow{Key: r.Key, Value: r.Value, ExpiresAt: r.ExpiresAt, UpdatedAt: r.UpdatedAt}
+				}
+				return db.Table(b.table).Clauses(upsertLeased).Create(&leased).Error
+			}
 			return db.Table(b.table).Clauses(upsert).Create(&batch).Error
 		}); err != nil {
 			for _, p := range chunk {
@@ -323,6 +358,21 @@ func (b *byteBackend) DelMany(ctx context.Context, keys []string) error {
 
 // delMany deletes keys with `WHERE key IN (...)` statements of up to
 // ChunkSize keys, locking rows in key order.
+// inLockOrder returns a statement on the rows matching cond, for an UPDATE or
+// DELETE. On PostgreSQL those lock rows in scan order, which follows the key
+// column's collation (often en_US), not SetMany's byte order: there the rows
+// are locked in byte order first, or the two deadlock each other.
+func (b *byteBackend) inLockOrder(db *gorm.DB, cond clause.Expression) *gorm.DB {
+	if db.Name() != "postgres" {
+		return db.Table(b.table).Where(cond)
+	}
+	locked := db.Session(&gorm.Session{NewDB: true}).Table(b.table).
+		Select("?", keyColumn).Where(cond).
+		Order(clause.OrderBy{Expression: clause.Expr{SQL: `? COLLATE "C"`, Vars: []any{keyColumn}, WithoutParentheses: true}}).
+		Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate})
+	return db.Table(b.table).Where("? IN (?)", keyColumn, locked)
+}
+
 func (b *byteBackend) delMany(ctx context.Context, keys []string) map[string]error {
 	keys = slices.DeleteFunc(slices.Sorted(slices.Values(keys)), func(key string) bool { return !storable(b.prefix + key) }) // never stored
 	errs := map[string]error{}
@@ -332,18 +382,7 @@ func (b *byteBackend) delMany(ctx context.Context, keys []string) map[string]err
 			prefixed[i] = b.prefix + key
 		}
 		if err := b.write(ctx, func(db *gorm.DB) error {
-			in := clause.IN{Column: keyColumn, Values: anys(prefixed)}
-			if db.Name() != "postgres" {
-				return db.Table(b.table).Where(in).Delete(nil).Error
-			}
-			// DELETE locks rows in scan order, which follows the column's
-			// collation (often en_US), not SetMany's byte order: lock them in
-			// byte order first, or the two deadlock each other
-			locked := db.Session(&gorm.Session{NewDB: true}).Table(b.table).
-				Select("?", keyColumn).Where(in).
-				Order(clause.OrderBy{Expression: clause.Expr{SQL: `? COLLATE "C"`, Vars: []any{keyColumn}, WithoutParentheses: true}}).
-				Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate})
-			return db.Table(b.table).Where("? IN (?)", keyColumn, locked).Delete(nil).Error
+			return b.inLockOrder(db, clause.IN{Column: keyColumn, Values: anys(prefixed)}).Delete(nil).Error
 		}); err != nil {
 			for _, key := range chunk {
 				errs[key] = fmt.Errorf("gormcachex: delete %q: %w", key, err)

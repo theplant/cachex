@@ -175,11 +175,26 @@ key 列一律以 `clause.Column` 传给 GORM（条件用 `clause.IN`，PostgreSQ
 
 gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立提交，行锁不跨语句持有。写入要是留在事务里，行锁会跨 `Cache` 调用持有，和分片锁形成数据库检测不到的死锁，见 [ADR 0017](../adr/0017-gorm-never-joins-a-caller-transaction.md)。正确的用法是在事务里改数据源，提交之后再 `Set`/`Del`。
 
+### 租约（`Leases`）
+
+`Config.Leases` 打开租约（默认关闭），机制见 [consistency.md](consistency.md#租约lease)。`Migrate` 总会建两列 `lease_token`、`lease_until`（可为空）；不开租约时读写都不碰它们，所以没调 `Migrate` 的旧表照样能用，开租约才需要这两列。
+
+- **领**：每段（至多 4000 个 key，SQLite 的参数上限）三条语句，各自提交，不管段多大：先给不存在的 key 插入只有租约、value 为空的行（冲突就跳过）；再用 `CASE` 把没人持有、或已经过期的租约改成这次的令牌；最后查一遍，令牌是自己的才算领到。三步之间被别人插进来，最后一步会如实反映。
+- **回填**：一条 `UPDATE`，`value`、`expires_at` 用 `CASE` 按 key 取值，条件是每个 key 的 `key = ? AND lease_token = ?`，同时把租约清空；要删除的 key 用一条同样条件的 `DELETE`。被写入删掉的行不存在，条件更新碰不到它，旧值不会让它复活。
+- **写入**：upsert 顺带把两列置空，和写值在同一条语句里；删除连行一起删掉。
+- **释放**：先删只有租约的行（`LENGTH(value) = 0`），再清空其余行的租约。
+- **读取**：跳过 value 为空的行（只有租约），不交给 `Encoded` 去解码，否则会被当成坏条目删掉。
+- **有效期按各实例自己的时钟**：`lease_until` 由领租约的实例写入，别的实例按自己的时钟判断它过没过期，时钟偏差只影响租约提前或推迟过期。
+- PostgreSQL 上的 `UPDATE`、`DELETE` 和删除一样，先按字节序锁行（`inLockOrder`）。`CASE` 的值在 PostgreSQL 上要写成 `?::bytea`、`?::timestamptz`，否则会被当成 text。
+- **两个 GORM 的坑**：只有一个元素的 `clause.Or` 放进 `clause.And` 时，会渲染成 `… OR (…)`，等于把条件变成了「或」，所以单个 key 时直接用那个条件；`clause.Expr` 里紧跟 `(` 的 `?` 会把切片参数（包括 `[]byte`）展开成列表，所以类型转换不能写成 `CAST(? AS bytea)`。
+
 ## cachextest
 
 - `Map[T]`：基于 `sync.Map`、没有容量上限、从不清理的 `Backend`，只用于测试。
 - `Clock`：手动时钟，`Now` 传给 `cachex.WithNow`，`Advance` 拨动它。
 - `TestBackend[T](t, newBackend, values)`：`Backend` 的契约测试。`values` 至少 3 个不同的值；用 `string` 和一个结构体各跑一遍，编码值的后端就覆盖了编解码器的主要分支。检查未命中不是错误、条目原样读回（包括不存在记录）、值和不存在记录互相覆盖、写入一个已经腐烂的条目不会让旧值还能读到、key 精确比较（大小写、末尾空格、重音）、批量操作、批量里重复的 key、空批量，以及多个 goroutine 同时读写（各自的 key 读回正确、共享 key 最后是写过的某个值，配合 `-race`）。
 - `TestByteBackend(t, newBackend)`：`ByteBackend` 的契约测试：未命中不是错误、字节原样读回并能覆盖、传进去和拿出来的字节归调用方、key 精确比较、批量操作、空批量、多个 goroutine 同时读写。
+- `NewLeasingMap[T]()`：打开了租约的 `Map`，几个 `Cache` 共用它，就是共用一个共享层的几个实例。
+- `TestLeaser(t, newBackend, value)`：打开了租约的 `Backend` 的契约测试：租约只能领一次，直到结束或过期；`Set`、`SetMany`、`Del`、`DelMany` 都结束租约；`PutLeased` 只在令牌对得上时写入或删除，并结束租约；别的令牌既不能写也不能释放；`Release` 结束租约、不写；已经腐烂的条目不会让旧值还能读到；批量。
 
 自写后端可以直接拿它们来测。
