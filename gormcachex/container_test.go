@@ -101,6 +101,10 @@ func TestOnRealDatabases(t *testing.T) {
 				})
 			})
 
+			t.Run("a key it cannot store fails alone", func(t *testing.T) {
+				testUnstorableKeys(t, newB(t))
+			})
+
 			t.Run("a batch larger than one statement", func(t *testing.T) {
 				b := newB(t)
 				entries, keys := map[string]cachex.Entry[string]{}, []string{}

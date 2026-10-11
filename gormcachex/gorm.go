@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -50,9 +51,10 @@ type Config[T any] struct {
 	// TableName is the cache table. Required.
 	TableName string
 	// KeyPrefix is prepended to every key, so that one table can hold several
-	// caches. The key column holds 255 characters, prefix included: a longer
-	// key fails to be written (a backfill only logs it, so the key misses on
-	// every read). Change it when the value type changes incompatibly (see
+	// caches. The key column holds 255 characters of valid UTF-8 without NUL,
+	// prefix included: any other key fails to be written (a backfill only logs
+	// it, so the key misses on every read), without failing the other keys of
+	// its call. Change it when the value type changes incompatibly (see
 	// rediscachex.Config.KeyPrefix).
 	KeyPrefix string
 	// ChunkSize is how many keys one statement carries; a larger call runs
@@ -102,6 +104,16 @@ func New[T any](cfg Config[T]) *Backend[T] {
 		chunkSize: min(cmp.Or(max(cfg.ChunkSize, 0), DefaultChunkSize), maxChunkSize)}
 	return &Backend[T]{Backend: cachex.Encoded(b, cfg.Codec, cfg.Logger), bytes: b}
 }
+
+// storable reports whether the key column can hold prefixed (a key with the
+// prefix). The databases reject a key longer than its 255 characters, or one
+// that is not UTF-8 or holds a NUL, failing every key of the statement: such
+// keys never reach SQL.
+func storable(prefixed string) bool {
+	return utf8.ValidString(prefixed) && utf8.RuneCountInString(prefixed) <= 255 && !strings.ContainsRune(prefixed, 0)
+}
+
+var errUnstorable = errors.New("the key column holds 255 characters of valid UTF-8 without NUL, prefix included")
 
 // keyColumn is the key column as a clause, so GORM quotes it: "key" is a
 // reserved word in MySQL.
@@ -230,6 +242,7 @@ func (b *byteBackend) getMany(ctx context.Context, keys []string) (map[string][]
 	out := make(map[string][]byte, len(keys))
 	errs := map[string]error{}
 	db := b.db.WithContext(ctx)
+	keys = slices.DeleteFunc(slices.Clone(keys), func(key string) bool { return !storable(b.prefix + key) }) // never stored
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
 		prefixed := make([]string, len(chunk))
 		for i, key := range chunk {
@@ -275,6 +288,10 @@ func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.Byt
 	}
 	rows := make([]pending, 0, len(entries))
 	for key, e := range entries {
+		if !storable(b.prefix + key) {
+			errs[key] = fmt.Errorf("gormcachex: set %q: %w", key, errUnstorable)
+			continue
+		}
 		rows = append(rows, pending{key, row{Key: b.prefix + key, Value: e.Data, ExpiresAt: e.ExpiresAt, UpdatedAt: now}})
 	}
 	// one row order for every writer, or overlapping batches lock rows in
@@ -307,7 +324,7 @@ func (b *byteBackend) DelMany(ctx context.Context, keys []string) error {
 // delMany deletes keys with `WHERE key IN (...)` statements of up to
 // ChunkSize keys, locking rows in key order.
 func (b *byteBackend) delMany(ctx context.Context, keys []string) map[string]error {
-	keys = slices.Sorted(slices.Values(keys))
+	keys = slices.DeleteFunc(slices.Sorted(slices.Values(keys)), func(key string) bool { return !storable(b.prefix + key) }) // never stored
 	errs := map[string]error{}
 	for chunk := range slices.Chunk(keys, b.chunkSize) {
 		prefixed := make([]string, len(chunk))

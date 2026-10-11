@@ -123,7 +123,7 @@ type row struct {
 }
 ```
 
-`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用；key 列最长 255 个字符，**包括前缀**，更长的 key 写不进去（回填失败只记 WARN，这个 key 就每次都未命中）。`New` 返回 `*gormcachex.Backend[T]`，它嵌入 `cachex.Backend[T]`，另有 `Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要自己定期删除（清理任务在 [todo](../todo.md) 里）。
+`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用；key 列最长 255 个字符，**包括前缀**，而且必须是合法的 UTF-8、不含 NUL。别的 key 不进 SQL：读成未命中，写入只让它自己失败（回填失败只记 WARN，这个 key 就每次都未命中），删除什么也不做。数据库拒收一个 key 时会让整条语句失败，所以要先拦下，否则同一条语句里的其他 key 跟着失败（PostgreSQL 连读取都会失败）。`New` 返回 `*gormcachex.Backend[T]`，它嵌入 `cachex.Backend[T]`，另有 `Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要自己定期删除（清理任务在 [todo](../todo.md) 里）。
 
 ### key 必须精确比较
 

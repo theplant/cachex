@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"regexp"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -211,4 +214,38 @@ func TestAClosedDatabaseFailsEveryKey(t *testing.T) {
 	assert.Len(t, be.Errors, 3)
 	require.ErrorAs(t, b.SetMany(ctx, map[string]cachex.Entry[string]{"a": entry("v")}), &be)
 	require.ErrorAs(t, b.DelMany(ctx, []string{"a"}), &be)
+}
+
+// testUnstorableKeys checks that a key the key column cannot hold (too long,
+// invalid UTF-8, NUL) misses and fails to be written on its own, without
+// failing the other keys of its statement.
+func testUnstorableKeys(t *testing.T, b *Backend[string]) {
+	ctx := context.Background()
+	bad := []string{strings.Repeat("x", 254), "a\xffb", "a\x00b"} // 254 plus the prefix "p:" is over 255
+	good := []string{"g1", "g2", strings.Repeat("é", 253)}
+	entries := map[string]cachex.Entry[string]{}
+	for _, k := range append(slices.Clone(bad), good...) {
+		entries[k] = entry("v")
+	}
+	var be *cachex.BatchError
+	require.ErrorAs(t, b.SetMany(ctx, entries), &be)
+	assert.ElementsMatch(t, bad, slices.Collect(maps.Keys(be.Errors)))
+	for _, k := range bad {
+		assert.Error(t, b.Set(ctx, k, entry("v")), "%q", k)
+		_, ok, err := b.Get(ctx, k)
+		assert.NoError(t, err, "%q", k)
+		assert.False(t, ok, "%q", k)
+		assert.NoError(t, b.Del(ctx, k), "%q: never stored, so deleted", k)
+	}
+	got, err := b.GetMany(ctx, append(slices.Clone(bad), good...))
+	require.NoError(t, err)
+	assert.ElementsMatch(t, good, slices.Collect(maps.Keys(got)))
+	require.NoError(t, b.DelMany(ctx, append(slices.Clone(bad), good...)))
+	got, err = b.GetMany(ctx, good)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+func TestUnstorableKeys(t *testing.T) {
+	testUnstorableKeys(t, newBackend(t, Config[string]{KeyPrefix: "p:"}))
 }
