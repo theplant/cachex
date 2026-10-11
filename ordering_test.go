@@ -3,6 +3,7 @@ package cachex_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,14 +20,15 @@ import (
 // the order a batch write locks them in.
 func keysInStripeOrder[T any](c *cachex.Cache[T], n int) []string {
 	var keys []string
-	last := -1
+	seen := map[int]bool{}
 	for i := 0; len(keys) < n; i++ {
 		key := fmt.Sprintf("k%d", i)
-		if idx := cachex.StripeIndex(c, key); idx > last {
+		if idx := cachex.StripeIndex(c, key); !seen[idx] {
+			seen[idx] = true
 			keys = append(keys, key)
-			last = idx
 		}
 	}
+	slices.SortFunc(keys, func(a, b string) int { return cachex.StripeIndex(c, a) - cachex.StripeIndex(c, b) })
 	return keys
 }
 

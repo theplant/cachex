@@ -113,6 +113,9 @@ func TestAFetchThatPanicsOrExitsAnswersEveryWaiter(t *testing.T) {
 				assert.Contains(t, log.String(), "panic during fetch")
 				assert.Contains(t, log.String(), "stack=")
 			}
+			// the waiters wake when the error is published, before the flight
+			// is forgotten: a read in between would join it and get the error
+			cachex.Settle(c)
 			broken.Store(false)
 			v, err := c.Get(ctx, "a")
 			require.NoError(t, err, "the key is fetched anew")
