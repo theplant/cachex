@@ -34,30 +34,35 @@ func keysInStripeOrder[T any](c *cachex.Cache[T], n int) []string {
 
 func TestAGetManyBackfillSkipsTheKeysWrittenDuringItsFetch(t *testing.T) {
 	ctx := context.Background()
-	src := newBatchSource(map[string]string{"a": "1", "b": "1"})
+	src := newBatchSource(nil)
 	src.gate = make(chan struct{})
 	calls, onGet := started()
 	src.onGet = onGet
 	mem := cachextest.NewMap[string]()
 	c := cachex.New[string](src, oneLayer(mem))
+	// a write to a skips the backfill of every key in a's stripe: keep b out of it
+	ks := keysInStripeOrder(c, 2)
+	a, b := ks[0], ks[1]
+	src.set(a, "1")
+	src.set(b, "1")
 
 	got := make(chan map[string]string)
 	go func() {
-		m, err := c.GetMany(ctx, []string{"a", "b"})
+		m, err := c.GetMany(ctx, []string{a, b})
 		assert.NoError(t, err)
 		got <- m
 	}()
 	<-calls
 	<-calls
-	require.NoError(t, c.Set(ctx, "a", "new"))
+	require.NoError(t, c.Set(ctx, a, "new"))
 	close(src.gate)
-	assert.Equal(t, map[string]string{"a": "1", "b": "1"}, <-got)
+	assert.Equal(t, map[string]string{a: "1", b: "1"}, <-got)
 	cachex.Settle(c)
 
-	e, ok := stored(t, mem, "a")
+	e, ok := stored(t, mem, a)
 	require.True(t, ok)
 	assert.Equal(t, "new", e.Value, "the fetch read a before the write: its backfill of a is skipped")
-	e, ok = stored(t, mem, "b")
+	e, ok = stored(t, mem, b)
 	require.True(t, ok)
 	assert.Equal(t, "1", e.Value, "b was not written: it is backfilled")
 }
