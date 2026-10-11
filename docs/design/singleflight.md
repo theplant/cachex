@@ -21,8 +21,10 @@ type Flight[T any] struct {
 }
 
 type Group[K comparable, T any] struct {
-    mu      sync.Mutex
-    flights map[K]*Flight[T]
+    shards [64]struct { // key 按 maphash 分进 64 个分片
+        mu      sync.Mutex
+        flights map[K]*Flight[T]
+    }
 }
 
 // package cachex
@@ -39,6 +41,8 @@ type flightKey struct {
 | `Publish(f, value, err)` | 写入结果、关闭 `done`；**仍留在登记里**。只有第一次调用生效，之后的调用什么都不做 | 领头请求 |
 | `Forget(k, f)` | 注销：从登记中删掉，只在登记的仍是 `f` 时才删 | 领头请求，回填完成之后 |
 | `Drop(k...)` | 摘除：从登记中删掉这些 key，但不发布结果、不打断回源 | 写入，见 [write-order.md](write-order.md#摘除在途回源) |
+
+登记表按 key 的哈希分成 64 片，每片一把锁：每次写入都要 `Drop` 这个 key 的在途回源，只有一把锁时，分散在不同 key 上的并行写入和未命中都挤在这把锁上。分片后 `SetDel/spread` 快了约 48%，`ZipfMixed` 快了约 17%，代价是单个 key 的未命中多算一次哈希，约慢 2%。试过 `sync.Map`，并行写入同样变快，但结构体 key 装进接口再哈希，未命中慢约 6%、陈旧命中慢约 14%，没有采用。
 
 「只在登记的仍是 `f` 时才删」很重要：一个被写入摘除的回源结束时，登记里可能已经是写入之后新建的回源，不能把它删掉。
 

@@ -1,6 +1,8 @@
 package flight
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,4 +74,31 @@ func TestForgetLeavesAReplacementRegistered(t *testing.T) {
 	f, leader := g.Claim("k")
 	assert.False(t, leader)
 	assert.Same(t, replacement, f)
+}
+
+func TestAKeyHasOneLeaderAtATimeUnderConcurrentClaims(t *testing.T) {
+	var g Group[int, int]
+	var leading [16]atomic.Int32
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Go(func() {
+			for i := range 2000 {
+				key := i % len(leading)
+				f, leader := g.Claim(key)
+				if !leader {
+					<-f.Done()
+					continue
+				}
+				assert.EqualValues(t, 1, leading[key].Add(1), "two leaders of key %d", key)
+				leading[key].Add(-1)
+				g.Publish(f, i, nil)
+				g.Forget(key, f)
+			}
+		})
+	}
+	wg.Wait()
+	for key := range leading {
+		_, leader := g.Claim(key)
+		assert.True(t, leader, "key %d was forgotten", key)
+	}
 }
