@@ -150,14 +150,21 @@ func WithFetchesPerKey(n int) Option {
 
 // WithGetManyConcurrency sets how many source requests one GetMany has in
 // flight at once: Get calls if the source is not a BatchSource, chunk calls
-// otherwise (see WithGetManyChunkSize). Default DefaultGetManyConcurrency.
+// otherwise. A chunk (see WithGetManyChunkSize) starts only when the source has
+// room for its requests. Default DefaultGetManyConcurrency.
 func WithGetManyConcurrency(n int) Option {
 	return func(o *options) { o.getManyConc = n }
 }
 
-// WithGetManyChunkSize splits the keys one GetMany sends to a BatchSource into
-// calls of at most size keys; each call's keys are answered and backfilled as
-// soon as it returns. Zero (the default) sends them in one call.
+// WithGetManyChunkSize splits the keys one GetMany fetches (and a background
+// refresh of many keys) into chunks of at most size keys. A chunk is claimed
+// when it starts, read from each layer below the first in one call, and sent
+// to the source in one call (a BatchSource) or as a Get per key; its answers
+// are returned and backfilled as soon as they arrive. The keys of a chunk not
+// started yet are not claimed: a Get of one of them fetches it at once instead
+// of waiting for the GetMany, and if the GetMany's ctx ends they are not
+// fetched at all. Smaller chunks cost more calls to the lower layers. Zero (the
+// default) makes all the keys one chunk.
 func WithGetManyChunkSize(size int) Option {
 	return func(o *options) { o.getManyChunk = size }
 }

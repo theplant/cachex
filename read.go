@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"runtime/debug"
-	"slices"
 	"sync"
 
 	"github.com/theplant/cachex/v2/internal/flight"
@@ -43,7 +42,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 	if leader {
 		p := c.claim([]string{key}, []flightKey{fk}, []*flight.Flight[T]{f}, []uint64{seen}, false)
 		fctx := sharedCtx(ctx)
-		c.background(func() { c.resolve(fctx, p) })
+		c.background(func() { c.resolve(fctx, p, 1) })
 	}
 	return c.await(ctx, key, f)
 }
@@ -115,39 +114,91 @@ type result[T any] struct {
 	err   error
 }
 
-// fetchMany fetches keys through the flight group: it claims every key,
-// resolves the ones it leads in one background call, and waits for all of
-// them (including those led by others). seen is each key's stripe epoch from
-// before the caller read the first layer.
+// fetchMany fetches keys in chunks (see fetchChunks) and waits for them all,
+// including those led by other requests. seen is each key's stripe epoch from
+// before the caller read the first layer. Once ctx ends no more chunks start:
+// nobody waits for their keys.
 func (c *Cache[T]) fetchMany(ctx context.Context, keys []string, seen []uint64) []result[T] {
 	if len(keys) == 0 {
 		return nil
 	}
 	flights := make([]*flight.Flight[T], len(keys))
-	var ownKeys []string
-	var ownFKs []flightKey
-	var ownFlights []*flight.Flight[T]
-	var ownSeen []uint64
-	for i, key := range keys {
-		fk := c.flightKey(key, false)
-		f, leader := c.flights.Claim(fk)
-		flights[i] = f
-		if leader {
-			ownKeys = append(ownKeys, key)
-			ownFKs = append(ownFKs, fk)
-			ownFlights = append(ownFlights, f)
-			ownSeen = append(ownSeen, seen[i])
-		}
-	}
-	if len(ownKeys) > 0 {
-		fctx, p := sharedCtx(ctx), c.claim(ownKeys, ownFKs, ownFlights, ownSeen, false)
-		c.background(func() { c.resolve(fctx, p) })
-	}
+	fctx := sharedCtx(ctx)
+	c.fetchChunks(ctx.Done(), keys, seen, false,
+		func(i int, f *flight.Flight[T]) { flights[i] = f },
+		func(p *claimed[T], conc int, release func()) {
+			c.background(func() {
+				defer release()
+				c.resolve(fctx, p, conc)
+			})
+		})
 	results := make([]result[T], len(keys))
 	for i, f := range flights {
+		if f == nil { // its chunk never started
+			results[i].err = fmt.Errorf("cachex: context done while fetching %q: %w", keys[i], ctx.Err())
+			continue
+		}
 		results[i].value, results[i].err = c.await(ctx, keys[i], f)
 	}
 	return results
+}
+
+// fetchChunks claims keys a chunk at a time (see WithGetManyChunkSize) and
+// hands each chunk's own flights to resolve, with the number of source requests
+// it may make at once and the release of its share of them. A chunk starts
+// only when the source has room for its requests (one call for a BatchSource,
+// a Get per key otherwise, up to WithGetManyConcurrency in all), and none
+// starts once stop is closed. So the keys of a chunk not started yet are not
+// claimed, and another request of one of them fetches it instead of waiting.
+// onClaim learns each key's flight as its chunk starts.
+func (c *Cache[T]) fetchChunks(stop <-chan struct{}, keys []string, seen []uint64, refresh bool,
+	onClaim func(i int, f *flight.Flight[T]), resolve func(p *claimed[T], conc int, release func())) {
+	size := cmp.Or(c.opts.getManyChunk, len(keys))
+	slots := make(chan struct{}, c.opts.getManyConc)
+	for start := 0; start < len(keys); start += size {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		end := min(start+size, len(keys))
+		conc := 1
+		if c.batchSource == nil {
+			conc = min(end-start, c.opts.getManyConc)
+		}
+		for range conc {
+			select {
+			case slots <- struct{}{}:
+			case <-stop:
+				return
+			}
+		}
+		release := func() {
+			for range conc {
+				<-slots
+			}
+		}
+		var ownKeys []string
+		var ownFKs []flightKey
+		var ownFlights []*flight.Flight[T]
+		var ownSeen []uint64
+		for i := start; i < end; i++ {
+			fk := c.flightKey(keys[i], refresh)
+			f, leader := c.flights.Claim(fk)
+			onClaim(i, f)
+			if leader {
+				ownKeys = append(ownKeys, keys[i])
+				ownFKs = append(ownFKs, fk)
+				ownFlights = append(ownFlights, f)
+				ownSeen = append(ownSeen, seen[i])
+			}
+		}
+		if len(ownKeys) == 0 {
+			release()
+			continue
+		}
+		resolve(c.claim(ownKeys, ownFKs, ownFlights, ownSeen, refresh), conc, release)
+	}
 }
 
 // await waits for f, the flight of key, or for ctx.
@@ -270,8 +321,8 @@ func (p *claimed[T]) run(ctx context.Context, idxs []int, body func()) {
 // resolve answers the claimed flights from below the first layer: it
 // double-checks the first layer, reads the lower layers in turn, asks the
 // source for what is left, and backfills each answer into the layers above
-// where it was found.
-func (c *Cache[T]) resolve(ctx context.Context, p *claimed[T]) {
+// where it was found, making up to conc source requests at once.
+func (c *Cache[T]) resolve(ctx context.Context, p *claimed[T], conc int) {
 	all := make([]int, len(p.keys))
 	for i := range all {
 		all[i] = i
@@ -282,7 +333,7 @@ func (c *Cache[T]) resolve(ctx context.Context, p *claimed[T]) {
 			p.gens[i] = c.generation(p.keys[i])
 		}
 		pending = c.readBelow(ctx, p, pending)
-		c.askSource(ctx, p, pending)
+		c.askSource(ctx, p, pending, conc)
 	})
 }
 
@@ -387,35 +438,29 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], idxs []int) []i
 	return idxs
 }
 
-// askSource fetches the flights idxs from the source: in chunk calls if it is
-// a BatchSource, key by key otherwise, up to getManyConc calls at once. Each
-// call's answers are settled as soon as it returns, and its backfill shares
-// its timeout.
-func (c *Cache[T]) askSource(ctx context.Context, p *claimed[T], idxs []int) {
-	switch len(idxs) {
-	case 0:
+// askSource fetches the flights idxs from the source: in one call if it is a
+// BatchSource, key by key otherwise, up to conc calls at once. Each call's
+// answers are settled as soon as it returns, and its backfill shares its
+// timeout.
+func (c *Cache[T]) askSource(ctx context.Context, p *claimed[T], idxs []int, conc int) {
+	switch {
+	case len(idxs) == 0:
 		return
-	case 1:
+	case len(idxs) == 1:
 		c.askSourceOne(ctx, p, idxs[0])
+		return
+	case c.batchSource != nil:
+		c.askSourceChunk(ctx, p, idxs)
 		return
 	}
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, c.opts.getManyConc)
-	spawn := func(part []int, body func()) {
+	sem := make(chan struct{}, conc)
+	for _, i := range idxs {
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			p.run(ctx, part, body)
+			p.run(ctx, []int{i}, func() { c.askSourceOne(ctx, p, i) })
 		})
-	}
-	if c.batchSource != nil {
-		for chunk := range slices.Chunk(idxs, cmp.Or(c.opts.getManyChunk, len(idxs))) {
-			spawn(chunk, func() { c.askSourceChunk(ctx, p, chunk) })
-		}
-	} else {
-		for _, i := range idxs {
-			spawn([]int{i}, func() { c.askSourceOne(ctx, p, i) })
-		}
 	}
 	wg.Wait()
 }
@@ -500,10 +545,10 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 }
 
 // refresh refetches keys in the background (stale entries below the first
-// layer do not count), one refresh per key at a time. seen, if not nil, is
-// each key's stripe epoch from before the caller read the first layer. It
-// claims the refresh flights before it returns and resolves them in the one
-// goroutine Close waits for, so that Close also waits for their backfills.
+// layer do not count), one refresh per key at a time, in chunks as GetMany
+// fetches. seen, if not nil, is each key's stripe epoch from before the caller
+// read the first layer. Its fetches run in the one goroutine Close waits for,
+// so that Close also waits for their backfills.
 func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 	var own []string
 	var ownSeen []uint64
@@ -531,19 +576,23 @@ func (c *Cache[T]) refresh(ctx context.Context, keys []string, seen []uint64) {
 		forget()
 		return
 	}
-	fks := make([]flightKey, len(own))
-	flights := make([]*flight.Flight[T], len(own))
-	for i, key := range own {
-		// a key in refreshing has no refresh flight, so this one leads
-		fks[i] = c.flightKey(key, true)
-		flights[i], _ = c.flights.Claim(fks[i])
-	}
-	ctx, p := sharedCtx(ctx), c.claim(own, fks, flights, ownSeen, true)
+	ctx = sharedCtx(ctx)
 	go func() {
 		defer done()
 		defer forget()
-		c.resolve(ctx, p)
+		flights := make([]*flight.Flight[T], len(own))
+		var wg sync.WaitGroup
+		c.fetchChunks(nil, own, ownSeen, true,
+			func(i int, f *flight.Flight[T]) { flights[i] = f },
+			func(p *claimed[T], conc int, release func()) {
+				wg.Go(func() {
+					defer release()
+					c.resolve(ctx, p, conc)
+				})
+			})
+		wg.Wait()
 		for i, f := range flights {
+			<-f.Done()
 			if _, err := f.Result(); err != nil && err != ErrNotFound { //nolint:errorlint // see claimed
 				c.opts.logger.ErrorContext(ctx, "cachex: background refresh failed", "key", own[i], "error", err)
 			}

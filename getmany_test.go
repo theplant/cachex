@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -203,15 +205,17 @@ func TestGetMany(t *testing.T) {
 		src := newBatchSource(map[string]string{"a": "1", "b": "2"})
 		release := map[string]chan struct{}{"a": make(chan struct{}), "b": make(chan struct{})}
 		var mu sync.Mutex
+		var entered atomic.Int64
 		src.onGet = func(ctx context.Context, key string) {
 			mu.Lock()
 			ch := release[key]
 			mu.Unlock()
+			entered.Add(1)
 			<-ch
 		}
 		c := cachex.New[string](src, oneLayer(cachextest.NewMap[string]()), cachex.WithGetManyChunkSize(1))
 		go func() { _, _ = c.GetMany(ctx, []string{"a", "b"}) }()
-		require.Eventually(t, func() bool { return len(src.batchCalls()) == 2 }, time.Second, time.Millisecond, "chunks run concurrently")
+		require.Eventually(t, func() bool { return entered.Load() == 2 }, time.Second, time.Millisecond, "chunks run concurrently")
 		close(release["a"])
 		v, err := c.Get(ctx, "a") // joins chunk a, which no longer waits for chunk b
 		require.NoError(t, err)
@@ -245,4 +249,129 @@ func TestGetMany(t *testing.T) {
 func TestBatchErrorMessage(t *testing.T) {
 	err := &cachex.BatchError{Errors: map[string]error{"b": errBoom, "a": errBoom, "c": errBoom, "d": errBoom}}
 	assert.Equal(t, "cachex: 4 keys failed; a: boom; b: boom; c: boom; and 1 more", err.Error())
+}
+
+func TestGetManyInChunks(t *testing.T) {
+	ctx := context.Background()
+	values := map[string]string{"k1": "1", "k2": "2", "k3": "3", "k4": "4", "k5": "5", "k6": "6"}
+	keys := []string{"k1", "k2", "k3", "k4", "k5", "k6"}
+
+	t.Run("a key of a chunk not started yet is not claimed: a Get of it does not wait", func(t *testing.T) {
+		src := newSource(values)
+		first := make(chan struct{})
+		src.onGet = func(_ context.Context, key string) {
+			if key == "k1" || key == "k2" {
+				<-first
+			}
+		}
+		mem := cachextest.NewMap[string]()
+		c := cachex.New(src, oneLayer(mem), cachex.WithGetManyChunkSize(2), cachex.WithGetManyConcurrency(2))
+		done := make(chan map[string]string)
+		go func() {
+			m, err := c.GetMany(ctx, keys)
+			assert.NoError(t, err)
+			done <- m
+		}()
+		require.Eventually(t, func() bool { return src.calls.Load() == 2 }, time.Second, time.Millisecond, "the first chunk is being fetched")
+
+		gctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		v, err := c.Get(gctx, "k6")
+		require.NoError(t, err, "k6 is fetched at once, not after the GetMany's first chunks")
+		assert.Equal(t, "6", v)
+		require.Eventually(t, func() bool { _, ok := stored(t, mem, "k6"); return ok }, time.Second, time.Millisecond)
+
+		close(first)
+		assert.Equal(t, values, <-done)
+		assert.EqualValues(t, 6, src.calls.Load(), "the GetMany takes k6 from the layer, not from the source again")
+	})
+
+	t.Run("each chunk reads each lower layer in one call", func(t *testing.T) {
+		src := newBatchSource(values)
+		var mu sync.Mutex
+		var reads [][]string
+		l2 := hook(cachextest.NewMap[string](), func(op string, keys []string, many bool) {
+			if op == "get" && many {
+				mu.Lock()
+				defer mu.Unlock()
+				reads = append(reads, slices.Clone(keys))
+			}
+		})
+		c := cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer(cachextest.NewMap[string](), cachex.TTL(time.Minute, 0)),
+			cachex.NewLayer[string](l2, cachex.TTL(time.Hour, 0)),
+		}, cachex.WithGetManyChunkSize(2), cachex.WithGetManyConcurrency(1))
+		m, err := c.GetMany(ctx, keys)
+		require.NoError(t, err)
+		assert.Equal(t, values, m)
+		assert.Equal(t, [][]string{{"k1", "k2"}, {"k3", "k4"}, {"k5", "k6"}}, reads)
+		assert.Equal(t, [][]string{{"k1", "k2"}, {"k3", "k4"}, {"k5", "k6"}}, src.batchCalls())
+	})
+
+	t.Run("overlapping GetManys in chunks do not wait on each other", func(t *testing.T) {
+		src := newSource(values)
+		src.onGet = func(context.Context, string) { runtime.Gosched() }
+		for range 50 {
+			c := cachex.New(src, oneLayer(cachextest.NewMap[string]()), cachex.WithGetManyChunkSize(1), cachex.WithGetManyConcurrency(1))
+			reversed := slices.Clone(keys)
+			slices.Reverse(reversed)
+			gctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			var wg sync.WaitGroup
+			for _, ks := range [][]string{keys, reversed} {
+				wg.Go(func() {
+					m, err := c.GetMany(gctx, ks)
+					assert.NoError(t, err)
+					assert.Equal(t, values, m)
+				})
+			}
+			wg.Wait()
+			cancel()
+		}
+	})
+
+	t.Run("a GetMany whose context ends starts no more chunks", func(t *testing.T) {
+		src := newSource(values)
+		first := make(chan struct{})
+		src.onGet = func(_ context.Context, key string) {
+			if key == "k1" {
+				<-first
+			}
+		}
+		c := cachex.New(src, oneLayer(cachextest.NewMap[string]()), cachex.WithGetManyChunkSize(1), cachex.WithGetManyConcurrency(1))
+		gctx, cancel := context.WithCancel(ctx)
+		done := make(chan error)
+		go func() {
+			_, err := c.GetMany(gctx, keys)
+			done <- err
+		}()
+		require.Eventually(t, func() bool { return src.calls.Load() == 1 }, time.Second, time.Millisecond)
+		cancel()
+		var be *cachex.BatchError
+		require.ErrorAs(t, <-done, &be)
+		assert.Len(t, be.Errors, 6)
+		close(first)
+		cachex.Settle(c)
+		assert.EqualValues(t, 1, src.calls.Load(), "nobody waits for the keys of the chunks not started")
+	})
+
+	t.Run("a refresh goes in chunks too", func(t *testing.T) {
+		src := newBatchSource(values)
+		clock, now := newClock()
+		c := cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer(cachextest.NewMap[string](), cachex.TTL(time.Minute, time.Hour)),
+		}, now, cachex.WithGetManyChunkSize(4))
+		_, err := c.GetMany(ctx, keys)
+		require.NoError(t, err)
+		cachex.Settle(c)
+		clock.Advance(2 * time.Minute) // stale
+		_, err = c.GetMany(ctx, keys)
+		require.NoError(t, err)
+		require.NoError(t, c.Close())
+		var sizes []int
+		for _, call := range src.batchCalls() {
+			sizes = append(sizes, len(call))
+		}
+		slices.Sort(sizes)
+		assert.Equal(t, []int{2, 2, 4, 4}, sizes, "two chunks to fetch, two to refresh")
+	})
 }
