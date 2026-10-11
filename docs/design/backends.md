@@ -140,7 +140,7 @@ type row struct {
 
 ### `key` 是 MySQL 的保留字
 
-所有条件都用 GORM 的 `clause.Eq`、`clause.IN` 构造，由 GORM 给列名加引号。不能写成 `Where("key = ?")` 这样的原始 SQL 片段：SQLite 能接受，MySQL 会报语法错误。有一个单元测试会截获实际执行的 SQL，检查列名有没有加引号。
+key 列一律以 `clause.Column` 传给 GORM（条件用 `clause.IN`，PostgreSQL 删除时的子查询写成 `Where("? IN (?)", keyColumn, …)`），由 GORM 给列名加引号。不能把列名直接写进 SQL 片段，比如 `Where("key = ?")`：SQLite 能接受，MySQL 会报语法错误。有一个单元测试会截获实际执行的 SQL，检查列名有没有加引号。
 
 ### 批量与死锁
 

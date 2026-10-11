@@ -62,7 +62,7 @@ import "github.com/theplant/cachex/v2"
 
 **`gormcachex` 从不加入你的事务。** v1 的 `WithGORMTx` 让缓存写入进你的事务；v2 没有这个选项，每条语句独立提交。写入留在事务里，行锁就会跨 `Cache` 调用持有，而 `Cache` 在进程内给同一个 key 的写入排队，两者可能永远互相等待。*怎么做：* 在事务里改数据源，提交之后再调用 `Set`/`Del`。
 
-**后端按真实时钟让条目过期。** `WithNow`（v1 的 `NowFunc`）设的是 `Cache` 判断条目所用的时钟，但 Redis、otter 和存字节的后端在条目的 `ExpiresAt` 按 `time.Now` 过去之后就丢掉它。*怎么做：* 测试里用 `cachextest.Clock` 配这类后端时，让时钟从 `time.Now()` 开始。
+**后端按真实时钟让条目过期。** `WithNow`（v1 的 `NowFunc`）设的是 `Cache` 判断条目所用的时钟，但 Redis 和 otter 在条目的 `ExpiresAt` 按 `time.Now` 过去之后就丢掉它，存字节的后端也不写按 `time.Now` 已经过了 `ExpiresAt` 的条目。*怎么做：* 测试里用 `cachextest.Clock` 配这类后端时，让时钟从 `time.Now()` 开始。
 
 **MySQL 需要 8.0.17 及以上，不支持 MariaDB。** `Migrate` 建表时 key 列用 `utf8mb4_0900_bin`；已有的表 key 列是别的排序规则时会报错，并给出转换用的 `ALTER TABLE` 语句。只支持各数据库默认的隔离级别。
 

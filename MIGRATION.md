@@ -62,7 +62,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **`gormcachex` never joins your transaction.** v1's `WithGORMTx` put cache writes in your transaction; v2 has no such option, and every statement commits on its own. A write held in a transaction keeps its row locks across `Cache` calls while the `Cache` orders writes of a key in the process, and the two can wait for each other forever. *What to do:* change the source in your transaction, then call `Set`/`Del` after it commits.
 
-**Backends expire entries by the wall clock.** `WithNow` (v1's `NowFunc`) sets the clock the `Cache` judges entries by, but Redis, otter and the byte-storing backends drop an entry once its `ExpiresAt` has passed by `time.Now`. *What to do:* in tests that use a `cachextest.Clock` with such a backend, start the clock at `time.Now()`.
+**Backends expire entries by the wall clock.** `WithNow` (v1's `NowFunc`) sets the clock the `Cache` judges entries by, but Redis and otter drop an entry once its `ExpiresAt` has passed by `time.Now`, and the byte-storing backends do not write an entry already past it by `time.Now`. *What to do:* in tests that use a `cachextest.Clock` with such a backend, start the clock at `time.Now()`.
 
 **MySQL needs 8.0.17 or later; MariaDB is not supported.** `Migrate` creates the table with a `utf8mb4_0900_bin` key column and rejects an existing table whose key column uses another collation, with the `ALTER TABLE` statement that converts it. Only each database's default isolation level is supported.
 

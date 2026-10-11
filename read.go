@@ -48,12 +48,13 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 }
 
 // GetMany returns the values of keys that exist, with the semantics of calling
-// Get for each: every layer and the source are read in one call per layer (a
-// BatchSource in chunks, see WithGetManyChunkSize; any other source key by
-// key, see WithGetManyConcurrency), and keys being fetched by other calls are
-// waited for, not fetched again. A key the source does not have is absent from
-// the map. If some keys failed, the map holds every other key and the error is
-// a *BatchError listing the failed ones.
+// Get for each: the first layer is read in one call, the layers below and a
+// BatchSource in one call per chunk (see WithGetManyChunkSize; by default one
+// chunk), any other source key by key (see WithGetManyConcurrency), and keys
+// being fetched by other calls are waited for, not fetched again. A key the
+// source does not have is absent from the map. If some keys failed, the map
+// holds every other key and the error is a *BatchError listing the failed
+// ones.
 func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, error) {
 	keys = uniqueKeys(keys)
 	out := make(map[string]T, len(keys))

@@ -132,7 +132,7 @@ sequenceDiagram
 
 单个 key 和批量共用同一个小结构 `claimed`：
 
-- `settle` 和 `fail` 给在途回源发布结果；`flight.Group.Publish` 只有第一次生效，所以重复发布无害；
+- `settle` 和 `publish` 给在途回源发布结果；`flight.Group.Publish` 只有第一次生效，所以重复发布无害；
 - `run(ctx, idxs, body)` 执行回源，`body` panic 或调用 Goexit 时，给 `idxs` 里的在途回源发布错误（已经发布过的不受影响），再全部注销。
 
 批量时，二次检查或下层已经找到的 key 会先发布；之后某一段问数据源时 panic，只影响这一段里还没发布的 key。
@@ -177,7 +177,7 @@ sequenceDiagram
 
 ## 后台刷新
 
-返回陈旧值时发起的后台刷新，用一个 `sync.Map`（`refreshing`）按 key 去重：同一个 key 的刷新还没结束时，不会再发起新的刷新，和 `WithFetchesPerKey` 无关；查已有的 key 不加锁，陈旧命中很便宜。抢到 `refreshing` 的请求先登记到 `Close` 要等的后台工作里（`Close` 之后不再发起刷新），再当场认领 `flightKey{key, refresh: true}`（这时这个 key 不会有别的刷新在途，所以总是领头），然后在**同一个**被登记的 goroutine 里回源、回填。回源不再另起 goroutine：另起的那个如果在 `Close` 之后才登记，就不在 `Close` 的等待范围里，`Close` 可能在刷新的回填写完之前返回。刷新用共享 ctx（见[回源用的 ctx](#回源用的-ctx)）；失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。
+返回陈旧值时发起的后台刷新，用一个 `sync.Map`（`refreshing`）按 key 去重：同一个 key 的刷新还没结束时，不会再发起新的刷新，和 `WithFetchesPerKey` 无关；查已有的 key 不加锁，陈旧命中很便宜。抢到 `refreshing` 的请求先登记到 `Close` 要等的后台工作里（`Close` 之后不再发起刷新），再当场认领 `flightKey{key, refresh: true}`（这时这个 key 不会有别的刷新在途，所以总是领头），然后由这个被登记的 goroutine 回源、回填：分段时每段一个子 goroutine，被登记的 goroutine 等它们全部结束才注销登记。不能另起一个自己去登记的 goroutine：它如果在 `Close` 之后才登记，就不在 `Close` 的等待范围里，`Close` 可能在刷新的回填写完之前返回。刷新用共享 ctx（见[回源用的 ctx](#回源用的-ctx)）；失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。
 
 刷新也走这套登记，但认领的是自己的在途回源（`flightKey.refresh` 为真）：它不加入普通回源，普通读取也不加入它。原因是刷新时下层的陈旧条目不算数，而普通回源会接受下层的陈旧条目；刷新加入普通回源，可能拿着一个陈旧条目就结束了，根本没问数据源。代价是同一个 key 的普通回源和刷新可以同时进行，最多多问一次数据源。写入摘除时两种都摘。见 [ADR 0016](../adr/0016-refresh-has-its-own-flights.md)。
 
