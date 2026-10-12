@@ -2,8 +2,10 @@ package cachex_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -464,13 +466,131 @@ func TestALayerThatPanicsInAWriteKeepsNoOldValue(t *testing.T) {
 			}
 		})
 		panicking.Store(false)
-		e, ok := stored(t, bottom, "k")
-		require.True(t, ok)
-		require.Equal(t, "new", e.Value, "the layer below was written")
-		_, ok = stored(t, top, "k")
+		if e, ok := stored(t, bottom, "k"); ok { // written, maybe dropped after: which layers a panic left is unknown
+			require.Equal(t, "new", e.Value)
+		}
+		_, ok := stored(t, top, "k")
 		assert.False(t, ok, "many=%v: the panicking layer keeps no old value", many)
 		v, err := c.Get(ctx, "k")
 		require.NoError(t, err)
 		assert.Equal(t, "new", v)
 	}
+}
+
+// partialMap fails key bad in SetMany and writes the rest.
+type partialMap struct {
+	*cachextest.Map[string]
+	bad string
+	on  bool
+}
+
+func (p *partialMap) SetMany(ctx context.Context, es map[string]cachex.Entry[string]) error {
+	if !p.on {
+		return p.Map.SetMany(ctx, es)
+	}
+	rest := map[string]cachex.Entry[string]{}
+	for k, e := range es {
+		if k != p.bad {
+			rest[k] = e
+		}
+	}
+	if err := p.Map.SetMany(ctx, rest); err != nil {
+		return err
+	}
+	return &cachex.BatchError{Errors: map[string]error{p.bad: errors.New("boom")}}
+}
+
+func TestAPanicAfterAKeyFailedBelowDropsItThereToo(t *testing.T) {
+	ctx := context.Background()
+	src := newSource(map[string]string{"a": "old", "b": "old"})
+	panicking := false
+	top := &hooked[string]{Backend: cachextest.NewMap[string](), hook: func(op string, _ []string, _ bool) error {
+		if op == "set" && panicking {
+			panic("layer 0 blew up")
+		}
+		return nil
+	}}
+	bottom := &partialMap{Map: cachextest.NewMap[string](), bad: "a"}
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](top, cachex.TTL(time.Hour, 0)),
+		cachex.NewLayer[string](bottom, cachex.TTL(time.Hour, 0)),
+	})
+	_, err := c.GetMany(ctx, []string{"a", "b"})
+	require.NoError(t, err)
+	cachex.Settle(c)
+
+	src.set("a", "new")
+	src.set("b", "new")
+	bottom.on, panicking = true, true
+	assert.Panics(t, func() { _ = c.SetMany(ctx, map[string]string{"a": "new", "b": "new"}) })
+	bottom.on, panicking = false, false
+
+	v, err := c.Get(ctx, "a")
+	require.NoError(t, err)
+	assert.Equal(t, "new", v, "a failed in the bottom layer; its old value must not survive there")
+}
+
+func TestALayerThatCallsGoexitInAWriteKeepsNoOldValue(t *testing.T) {
+	ctx := context.Background()
+	for _, many := range []bool{false, true} {
+		src := newSource(map[string]string{"k": "old"})
+		var exiting atomic.Bool
+		top := &hooked[string]{Backend: cachextest.NewMap[string](), hook: func(op string, _ []string, _ bool) error {
+			if op == "set" && exiting.Load() {
+				runtime.Goexit()
+			}
+			return nil
+		}}
+		c := cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer[string](top, cachex.TTL(time.Hour, 0)),
+			cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Hour, 0)),
+		})
+		_, err := c.Get(ctx, "k")
+		require.NoError(t, err)
+		cachex.Settle(c)
+
+		src.set("k", "new")
+		exiting.Store(true)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if many {
+				_ = c.SetMany(ctx, map[string]string{"k": "new"})
+			} else {
+				_ = c.Set(ctx, "k", "new")
+			}
+		}()
+		<-done
+		exiting.Store(false)
+		v, err := c.Get(ctx, "k")
+		require.NoError(t, err)
+		assert.Equal(t, "new", v, "many=%v", many)
+	}
+}
+
+func TestALayerThatPanicsInDelKeepsNoOldValueAbove(t *testing.T) {
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "old"})
+	var panicking atomic.Bool
+	bottom := &hooked[string]{Backend: cachextest.NewMap[string](), hook: func(op string, _ []string, _ bool) error {
+		if op == "del" && panicking.Load() {
+			panic("layer 1 blew up")
+		}
+		return nil
+	}}
+	top := cachextest.NewMap[string]()
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](top, cachex.TTL(time.Hour, 0)),
+		cachex.NewLayer[string](bottom, cachex.TTL(time.Hour, 0)),
+	})
+	_, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	cachex.Settle(c)
+
+	src.del("k")
+	panicking.Store(true)
+	assert.Panics(t, func() { _ = c.Del(ctx, "k") })
+	panicking.Store(false)
+	_, ok := stored(t, top, "k")
+	assert.False(t, ok, "layer 0 is above the panicking layer and must not keep the old value")
 }

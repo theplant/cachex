@@ -185,7 +185,7 @@ _避免_：批（单独说「批」时指整个批量读）、分片（分片指
 共享层在一层未命中时发给领头请求的令牌；写入会让令牌作废，持有作废令牌的回填什么也不写。后端可选支持，默认关闭。
 
 **hash tag**：
-key 里一个 `{`、后面某处一个 `}`、中间不为空的那一段；Redis Cluster 只按这一段决定 key 落在哪个 slot。
+key 里第一个 `{` 和它后面第一个 `}` 之间的那一段，不能为空（`{}a}` 没有 hash tag）；Redis Cluster 只按这一段决定 key 落在哪个 slot。
 
 **不支持的 key（unsupported key，`ErrUnsupportedKey`）**：
 含 `}` 却没有 hash tag 的 key。它没法和自己的租约落在同一个 slot，所以 `Cache` 不管有哪些层都拒绝它。

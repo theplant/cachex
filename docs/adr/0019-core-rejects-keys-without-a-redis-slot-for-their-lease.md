@@ -1,6 +1,6 @@
 # 核心包拒绝没法和租约同 slot 的 key
 
-租约（见 [consistency.md](../design/consistency.md#租约lease)）在 Redis 上用一段 Lua 同时操作数据 key 和租约 key。Redis Cluster 要求一段脚本碰的 key 在同一个 slot，所以租约 key 要从数据 key 推出来：数据 key 带 hash tag（一个 `{`，后面某处有 `}`，中间不为空）时在后面加后缀，不带时把整个 key 包进 `{}`。只有一种 key 推不出来：含 `}`、却没有 hash tag，比如 `a}b`。
+租约（见 [consistency.md](../design/consistency.md#租约lease)）在 Redis 上用一段 Lua 同时操作数据 key 和租约 key。Redis Cluster 要求一段脚本碰的 key 在同一个 slot，所以租约 key 要从数据 key 推出来：数据 key 带 hash tag（第一个 `{` 和它后面第一个 `}` 之间不为空）时在前面加前缀（`cachex-lease:t:`），不带时把整个 key 包进 `{}`（`cachex-lease:{key}`）。只有一种 key 推不出来：含 `}`、却没有 hash tag，比如 `a}b`。
 
 我们让**核心包**拒绝这种 key，不管有哪些层、开没开租约：`Get`、`GetMany`、`Set`、`SetMany` 返回 `ErrUnsupportedKey`，`Del`、`DelMany` 什么也不做（它从来没被存过）。`Get` 只在未命中时检查，因为没有哪一层会存这种 key，命中路径不多花一次扫描。
 

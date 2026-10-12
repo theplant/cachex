@@ -76,11 +76,10 @@ func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 	}
 	defer c.unlockWrite(key)
 
-	j := len(c.layers) - 1
+	done := false
 	defer func() {
-		if r := recover(); r != nil { // a panic is a failure too: drop the key at and above j
-			c.invalidate(ctx, []string{key}, j)
-			panic(r)
+		if !done { // a layer panicked or called runtime.Goexit: see abort
+			c.abort(ctx, []string{key}, recover())
 		}
 	}()
 	var a Entry[T]
@@ -88,7 +87,7 @@ func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 		a = c.answer(*value, false)
 	}
 	now := c.opts.now()
-	for ; j >= 0; j-- {
+	for j := len(c.layers) - 1; j >= 0; j-- {
 		l := &c.layers[j]
 		var err error
 		if value != nil {
@@ -97,10 +96,12 @@ func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 			err = l.backend.Del(ctx, key)
 		}
 		if err != nil {
+			done = true
 			c.invalidate(ctx, []string{key}, j)
 			return fmt.Errorf("cachex: write %q to layer %d: %w", key, j, err)
 		}
 	}
+	done = true
 	return nil
 }
 
@@ -125,11 +126,10 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 	}
 	defer unlock()
 
-	j := len(c.layers) - 1
+	done := false
 	defer func() {
-		if r := recover(); r != nil { // a panic is a failure too: drop the keys at and above j
-			c.invalidate(ctx, append(keys, dels...), j)
-			panic(r)
+		if !done { // a layer panicked or called runtime.Goexit: see abort
+			c.abort(ctx, append(keys, dels...), recover())
 		}
 	}()
 	answers := make(map[string]Entry[T], len(values))
@@ -138,7 +138,7 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 	}
 	failedAt := map[string]int{}
 	now := c.opts.now()
-	for ; j >= 0; j-- {
+	for j := len(c.layers) - 1; j >= 0; j-- {
 		var drop []string
 		for _, key := range dels {
 			if _, failed := errs[key]; !failed {
@@ -156,21 +156,43 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 	for key, j := range failedAt {
 		byLayer[j] = append(byLayer[j], key)
 	}
-	for l, keys := range byLayer {
-		c.invalidate(ctx, keys, l)
+	done = true
+	for j, keys := range byLayer {
+		c.invalidate(ctx, keys, j)
 	}
 	return batchError(errs)
 }
 
-// invalidate drops keys from layers top..0, best effort. It runs after a write
-// failed, often because of ctx itself, so it does not use ctx's cancellation,
-// nor its transaction (see IsShared).
+// abort cleans up after a write that a layer cut short with a panic (r) or
+// runtime.Goexit (r is nil): which layers it wrote, and which keys failed
+// where, is unknown, so the keys are dropped from every layer; then the
+// panic goes on (a Goexit goes on by itself).
+func (c *Cache[T]) abort(ctx context.Context, keys []string, r any) {
+	c.invalidate(ctx, keys, len(c.layers)-1)
+	if r != nil {
+		panic(r)
+	}
+}
+
+// invalidate drops keys from layers top..0, best effort: a layer that fails,
+// or panics, is logged and the layers above it are still dropped from. It
+// runs after a write failed, often because of ctx itself, so it does not use
+// ctx's cancellation, nor its transaction (see IsShared).
 func (c *Cache[T]) invalidate(ctx context.Context, keys []string, top int) {
 	ictx, cancel := context.WithTimeout(sharedCtx(ctx), c.opts.fetchTimeout)
 	defer cancel()
 	for j := top; j >= 0; j-- {
-		if err := c.layers[j].backend.DelMany(ictx, keys); err != nil {
-			c.opts.logger.WarnContext(ictx, "cachex: invalidation failed", "layer", j, "keys", keys, "error", err)
+		c.invalidateLayer(ictx, j, keys)
+	}
+}
+
+func (c *Cache[T]) invalidateLayer(ctx context.Context, j int, keys []string) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.opts.logger.ErrorContext(ctx, "cachex: panic during invalidation", "layer", j, "keys", keys, "panic", r)
 		}
+	}()
+	if err := c.layers[j].backend.DelMany(ctx, keys); err != nil {
+		c.opts.logger.WarnContext(ctx, "cachex: invalidation failed", "layer", j, "keys", keys, "error", err)
 	}
 }
