@@ -212,3 +212,9 @@ func TestTwoInstancesDoNotBackfillAnOldValue(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "v2", e.Value, "b's write stands in Redis")
 }
+
+func TestAKeyPrefixInTheLeasesNamespaceIsRejected(t *testing.T) {
+	_, client := newRedis(t)
+	assert.Panics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "cachex-lease:x:"}) })
+	assert.NotPanics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "app:cachex-lease:"}) })
+}

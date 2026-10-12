@@ -2,6 +2,7 @@ package gormcachex
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -20,6 +21,26 @@ func testLeases(t *testing.T, newB func(t *testing.T, chunkSize int) *Backend[st
 		cachextest.TestLeaser(t, func(t *testing.T) cachex.Backend[string] { return newB(t, 2) }, "v")
 	})
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] { return newB(t, 0) }, strs)
+	t.Run("statements keep working once PostgreSQL plans them generically", func(t *testing.T) {
+		// a prepared statement gets a generic plan from its 6th run, which
+		// some statements (ON CONFLICT on a partial index, say) fail under
+		ctx := context.Background()
+		b := newB(t, 0)
+		l := b.Leaser()
+		e := cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}
+		for i := range 8 {
+			keys := []string{fmt.Sprint("a", i), fmt.Sprint("b", i)}
+			tokens, err := l.Lease(ctx, keys, time.Minute)
+			require.NoError(t, err, "run %d", i+1)
+			require.Len(t, tokens, 2, "run %d", i+1)
+			require.NoError(t, l.PutLeased(ctx, tokens, map[string]cachex.Entry[string]{keys[0]: e}), "run %d", i+1)
+			tokens, err = l.Lease(ctx, keys, time.Minute)
+			require.NoError(t, err, "run %d", i+1)
+			require.NoError(t, l.Release(ctx, tokens), "run %d", i+1)
+			require.NoError(t, b.SetMany(ctx, map[string]cachex.Entry[string]{keys[0]: e, keys[1]: e}), "run %d", i+1)
+			require.NoError(t, b.DelMany(ctx, keys), "run %d", i+1)
+		}
+	})
 	t.Run("a lease of a missing key is not a row a read sees", func(t *testing.T) {
 		ctx := context.Background()
 		b := newB(t, 0)

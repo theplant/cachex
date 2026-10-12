@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -26,7 +27,8 @@ type Config[T any] struct {
 	// Client is the Redis client. Required.
 	Client redis.UniversalClient
 	// KeyPrefix is prepended to every key, so that one Redis can hold several
-	// caches. Change it when the value type changes incompatibly: JSON
+	// caches. It must not start with "cachex-lease:", which the keys of leases
+	// (see Leases) start with. Change it when the value type changes incompatibly: JSON
 	// decodes leniently, so a renamed field reads back as a zero value rather
 	// than failing.
 	KeyPrefix string
@@ -50,6 +52,9 @@ type Config[T any] struct {
 func New[T any](cfg Config[T]) cachex.Backend[T] {
 	if cfg.Client == nil {
 		panic("rediscachex: Client is required")
+	}
+	if strings.HasPrefix(cfg.KeyPrefix, leasePrefix) {
+		panic("rediscachex: KeyPrefix must not start with " + leasePrefix + ", where the keys of leases are")
 	}
 	b := &byteBackend{client: cfg.Client, prefix: cfg.KeyPrefix, chunkSize: cfg.ChunkSize, leases: cfg.Leases}
 	if b.chunkSize <= 0 {
