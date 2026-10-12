@@ -198,6 +198,20 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 - PostgreSQL 上的 `UPDATE`、`DELETE` 和删除一样，先按字节序锁行（`inLockOrder`）。`CASE` 的值在 PostgreSQL 上要写成 `?::bytea`、`?::timestamptz`，否则会被当成 text。
 - **两个 GORM 的坑**：只有一个元素的 `clause.Or` 放进 `clause.And` 时，会渲染成 `… OR (…)`，等于把条件变成了「或」，所以单个 key 时直接用那个条件；`clause.Expr` 里紧跟 `(` 的 `?` 会把切片参数（包括 `[]byte`）展开成列表，所以类型转换不能写成 `CAST(? AS bytea)`。
 
+## gobuscachex
+
+只有失效广播的传输，不存条目：`NewBroadcast` 返回一个基于 go-bus（github.com/qor5/go-bus，PostgreSQL 上的发布订阅）的 `cachex.Broadcast`，给没有 Redis 的部署用。机制见 [consistency.md](consistency.md#失效广播)。
+
+- **主题**默认 `cachex.invalidate`；几份缓存共用一个 go-bus 时，各给各的（只能是小写、用点分隔）。
+- **每次 `Listen` 订阅一个自己的队列**（`cachex-` 加随机后缀），带 TTL（默认 1 分钟）和自动清空，订阅成功就调用 `ready`；`ctx` 结束时停掉消费者、退订（go-bus 的退订是软删除）。
+- **心跳**：go-bus 提供 `Heartbeat`，但要使用者自己定期调用，这里每 TTL 的三分之一调一次。订阅过期后 go-bus 不再往它的队列投递，`Heartbeat` 返回 `ErrSubscriptionNotFound`：这时可能漏了消息，就重新订阅，再调用一次 `ready`，`Cache` 清空本地层。数据库暂时连不上导致的心跳失败只记 WARN，下次再试，订阅在 TTL 内仍然有效。过期按数据库的 `NOW()` 判断，不受实例之间的时钟偏差影响。消费者自己停下（比如数据库出错）时也重新订阅。
+- **消息不会因为断线而丢**：实例慢了或者短暂断开，消息留在它的队列里；只有订阅过期才会丢，上面已经兜住。
+- **延迟取决于轮询**：消费者按 `WorkerConfig.MaxLockPerSecond` 轮询数据库，消息大约在一个轮询间隔内到达。go-bus 并发执行处理函数，这里加锁，一次只交给 `Cache` 一条。
+- 载荷是 `[]byte`，go-bus 把它编成 base64 的 JSON 字符串；解不开的消息直接销毁，不重试。
+- 在 PostgreSQL 16 容器上跑 `TestBroadcast`、订阅过期后续订、两个实例的端到端测试；没有 Docker 时跳过。
+
+依赖 go-bus 时要注意：go-bus v0.1.2 的 go.mod 要求被撤回的 `go-sqlite3 v2.0.3+incompatible`，Go 会按版本号选中它，把每个依赖 cachex、自己也用 go-sqlite3 的项目降级到 2020 年的版本。所以这里依赖的是修好之后的提交（qor5/go-bus#36），go-bus 发版后换成正式版本（见 [todo](../todo.md)）。
+
 ## cachextest
 
 - `Map[T]`：基于 `sync.Map`、没有容量上限、从不清理的 `Backend`，只用于测试。它是本地层（实现 `LocalBackend`）。

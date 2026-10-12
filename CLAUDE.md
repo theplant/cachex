@@ -1,6 +1,6 @@
 # cachex
 
-Go 泛型多层读穿缓存（module `github.com/theplant/cachex/v2`）：一个 Cache 管从上到下的若干层和一个数据源，合并回源、二次检查、不存在记录、返回陈旧值、抖动、寿命上限、批量读写、写入顺序保证；后端在子包里：`ottercachex`、`bigcachex`、`rediscachex`、`gormcachex`。
+Go 泛型多层读穿缓存（module `github.com/theplant/cachex/v2`）：一个 Cache 管从上到下的若干层和一个数据源，合并回源、二次检查、不存在记录、返回陈旧值、抖动、寿命上限、批量读写、写入顺序保证；后端在子包里：`ottercachex`、`bigcachex`、`rediscachex`、`gormcachex`；失效广播的传输在 `rediscachex` 和 `gobuscachex`。
 
 ## 先读什么
 
@@ -16,7 +16,7 @@ Go 泛型多层读穿缓存（module `github.com/theplant/cachex/v2`）：一个
 ## 仓库布局
 
 - 根目录是核心包 `cachex`，只依赖标准库：`cache.go`（`Cache`、`New`、选项、`Close`）、`layer.go`（层、`Layer.place` 决定一层为一个回答存什么、`Cache.answer`）、`read.go`（`Get`/`GetMany`、回源、回填、后台刷新；`fetchChunks` 按段认领，一段开始时才认领，见 ADR 0018；在途回源的结果里，不存在就是 `ErrNotFound` 本身、失败一律包过一层，所以按同一性判断不存在，数据源的错误只在 `askSource*` 分类一次；`claimed.settle` 按「发布、回填、注销」收尾，`claimed.run` 管 panic 和 Goexit）、`write.go`（`Set`/`Del`/`SetMany`/`DelMany`、失败后的失效）、`guard.go`（写入顺序守卫：对分片的全部用法，读写路径不直接碰分片）、`types.go`（接口、`ErrNotFound`、`ErrUnsupportedKey`、`BatchError`、`NewBatchError`、`Batched`）、`codec.go`（`Codec` 和内置的编解码器）、`bytes.go`（`ByteBackend`、`ByteEntry`、`Encoded`，以及只有 `Encoded` 用的私有条目编码）、`broadcast.go`（失效广播：`Broadcast`、`WithBroadcast`、`LocalBackend`、消息编码、监听；收到消息和重新订阅时的失效在 `guard.go`）、`lease.go`（租约：`Leaser`/`Leasing` 及字节版、`Encoded` 的转发，以及读路径里领、用、释放租约的部分）。
-- 后端子包：`ottercachex`、`bigcachex`、`rediscachex`、`gormcachex`；字节后端（`bigcachex`、`rediscachex`、`gormcachex`）只实现私有的 `ByteBackend`，`New` 返回 `cachex.Encoded` 包好的后端（`gormcachex` 外面再包一层带 `Migrate` 的 `*Backend[T]`）。`cachextest` 是测试用的内存后端（`Map` 是本地层；`NewLeasingMap` 是打开了租约的共享层，几个 `Cache` 共用它就是多个实例）、内存里的广播 `NewBus`、时钟和契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser`、`TestBroadcast`：每个后端都要过前两个，支持租约的还要过 `TestLeaser`，广播的传输要过 `TestBroadcast`。
+- 后端子包：`ottercachex`、`bigcachex`、`rediscachex`、`gormcachex`；`gobuscachex` 只有失效广播的 go-bus 传输（它的容器测试和 gormcachex 一样用 testcontainers 起 PostgreSQL）；字节后端（`bigcachex`、`rediscachex`、`gormcachex`）只实现私有的 `ByteBackend`，`New` 返回 `cachex.Encoded` 包好的后端（`gormcachex` 外面再包一层带 `Migrate` 的 `*Backend[T]`）。`cachextest` 是测试用的内存后端（`Map` 是本地层；`NewLeasingMap` 是打开了租约的共享层，几个 `Cache` 共用它就是多个实例）、内存里的广播 `NewBus`、时钟和契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser`、`TestBroadcast`：每个后端都要过前两个，支持租约的还要过 `TestLeaser`，广播的传输要过 `TestBroadcast`。
 - `internal/flight`（合并回源的登记表：`Claim`、只生效一次的 `Publish`、`Forget`、`Drop`）、`internal/stripe`（分片锁）：通用部件，暂不公开。
 - 核心的测试是外部测试包 `cachex_test`，只通过公开接口测；`export_test.go` 只暴露三样：分片编号（`StripeIndex`，给基准测试）、`Settle`（等后台工作结束，给读完马上查后端的测试）和 `SourceWaiters`（有几个回源在等别人问数据源）。测试替身用 `helpers_test.go` 的 `hooked`（单 key 和批量调用共用一个钩子），不要再为每个测试单写一个包装后端。`gormcachex` 的容器测试用 testcontainers 在 MySQL 和 PostgreSQL 上跑，没有 Docker 时自动跳过。
 - `tools/bench/<日期-主题>/`：实测的复跑脚本，带 `bench` build tag，平时的 `go test ./...` 不会运行。

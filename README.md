@@ -132,7 +132,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
     rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
 ```
 
-It uses Redis Pub/Sub (Redis Cluster too). Messages published while an instance is disconnected are lost, so each time it subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
+It uses Redis Pub/Sub (Redis Cluster too); without Redis, `gobuscachex.NewBroadcast` does the same over go-bus, on PostgreSQL, with messages polled from a queue per instance. Messages published while an instance is disconnected are lost, so each time it subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
 
 ## Options
 
@@ -157,6 +157,7 @@ It uses Redis Pub/Sub (Redis Cluster too). Messages published while an instance 
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
 | `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys; `Leases` for a Redis several instances share; `NewBroadcast` for the invalidation broadcast |
 | `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL 8.0.17+ only; see Pitfalls for keys, isolation and expired rows; `Leases` for a table several instances share |
+| `gobuscachex` | nothing: the invalidation broadcast over go-bus | For deployments without Redis; each instance subscribes a queue of its own, kept alive by heartbeats |
 | `cachextest` | values in memory, unbounded | For tests only, with `Clock`, `NewLeasingMap` (a shared map with leases, for Caches standing for instances), `NewBus` (an in-memory broadcast that can lose messages), and `TestBackend`, `TestByteBackend`, `TestLeaser` and `TestBroadcast`, contract tests for your own backends and transports |
 
 `rediscachex.New` and `bigcachex.New` return a `cachex.Backend[T]`; `gormcachex.New` returns a `*gormcachex.Backend[T]`, which is one and adds `Migrate`.
