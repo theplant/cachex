@@ -5,7 +5,7 @@
 实现分两部分（为什么不用 `golang.org/x/sync/singleflight`，见 [ADR 0001](../adr/0001-own-flight-group.md)）：
 
 - `internal/flight`：通用的登记表 `flight.Group`，只管「认领、发布、注销、摘除」；「恰好发布一次」由它保证：`Publish` 对同一个在途回源只生效一次；
-- `read.go` 里的 `claimed`：一次回源领头的那些在途回源。`settle` 按「发布、回填、注销」的顺序收尾，`run` 保证 panic 和 Goexit 时也给每个等待方发布结果（见下文「panic 与 Goexit」）。
+- `read.go` 里的 `claimed`：一次回源领头的那些在途回源。`settle` 按「发布、回填、注销」的顺序收尾（发布拿着回填锁，第一层可能有更旧的条目时先回填再发布），`run` 保证 panic 和 Goexit 时也给每个等待方发布结果（见下文「panic 与 Goexit」）。
 
 `internal/flight` 是内部包，暂不对外公开，以后有别的库需要时再考虑挪出去。
 
