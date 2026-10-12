@@ -50,7 +50,7 @@ func NewLayer[T any](backend Backend[T], opts ...LayerOption) Layer[T]
 
 - **一个 `Cache` 管所有层**：`layers[0]` 最快、最先读，最后才是数据源。一个 key 只有一个在途回源、一套分片锁，见 [ADR 0012](adr/0012-one-cache-over-layers.md)。
 - **条目由 `Cache` 计算**：用户类型只出现在 `T` 里；每层的新鲜期、陈旧期、不存在记录的寿命在 `NewLayer` 上配置，后端只负责存。
-- **后端拆在子包里**：`ottercachex`（内存）、`bigcachex`（按字节存的内存）、`rediscachex`、`gormcachex`；失效广播的传输在 `rediscachex`（Redis Pub/Sub）和 `gobuscachex`（go-bus，基于 PostgreSQL）；测试用的 `cachextest`。见 [backends.md](design/backends.md)。
+- **后端拆在子包里**：`ottercachex`（内存）、`bigcachex`（按字节存的内存）、`rediscachex`、`gormcachex`；失效广播的传输在 `rediscachex`（Redis Pub/Sub）和 `gobuscachex`（go-bus，基于 PostgreSQL）；`goquecachex` 把 gormcachex 的清理做成 go-que 上的单例定时任务；测试用的 `cachextest`。见 [backends.md](design/backends.md)。
 - **多个实例之间可以打开失效广播**：`WithBroadcast` 把写过的 key 发给其他实例，它们只从本地层（后端实现了 `LocalBackend`）删掉，经过写入顺序守卫；每次订阅成功就清空本地层，兜住丢掉的消息。见 [consistency.md](design/consistency.md#失效广播)、[ADR 0023](adr/0023-invalidation-broadcast.md)。
 - **共享层可以打开租约**：后端可选实现 `Leasing`（字节后端实现 `ByteLeasing`，由 `Encoded` 转发），一层未命中后领租约，写入作废它，回填只写还持有令牌的层，这样别的实例写入之后，旧值不会被回填进共享层。见 [consistency.md](design/consistency.md#租约lease)、[ADR 0020](adr/0020-leases-on-shared-layers.md)。
 - **字节后端统一经 `Encoded`**：`bigcachex`、`rediscachex`、`gormcachex` 只实现 `ByteBackend`；条目的编码、解码失败当未命中、不写已经腐烂的条目，都只在 `Encoded` 里写一次，见 [ADR 0015](adr/0015-byte-backends-through-encoded.md)。

@@ -191,7 +191,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 
 - **每批两条语句，各自提交**：先读出至多 `ChunkSize` 个腐烂的 key（不加锁，走 `expires_at` 索引），再删除它们；删除时再核对一次仍然腐烂，两步之间刚被写入、变新鲜的行不会被误删。删除的加锁顺序和写入一致（PostgreSQL 上先按字节序锁行），不会和写入死锁。没有用事务加 `SKIP LOCKED`：MySQL 不允许在 `DELETE` 的子查询里用 `LIMIT`、也不能读写同一张表，硬做就要一个跨两条语句持锁的事务。
 - **打开了租约时，不删还有有效租约的行**：那个 key 正在回源，持有者马上会回填它；删了的话回填找不到行，白回源一次。没开租约的表可能没有租约那两列，所以只在打开租约时加这个条件。
-- **谁来跑、多久跑一次交给应用**：同时跑几个是安全的，只是浪费。PostgreSQL 上可以用 `quecachex.StartCleanup` 让一个实例定时跑它（见下文）。
+- **谁来跑、多久跑一次交给应用**：同时跑几个是安全的，只是浪费。PostgreSQL 上可以用 `goquecachex.StartCleanup` 让一个实例定时跑它（见下文）。
 - `ctx` 结束就停在批与批之间，返回已经删掉的数量。
 
 ### 租约（`Leases`）
@@ -220,6 +220,17 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 - 在 PostgreSQL 16 容器上跑 `TestBroadcast`、订阅过期后续订、两个实例的端到端测试；没有 Docker 时跳过。
 
 依赖 go-bus 时要注意：go-bus v0.1.2 的 go.mod 要求被撤回的 `go-sqlite3 v2.0.3+incompatible`，Go 会按版本号选中它，把每个依赖 cachex、自己也用 go-sqlite3 的项目降级到 2020 年的版本。所以这里依赖的是修好之后的提交（qor5/go-bus#36），go-bus 发版后换成正式版本（见 [todo](../todo.md)）。
+
+## goquecachex
+
+把 gormcachex 的 `DeleteExpired`（或者任何有这个方法的后端）做成 go-que（github.com/qor5/go-que）上的定时任务：`StartCleanup` 在每个实例上调用，同一时刻只有一个实例在跑。go-que 的队列只支持 PostgreSQL，被清理的表可以在别的数据库（比如 MySQL）。
+
+- **一条自我续期的链**：任务带固定的 `UniqueID`（`cachex-cleanup:` 加 `Name`），生命周期是 `que.Lockable`，队列里同一时刻最多一个；每个实例启动时都入队一次，重复入队报 `ErrViolateUniqueConstraint`，忽略。每个实例都起一个 worker 抢它，只有一个能锁住。
+- **每次运行在同一个事务里 `Destroy` 自己、入队下一次**（`RunAt` 是现在加 `Interval`，默认 1 小时）。
+- **清理失败不算任务失败**：记 ERROR 日志，下一次提前到 `min(间隔, 1 分钟)` 之后。只有「`Destroy` 并入队下一次」这个事务失败（数据库暂时连不上）才返回错误，交给 go-que 按重试策略重试。
+- **链断了也能自己接上**：go-que 在重试次数用完时会 `Expire` 任务，链就断了。每个实例每隔 `Interval` 再入队一次种子任务，链还在时撞上唯一约束、什么也不做，断了就从这里接上，不用等重启。
+- 每个 `Name` 一个队列，几张表各跑各的。`Stop` 停掉本实例的 worker，任务留在队列里给其他实例。
+- 在 PostgreSQL 16 容器上测过：4 个实例同时跑时从不重叠、清理失败会再试、重启后接上、任务被删掉后重新入队、两张表互不干扰；去掉唯一约束或者去掉定期入队，对应的测试都会失败。
 
 ## cachextest
 

@@ -156,6 +156,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 | `bigcachex` | 内存里编码后的条目 | 数百万条目、GC 在 profile 里显眼时使用；每次读取都要解码 |
 | `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline；多个实例共用时打开 `Leases`；`NewBroadcast` 提供失效广播 |
 | `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 只支持 8.0.17 及以上；key、隔离级别、过期的行见注意事项；多个实例共用时打开 `Leases` |
+| `goquecachex` | 不存条目：把 `gormcachex` 的清理做成 go-que 任务 | 队列需要 PostgreSQL（被清理的表可以在别处）；每个实例都调用 `StartCleanup`，同一时刻只有一个实例在跑 `DeleteExpired` |
 | `gobuscachex` | 不存条目：用 go-bus 做失效广播 | 只支持 PostgreSQL；给有 PostgreSQL、没有 Redis 的部署用；每个实例订阅自己的队列，靠心跳续命 |
 | `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`、`NewLeasingMap`（打开了租约的共享 map，几个代表不同实例的 `Cache` 共用它）、`NewBus`（内存里的失效广播，可以模拟丢消息），以及给自写后端和传输用的契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser`、`TestBroadcast` |
 
@@ -198,7 +199,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 - **值的类型有不兼容的改动，却不换 `KeyPrefix`。** JSON 解码很宽松：改了名的字段会读成零值。改类型时一起换 `KeyPrefix`。
 - **`ottercachex` 没设上限。** `New` 会失败：设置 `MaximumSize`，或者 `MaximumWeight` 加 `Weigher`。
 - **`bigcachex` 的 `LifeWindow` 比层的 TTL 短。** 条目会提前消失。只在内存层有数百万条、profile 里 GC 明显时才用它；每次读取都要解码。
-- **`gormcachex` 不调 `Migrate`，或者 MySQL 表不是 `utf8mb4_0900_bin`。** `Migrate` 会建表，并拒绝 key 列用其他任何排序规则的已有 MySQL 表。key 连同 `KeyPrefix` 最长 255 个字符，必须是合法的 UTF-8、不含 NUL；别的 key 总是未命中，写入失败。过期的行不会自动删除：定期调用 `DeleteExpired`（`quecachex.StartCleanup` 让一个实例定时跑它，需要 PostgreSQL）。只支持各数据库默认的隔离级别。
+- **`gormcachex` 不调 `Migrate`，或者 MySQL 表不是 `utf8mb4_0900_bin`。** `Migrate` 会建表，并拒绝 key 列用其他任何排序规则的已有 MySQL 表。key 连同 `KeyPrefix` 最长 255 个字符，必须是合法的 UTF-8、不含 NUL；别的 key 总是未命中，写入失败。过期的行不会自动删除：定期调用 `DeleteExpired`（`goquecachex.StartCleanup` 让一个实例定时跑它，需要 PostgreSQL）。只支持各数据库默认的隔离级别。
 - **在修改数据源的事务里调用 `Set`/`Del`。** `gormcachex` 从不加入事务：每条语句独立提交，事务回滚不会撤销缓存的写入。在提交之后再调用。
 - **`cachextest.Clock` 远远落后于真实时钟，后端又会让条目过期。** 不管 `WithNow` 怎么设，后端都按真实时钟让条目过期，所以按这个时钟算出的条目会被当场丢掉，每次读取都未命中。让时钟从 `time.Now()` 开始，或者用 `cachextest.Map`。
 
