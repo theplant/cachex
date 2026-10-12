@@ -734,10 +734,14 @@ func (c *Cache[T]) supersede(f *fill[T]) {
 //     publish after it lands (see publishesEarly), and leaves a layer that
 //     holds a newer one alone (one holding the same is written again: its
 //     place there may be fresher now);
-//   - a fill that holds no lease on a layer that leases (another fetch has it,
-//     maybe this process's refresh, which may land an older answer) may not
-//     write there, so it deletes an older entry it finds there: a delete
-//     never brings back an old value.
+//   - a fill refused the lease of a layer that leases while this process
+//     refreshes the key (its refresh may hold it, and land an older answer
+//     than this one, which a read may return) may not write there, so it
+//     deletes an older, unrotten entry it finds there: a delete never brings
+//     back an old value. Refused by another instance, it leaves the layer
+//     alone: deleting there would empty the shared layer after every
+//     contended miss (the holder's answer is usually the earlier one), and
+//     across instances ADR 0022 promises nothing anyway.
 //
 // An answer of the source needs no read otherwise: the source is asked once
 // at a time (see askSource), so no newer answer landed, and only the holder
@@ -747,13 +751,14 @@ func (c *Cache[T]) land(ctx context.Context, origin int, fills []fill[T], idxs [
 	copied := origin < len(c.layers)
 	leasing := func(j int) bool { return c.leasers != nil && c.leasers[j] != nil }
 	held := func(i, j int) bool { l := fills[i].leases; return l != nil && l.tokens[j] != "" }
+	ownRefreshHolds := func(i int) bool { l := fills[i].leases; return l != nil && l.byOwn }
 	found := make([]map[string]Entry[T], origin)
 	var keys []string
 	for j := origin - 1; j >= 0; j-- {
 		read := copied
 		if !read && leasing(j) {
 			for _, i := range idxs {
-				read = read || !held(i, j)
+				read = read || !held(i, j) && ownRefreshHolds(i)
 			}
 		}
 		if !read {
@@ -793,7 +798,7 @@ func (c *Cache[T]) land(ctx context.Context, origin int, fills []fill[T], idxs [
 					skip = map[string]error{}
 				}
 				skip[key] = nil // it holds a newer answer; a lease held is released after the fetch
-			case leasing(j) && !held(i, j) && (!copied || e.CachedAt.Before(a.CachedAt)):
+			case leasing(j) && !held(i, j) && ownRefreshHolds(i) && e.state(now) != rotten && (!copied || e.CachedAt.Before(a.CachedAt)):
 				stale = append(stale, key) // older (for a source's answer, another one of the same instant too)
 			}
 		}

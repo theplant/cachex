@@ -143,6 +143,9 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 			k.leases.tokens[li] = token
 		} else if kerr := errForKey(err, p.keys[i]); kerr == nil {
 			k.leases.refused = true // another instance holds it; a key that failed is not refused
+			if !p.refresh {
+				_, k.leases.byOwn = c.refreshing.Load(p.keys[i]) // a refresh registers before it leases
+			}
 		} else if !errors.Is(kerr, ErrUnsupportedKey) { // a key the layer cannot store just misses there
 			warn = true
 		}
@@ -159,6 +162,7 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 type keyLeases struct {
 	tokens  []string
 	refused bool
+	byOwn   bool // refused while this process refreshes the key: its refresh may hold the lease (see land)
 }
 
 // skipLeased answers, for a refresh, the flights idxs that another instance
