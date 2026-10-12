@@ -98,7 +98,7 @@ func (b *broadcast) Listen(ctx context.Context, ready func(), deliver func(msg [
 		mu.Lock()
 		deliver(msg)
 		mu.Unlock()
-		return in.Done(ctx)
+		return in.Destroy(ctx) // Done would keep the row for good
 	}
 	backoff := 100 * time.Millisecond
 	for {
@@ -123,7 +123,7 @@ func (b *broadcast) subscribe(ctx context.Context, ready func(), handler bus.Han
 	_, _ = rand.Read(id[:])
 	name := hex.EncodeToString(id[:])
 	q := b.cfg.Bus.Queue("cachex-" + name)
-	probe := b.cfg.Subject + ".probe-" + name
+	probe := "cachex.probe." + name // short: go-bus bounds a subject's tokens and length
 	var subs []bus.Subscription
 	defer func() { // not under ctx, which may be over
 		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -145,7 +145,7 @@ func (b *broadcast) subscribe(ctx context.Context, ready func(), handler bus.Han
 	handler = func(ctx context.Context, in *bus.Inbound) error {
 		if in.Subject == probe {
 			probed.Store(time.Now().UnixNano())
-			return in.Done(ctx)
+			return in.Destroy(ctx)
 		}
 		return inner(ctx, in)
 	}

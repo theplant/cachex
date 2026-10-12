@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -165,4 +166,48 @@ func TestDeliveriesResumeAfterADroppedConnection(t *testing.T) {
 			return false
 		}
 	}, 40*time.Second, 10*time.Millisecond, "deliveries resumed")
+}
+
+func TestNothingIsLeftInTheQueueTable(t *testing.T) {
+	// go-que's Done keeps a job's row; nothing would ever remove the rows of
+	// messages and probes
+	b, db := newBus(t)
+	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.left", TTL: 600 * time.Millisecond, WorkerConfig: fast}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{}, 16)
+	got := make(chan []byte, 16)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = NewBroadcast(cfg).Listen(ctx, func() { ready <- struct{}{} }, func(m []byte) { got <- m })
+	}()
+	waitFor(t, ready)
+	for range 3 {
+		require.NoError(t, NewBroadcast(cfg).Publish(ctx, []byte("m")))
+		<-got
+	}
+	time.Sleep(time.Second) // ponytail: a few heartbeat ticks, each with a probe
+	cancel()
+	<-done
+	var rows int
+	require.NoError(t, db.QueryRow("SELECT count(*) FROM goque_jobs").Scan(&rows))
+	assert.Zero(t, rows, "messages and probes are destroyed once handled, the rest drained")
+}
+
+func TestALongSubjectStillSubscribes(t *testing.T) {
+	// go-bus allows 16 tokens and 255 characters: the probe's subject must not
+	// build on the configured one
+	b, _ := newBus(t)
+	for _, subject := range []string{
+		strings.TrimSuffix(strings.Repeat("a.", 16), "."),
+		strings.TrimSuffix(strings.Repeat(strings.Repeat("a", 59)+".", 4), "."),
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		ready := make(chan struct{}, 1)
+		go func() {
+			_ = NewBroadcast(BroadcastConfig{Bus: b, Subject: subject, WorkerConfig: fast}).Listen(ctx, func() { ready <- struct{}{} }, func([]byte) {})
+		}()
+		waitFor(t, ready)
+		cancel()
+	}
 }
