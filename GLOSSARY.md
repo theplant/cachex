@@ -190,5 +190,8 @@ key 里一个 `{`、后面某处一个 `}`、中间不为空的那一段；Redis
 **不支持的 key（unsupported key，`ErrUnsupportedKey`）**：
 含 `}` 却没有 hash tag 的 key。它没法和自己的租约落在同一个 slot，所以 `Cache` 不管有哪些层都拒绝它。
 
-**失效广播（invalidation broadcast）**：
-（尚未实现）一个实例写入后通知其他实例失效各自内存层的做法。
+**失效广播（invalidation broadcast，`Broadcast`、`WithBroadcast`）**：
+一个实例写入后，把写过的 key 发给其他实例，让它们从各自的本地层里删掉。可选功能，传输可插拔。
+
+**本地层（local layer，`LocalBackend`）**：
+后端只存在本进程里的层（内存层）。失效广播只作用于它，重新订阅时把它整个清空；共享层由写入方自己写，广播从不碰它。

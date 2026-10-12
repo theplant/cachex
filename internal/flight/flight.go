@@ -97,3 +97,13 @@ func (g *Group[K, T]) Drop(keys ...K) {
 		s.mu.Unlock()
 	}
 }
+
+// DropAll is Drop for every key.
+func (g *Group[K, T]) DropAll() {
+	for i := range g.shards {
+		s := &g.shards[i]
+		s.mu.Lock()
+		clear(s.flights)
+		s.mu.Unlock()
+	}
+}

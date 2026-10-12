@@ -23,3 +23,10 @@ func TestLocality(t *testing.T) {
 	assert.False(t, local, "a leasing Map stands for a layer instances share")
 	cachextest.TestBackend(t, func(*testing.T) cachex.Backend[string] { return cachextest.NewMap[string]() }, []string{"v", "", "w"})
 }
+
+func TestBus(t *testing.T) {
+	cachextest.TestBroadcast(t, func(*testing.T) (cachex.Broadcast, cachex.Broadcast) {
+		bus := cachextest.NewBus()
+		return bus.Broadcast(), bus.Broadcast()
+	})
+}

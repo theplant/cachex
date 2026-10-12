@@ -194,3 +194,53 @@ func (c *Cache[T]) beginFills(fills []fill[T]) (ok []int, end func()) {
 		}
 	}
 }
+
+// invalidateLocal drops keys, written on another instance, from the local
+// layers as a write of them would: holding their stripes, and counting a
+// write, so that a fetch of them that started before does not backfill its
+// answer after. If the stripes stay busy past the fetch timeout, the keys are
+// dropped from every layer once each is free (see lockWrites).
+func (c *Cache[T]) invalidateLocal(keys []string) {
+	keys = slices.DeleteFunc(uniqueKeys(keys), func(key string) bool { return !supportedKey(key) })
+	if len(keys) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.opts.fetchTimeout)
+	defer cancel()
+	unlock, err := c.lockWrites(ctx, keys)
+	if err != nil {
+		c.opts.logger.WarnContext(ctx, "cachex: broadcast invalidation waited too long", "error", err)
+		return
+	}
+	defer unlock()
+	for _, j := range c.local {
+		if err := c.layers[j].backend.DelMany(ctx, keys); err != nil {
+			c.opts.logger.WarnContext(ctx, "cachex: broadcast invalidation failed", "layer", j, "error", err)
+		}
+	}
+}
+
+// clearLocal clears the local layers, holding every stripe meanwhile and
+// counting a write on each, so that no fetch that started before lands its
+// backfill after; and drops every flight, so that reads from now on fetch
+// anew. Writes wait for it; reads do not.
+func (c *Cache[T]) clearLocal() {
+	ctx := context.Background()
+	for i := range stripe.Count {
+		_ = c.stripes.At(i).Lock(ctx, func() {}) // a background ctx never gives up
+	}
+	cctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
+	for _, j := range c.local {
+		if err := c.layers[j].backend.(LocalBackend).Clear(cctx); err != nil {
+			c.opts.logger.ErrorContext(cctx, "cachex: clearing a local layer failed", "layer", j, "error", err)
+		}
+	}
+	cancel()
+	c.flights.DropAll()
+	c.sourcing.Clear()
+	for i := range stripe.Count {
+		s := c.stripes.At(i)
+		s.AddWrite()
+		s.Unlock()
+	}
+}

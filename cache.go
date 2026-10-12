@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -56,6 +57,11 @@ type Cache[T any] struct {
 	mu     sync.Mutex // guards closed and adding to wg
 	closed bool
 	wg     sync.WaitGroup // fetches and refreshes started before Close
+
+	local      []int    // the layers whose backend is a LocalBackend
+	sender     [16]byte // this Cache in its broadcast messages
+	stopListen context.CancelFunc
+	listening  chan struct{} // closed once the broadcast listener returns
 }
 
 // flightKey is what a flight is registered under: a key, and whether it is a
@@ -74,6 +80,7 @@ type options struct {
 	now          func() time.Time
 	maxAge       any
 	doubleCheck  DoubleCheckMode
+	broadcast    Broadcast
 }
 
 // Option configures a Cache.
@@ -134,6 +141,26 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 			panic(fmt.Sprintf("cachex: New: WithMaxAge takes a func(%T) time.Duration, got %T", *new(T), o.maxAge))
 		}
 		c.maxAge = f
+	}
+	if o.broadcast != nil {
+		for i, l := range layers {
+			if _, ok := l.backend.(LocalBackend); ok {
+				c.local = append(c.local, i)
+			}
+		}
+		if len(c.local) == 0 {
+			panic("cachex: New: WithBroadcast needs a layer whose backend is a LocalBackend")
+		}
+		for i := range c.sender {
+			c.sender[i] = byte(rand.Uint32())
+		}
+		var ctx context.Context
+		ctx, c.stopListen = context.WithCancel(context.Background())
+		c.listening = make(chan struct{})
+		go func() {
+			defer close(c.listening)
+			c.listen(ctx)
+		}()
 	}
 	return c
 }
@@ -212,12 +239,16 @@ func sharedCtx(ctx context.Context) context.Context {
 	return context.WithValue(context.WithoutCancel(ctx), sharedKey{}, true)
 }
 
-// Close waits for the fetches and background refreshes in progress (and
-// their backfills) and for the invalidations of writes that gave up waiting,
-// so that the backends can be closed after it, and starts
-// no more background refreshes. It does not close the backends. The Cache
+// Close stops listening to the broadcast, if any, and waits for the fetches
+// and background refreshes in progress (and their backfills) and for the
+// invalidations of writes that gave up waiting, so that the backends can be
+// closed after it, and starts no more background refreshes. It does not close the backends. The Cache
 // still serves reads and writes.
 func (c *Cache[T]) Close() error {
+	if c.stopListen != nil {
+		c.stopListen()
+		<-c.listening
+	}
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()

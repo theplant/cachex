@@ -24,14 +24,22 @@ import (
 // from every layer once the stripe is free, since the caller may have changed
 // the source already.
 func (c *Cache[T]) Set(ctx context.Context, key string, value T) error {
-	return c.writeOne(ctx, key, &value)
+	err := c.writeOne(ctx, key, &value)
+	if c.opts.broadcast != nil {
+		c.publish(ctx, []string{key})
+	}
+	return err
 }
 
 // Del drops key from every layer, bottom up, so the next read asks the
 // source. Like Set, call it after changing the source; it records nothing
 // about whether the key exists. Failures and waiting are as for Set.
 func (c *Cache[T]) Del(ctx context.Context, key string) error {
-	return c.writeOne(ctx, key, nil)
+	err := c.writeOne(ctx, key, nil)
+	if c.opts.broadcast != nil {
+		c.publish(ctx, []string{key})
+	}
+	return err
 }
 
 // SetMany is Set for many keys, with one call per layer. A key that fails in a
@@ -39,13 +47,23 @@ func (c *Cache[T]) Del(ctx context.Context, key string) error {
 // *BatchError; the other keys are written. An error that is not a *BatchError
 // means nothing was written (ctx ended while waiting).
 func (c *Cache[T]) SetMany(ctx context.Context, values map[string]T) error {
-	return c.write(ctx, values, nil)
+	err := c.write(ctx, values, nil)
+	if c.opts.broadcast != nil {
+		c.publish(ctx, slices.Collect(maps.Keys(values)))
+	}
+	return err
 }
 
 // DelMany is Del for many keys, with one call per layer; failures are reported
 // as for SetMany.
 func (c *Cache[T]) DelMany(ctx context.Context, keys []string) error {
-	return c.write(ctx, nil, uniqueKeys(keys))
+	keys = uniqueKeys(keys)
+	if c.opts.broadcast == nil {
+		return c.write(ctx, nil, keys)
+	}
+	err := c.write(ctx, nil, slices.Clone(keys)) // write drops unsupported keys in place
+	c.publish(ctx, keys)
+	return err
 }
 
 // writeOne is write for one key (deleting it if value is nil), without the
