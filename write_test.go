@@ -624,3 +624,41 @@ func TestAGoexitInALateDropLeavesNoStripeLocked(t *testing.T) {
 	defer cancel2()
 	require.NoError(t, c.Set(wctx, "k", "3"), "k's stripe was released")
 }
+
+func TestALayerThatCallsGoexitAgainWhenDroppedKeepsNoOldValueAbove(t *testing.T) {
+	ctx := context.Background()
+	for _, many := range []bool{false, true} {
+		src := newSource(map[string]string{"k": "old"})
+		var exiting atomic.Bool
+		bottom := &hooked[string]{Backend: cachextest.NewMap[string](), hook: func(op string, _ []string, _ bool) error {
+			if op != "get" && exiting.Load() {
+				runtime.Goexit()
+			}
+			return nil
+		}}
+		top := cachextest.NewMap[string]()
+		c := cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer[string](top, cachex.TTL(time.Hour, 0)),
+			cachex.NewLayer[string](bottom, cachex.TTL(time.Hour, 0)),
+		})
+		_, err := c.Get(ctx, "k")
+		require.NoError(t, err)
+		cachex.Settle(c)
+
+		src.set("k", "new")
+		exiting.Store(true)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if many {
+				_ = c.SetMany(ctx, map[string]string{"k": "new"})
+			} else {
+				_ = c.Set(ctx, "k", "new")
+			}
+		}()
+		<-done
+		exiting.Store(false)
+		_, ok := stored(t, top, "k")
+		assert.False(t, ok, "many=%v: the layer above keeps no old value", many)
+	}
+}

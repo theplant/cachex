@@ -201,13 +201,13 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 `Config.Leases` 打开租约（默认关闭），机制见 [consistency.md](consistency.md#租约lease)。`Migrate` 总会建两列 `lease_token`、`lease_until`（可为空）；不开租约时读写都不碰它们，所以没调 `Migrate` 的旧表照样能用，开租约才需要这两列。
 
 - **领**：每段（至多 4000 个 key，SQLite 的参数上限）三条语句，各自提交，不管段多大：先给不存在的 key 插入只有租约、value 为空的行（冲突就跳过）；再用 `CASE` 把没人持有、或已经过期的租约改成这次的令牌；最后查一遍，令牌是自己的才算领到。三步之间被别人插进来，最后一步会如实反映。
-- **回填**：一条 `UPDATE`，`value`、`expires_at` 用 `CASE` 按 key 取值，条件是每个 key 的 `key = ? AND lease_token = ?`，同时把租约清空；要删除的 key 用一条同样条件的 `DELETE`。被写入删掉的行不存在，条件更新碰不到它，旧值不会让它复活。
+- **回填**：一条 `UPDATE`，`value`、`expires_at` 用 `CASE` 按 key 取值，条件是 `key IN (…) AND lease_token IN (…)`（令牌是随机的、只写在自己那个 key 的行上，所以两个 IN 等价于逐对匹配；每个 key 一项 OR 会超过 SQLite 表达式 1000 层的深度），同时把租约清空；要删除的 key 用一条同样条件的 `DELETE`。被写入删掉的行不存在，条件更新碰不到它，旧值不会让它复活。
 - **写入**：upsert 顺带把两列置空，和写值在同一条语句里；删除连行一起删掉。
 - **释放**：先删只有租约的行（`LENGTH(value) = 0`），再清空其余行的租约。
 - **读取**：跳过 value 为空的行（只有租约），不交给 `Encoded` 去解码，否则会被当成坏条目删掉。
 - **有效期按各实例自己的时钟**：`lease_until` 由领租约的实例写入，别的实例按自己的时钟判断它过没过期，时钟偏差只影响租约提前或推迟过期。
 - PostgreSQL 上的 `UPDATE`、`DELETE` 和删除一样，先按字节序锁行（`inLockOrder`）。`CASE` 的值在 PostgreSQL 上要写成 `?::bytea`、`?::timestamptz`，否则会被当成 text。
-- **两个 GORM 的坑**：只有一个元素的 `clause.Or` 放进 `clause.And` 时，会渲染成 `… OR (…)`，等于把条件变成了「或」，所以单个 key 时直接用那个条件；`clause.Expr` 里紧跟 `(` 的 `?` 会把切片参数（包括 `[]byte`）展开成列表，所以类型转换不能写成 `CAST(? AS bytea)`。
+- **两个 GORM 的坑**：只有一个元素的 `clause.Or` 放进 `clause.And` 时，会渲染成 `… OR (…)`，等于把条件变成了「或」，所以不要放单个元素的 `clause.Or`（现在的 `clause.Or` 都是两项）；`clause.Expr` 里紧跟 `(` 的 `?` 会把切片参数（包括 `[]byte`）展开成列表，所以类型转换不能写成 `CAST(? AS bytea)`。
 
 ## gobuscachex
 

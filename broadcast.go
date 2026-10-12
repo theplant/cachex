@@ -101,7 +101,7 @@ func decodeMessage(msg []byte) (sender [16]byte, keys []string, err error) {
 // listen runs the broadcast's Listen until stop, again after a failure.
 func (c *Cache[T]) listen(ctx context.Context) {
 	for {
-		err := c.opts.broadcast.Listen(ctx, c.resubscribed, c.received)
+		err := c.listenOnce(ctx)
 		if ctx.Err() != nil {
 			return
 		}
@@ -112,6 +112,24 @@ func (c *Cache[T]) listen(ctx context.Context) {
 		case <-time.After(time.Second):
 		}
 	}
+}
+
+// listenOnce runs the broadcast's Listen in a goroutine of its own, so that a
+// runtime.Goexit under it (in a local layer, say) ends that call, not the
+// listening: listen calls it again.
+func (c *Cache[T]) listenOnce(ctx context.Context) (err error) {
+	done := make(chan struct{})
+	returned := false
+	go func() {
+		defer close(done)
+		err = c.opts.broadcast.Listen(ctx, c.resubscribed, c.received)
+		returned = true
+	}()
+	<-done
+	if !returned {
+		return errors.New("cachex: broadcast listener exited without returning (runtime.Goexit)")
+	}
+	return err
 }
 
 // publish sends the keys a write changed (or tried to) to the other

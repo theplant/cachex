@@ -181,7 +181,13 @@ func (c *Cache[T]) abort(ctx context.Context, keys []string, r any) {
 func (c *Cache[T]) invalidate(ctx context.Context, keys []string, top int) {
 	ictx, cancel := context.WithTimeout(sharedCtx(ctx), c.opts.fetchTimeout)
 	defer cancel()
-	for j := top; j >= 0; j-- {
+	j := top
+	defer func() { // a layer that called runtime.Goexit: still drop from those above it
+		for j--; j >= 0; j-- {
+			c.invalidateLayer(ictx, j, keys)
+		}
+	}()
+	for ; j >= 0; j-- {
 		c.invalidateLayer(ictx, j, keys)
 	}
 }

@@ -64,7 +64,7 @@ sequenceDiagram
 | `SetMany`/`DelMany` 里某些 key 在第 j 层失败 | 只有这些 key 按上面处理，不再写它们上面的层，列在返回的 `*BatchError` 里；其余 key 照常写完 |
 | `Set`/`Del` 等分片锁时 ctx 结束 | 返回 `cachex: context done while waiting to write: …`，什么都不写。分片空出来后，从各层删掉这个 key（见下文「等写锁时尊重 ctx」） |
 | `SetMany`/`DelMany` 等某个分片时 ctx 结束 | 同上，返回的不是 `*BatchError`，什么都不写。已经拿到的分片和当场能拿到的分片上的 key，每层一次 `DelMany` 当场删掉；其余分片上的 key 各自等分片空出来后删掉 |
-| 写入时某一层 panic 或调用 `runtime.Goexit`（`WithMaxAge` 的函数 panic 也算） | 哪些层写了、哪些 key 在哪层失败都不清楚，所以把这次写入的全部 key 从**所有层**删掉，再让 panic 继续往上抛（Goexit 本来就会继续）；广播照发。删除时某一层又 panic，记 ERROR 后接着删它上面的层 |
+| 写入时某一层 panic 或调用 `runtime.Goexit`（`WithMaxAge` 的函数 panic 也算） | 哪些层写了、哪些 key 在哪层失败都不清楚，所以把这次写入的全部 key 从**所有层**删掉，再让 panic 继续往上抛（Goexit 本来就会继续）；广播照发。删除时某一层又 panic 或 Goexit，接着删它上面的层（panic 记 ERROR）。持有分片的路径都在 defer 里释放分片；监听失效广播的 goroutine 被 Goexit 结束时，会重新调用 `Listen` |
 | 回填某一层失败 | 只记 WARN `cachex: backfill failed`，其他层照写，结果照常返回给调用方 |
 
 一句话：**任何失败的写入，都不会在失败的那一层及其上面留下这个 key 的条目**。返回错误不代表什么都没写进去。失效用的是共享 ctx（去掉取消和调用方的事务），整次失效受一个 `WithFetchTimeout` 限制（见 [singleflight.md](singleflight.md#回源用的-ctx)），因为写入失败往往正是 ctx 结束导致的。失效失败只记 WARN `cachex: invalidation failed`（panic 记 ERROR，接着删上面的层）：一层既然删不掉，紧接着的失效同样删不掉。分片空出来之后才做的失效，如果在 `Close` 之前安排，`Close` 会等它完成。开了失效广播时，放弃等待的写入在返回时广播一次，分片空出来、删完各层之后**再广播一次**：第一条消息到达别的实例时，共享层可能还留着旧值，它会被复制进那个实例的内存层，只有第二条消息能把它删掉。
@@ -250,6 +250,8 @@ sequenceDiagram
 
 所以同一个分片的回填还要排队：拿到读锁、核对完写入代数之后，再拿分片的**回填锁**（每个分片一把互斥锁）。回填锁只在回填之间互斥，写入不碰它，所以回填仍然从不等写入。拿着它的时候，**从下层复制上来的**条目先读一次目标层：目标层已有的条目 `CachedAt` 更晚（来自数据源更晚的回答），就不写这一层。
 
+回填写各层之前、以及写完还拿着回填锁时，还要摘掉这个 key 上**别的**读取回源（`supersede`）：它们已经发布的答案可能比正要落下的旧，第一层的新条目被淘汰之后，后来的读加入它们就会倒退（见 [singleflight.md](singleflight.md#发布与注销)）。
+
 数据源的回答回填时不用读：同一个 key 同时只问一次数据源（见 [singleflight.md](singleflight.md#一个-key-同时只问一次数据源)），而且下一次要等上一次回填完才开始，所以不会有更新的回答在它之前落下。打开了租约的层也不用读：只有持有租约的回源能写它。
 
 ## 批量为什么不会死锁
@@ -270,7 +272,7 @@ flowchart TD
     c -- 锁 --> ok2([拿到锁])
     c -- ctx 结束 --> d([返回 ctx 错误，什么都不写])
     d -.-> e[后台 goroutine 之后拿到锁]
-    e -.-> f[收尾：从各层删掉这些 key、写入代数 +1、摘除在途回源]
+    e -.-> f[收尾：从各层删掉这些 key、摘除在途回源、写入代数 +1]
     f -.-> g[释放锁]
 ```
 

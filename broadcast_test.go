@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -344,4 +345,56 @@ func TestALocalLayerThatPanicsInAnInvalidationLeavesNoStripeLocked(t *testing.T)
 	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	require.NoError(t, r.Set(wctx, b.Load().(string), "y"), "b's stripe was released")
+}
+
+// goexitClear is a local map whose Clear calls runtime.Goexit once when armed.
+type goexitClear struct {
+	*cachextest.Map[string]
+	exit    atomic.Bool
+	cleared chan struct{}
+}
+
+func (g *goexitClear) Clear(ctx context.Context) error {
+	if g.exit.CompareAndSwap(true, false) {
+		defer close(g.cleared)
+		runtime.Goexit()
+	}
+	return g.Map.Clear(ctx)
+}
+
+func TestAGoexitUnderTheListenerDoesNotEndIt(t *testing.T) {
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v1"})
+	shared := cachextest.NewLeasingMap[string]()
+	bus := cachextest.NewBus()
+	mk := func(local cachex.Backend[string]) *cachex.Cache[string] {
+		c := cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer[string](local, cachex.TTL(time.Hour, 0)),
+			cachex.NewLayer[string](shared, cachex.TTL(time.Hour, 0)),
+		}, cachex.WithBroadcast(bus.Broadcast()))
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	bLocal := &goexitClear{Map: cachextest.NewMap[string](), cleared: make(chan struct{})}
+	a := mk(cachextest.NewMap[string]())
+	b := mk(bLocal)
+	require.Eventually(t, func() bool { return bus.Subscribed() == 2 }, 5*time.Second, time.Millisecond)
+
+	bLocal.exit.Store(true)
+	bus.Disconnect()
+	bus.Reconnect() // b's Clear calls Goexit once
+	<-bLocal.cleared
+	require.Eventually(t, func() bool { // b listens again (and clears)
+		_, err := b.Get(ctx, "k")
+		require.NoError(t, err)
+		cachex.Settle(b)
+		_, ok := stored(t, bLocal.Map, "k")
+		return ok
+	}, 5*time.Second, 5*time.Millisecond)
+	assert.Eventually(t, func() bool {
+		src.set("k", "v2")
+		require.NoError(t, a.Set(ctx, "k", "v2"))
+		_, ok := stored(t, bLocal.Map, "k")
+		return !ok
+	}, 5*time.Second, 5*time.Millisecond, "b hears a's writes again")
 }

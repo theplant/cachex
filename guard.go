@@ -153,8 +153,14 @@ func (c *Cache[T]) drop(ctx context.Context, keys []string, local bool) {
 	}
 	dctx, cancel := context.WithTimeout(sharedCtx(ctx), c.opts.fetchTimeout)
 	defer cancel()
-	for _, j := range c.local {
-		c.invalidateLayer(dctx, j, keys)
+	n := 0
+	defer func() { // a layer that called runtime.Goexit: still drop from the others
+		for n++; n < len(c.local); n++ {
+			c.invalidateLayer(dctx, c.local[n], keys)
+		}
+	}()
+	for ; n < len(c.local); n++ {
+		c.invalidateLayer(dctx, c.local[n], keys)
 	}
 }
 
@@ -276,8 +282,14 @@ func (c *Cache[T]) clearLocal() {
 	}()
 	cctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	defer cancel()
-	for _, j := range c.local {
-		c.clearLayer(cctx, j)
+	n := 0
+	defer func() { // a layer that called runtime.Goexit: still clear the others
+		for n++; n < len(c.local); n++ {
+			c.clearLayer(cctx, c.local[n])
+		}
+	}()
+	for ; n < len(c.local); n++ {
+		c.clearLayer(cctx, c.local[n])
 	}
 }
 

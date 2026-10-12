@@ -60,7 +60,7 @@ gormcachex 的容器测试偶尔启动失败（`port "3306/tcp" not found`，或
 
 - **写入先写下层、再写上层，从不写数据源；某一层失败，就删掉它和它上面各层的条目。** 不要改成从上往下写。见 [ADR 0002](docs/adr/0002-bottom-up-writes.md)。
 - **回填必须持分片读锁、核对写入代数，写入之后还要摘除在途回源。** 少任何一步，旧值都可能盖过写入。这些都在 `guard.go`（写入顺序守卫）里，不要在读写路径里绕过它直接用分片。回源按「发布、回填、注销」的顺序收尾，只在 `claimed.settle` 一处，见 [singleflight.md](docs/design/singleflight.md#发布与注销)、[ADR 0003](docs/adr/0003-striped-backfill-guard.md)。
-- **读到的值不倒退**：回填之间按分片排队（回填锁，只在回填之间互斥），从下层复制的条目不覆盖目标层里 `CachedAt` 更晚的；同一个 key 同时只问一次数据源（`sourcing`），登记在回填之后才注销，写入摘除它。不要为了省一次读把复制前的比较去掉，也不要让两次问数据源重叠。见 [ADR 0022](docs/adr/0022-reads-never-go-back.md)。
+- **读到的值不倒退**：回填之间按分片排队（回填锁，只在回填之间互斥），从下层复制的条目不覆盖目标层里 `CachedAt` 更晚的；同一个 key 同时只问一次数据源（`sourcing`），登记在回填之后才注销，写入摘除它；回填写各层之前和写完之后，各摘一次别的读取回源（`supersede`）。不要为了省一次读把复制前的比较去掉，不要让两次问数据源重叠，也不要为了那约 6% 的未命中开销去掉 `supersede`。见 [ADR 0022](docs/adr/0022-reads-never-go-back.md)。
 - **失效广播收到的 key 经写入顺序守卫删除（`invalidateLocal`），每次订阅成功都清空本地层（`clearLocal`，拿住全部分片）**：直接删后端会让更早的回源把旧值回填回来；不清空则断线期间漏掉的写入一直留着。只碰本地层（`LocalBackend`），共享层从不删、更不清空。忽略自己发出的消息。见 [ADR 0023](docs/adr/0023-invalidation-broadcast.md)。
 - **每个在途回源恰好发布一次结果**，panic 和 Goexit 也不例外：`flight.Group.Publish` 只生效一次，`claimed.run` 在 panic 或 Goexit 时给还没发布的发布错误。不要让等待方去等一个永远不会来的结果。见 [ADR 0006](docs/adr/0006-goexit-publishes-an-error.md)。
 - **刷新从不加入普通回源**，普通读取也不加入刷新（`flightKey.refresh`）；写入两种都摘除。一个 key 同时只有一次刷新，靠 `refreshing` 去重（查重不加锁，别换成认领，陈旧命中会慢）；刷新先 `track` 再认领，由这个被登记的 goroutine 回源（分段时的子 goroutine 也由它等完再注销），不能另起一个自己去登记的 goroutine，否则 `Close` 可能不等它的回填。见 [ADR 0016](docs/adr/0016-refresh-has-its-own-flights.md)。
