@@ -24,12 +24,13 @@ const leasePrefix = "cachex-lease:"
 // prefixed it is leasePrefix+"t:"+prefixed (the tag still comes first),
 // without one prefixed is wrapped in braces; the "t:" keeps "X" and "{X}"
 // apart. A key with a "}" but no hash tag has no such key; cachex.Cache
-// rejects it (see cachex.ErrUnsupportedKey).
+// rejects it (see cachex.ErrUnsupportedKey). Neither has the empty key (an
+// empty KeyPrefix and key): "{}" is not a hash tag.
 func leaseKey(prefixed string) (string, bool) {
 	if hasHashTag(prefixed) {
 		return leasePrefix + "t:" + prefixed, true
 	}
-	if strings.IndexByte(prefixed, '}') >= 0 {
+	if prefixed == "" || strings.IndexByte(prefixed, '}') >= 0 { // "{}" is no tag
 		return "", false
 	}
 	return leasePrefix + "{" + prefixed + "}", true

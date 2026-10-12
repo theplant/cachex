@@ -294,3 +294,14 @@ func TestAKeyPrefixWithAnUnclosedBraceIsRejectedWithLeases(t *testing.T) {
 		assert.Panics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: prefix, Leases: true}) }, prefix)
 	}
 }
+
+func TestTheEmptyKeyHasNoLeaseWithoutAPrefix(t *testing.T) {
+	// "cachex-lease:{}" has an empty tag: Redis Cluster would hash all of it,
+	// into another slot than the data key ""
+	_, ok := leaseKey("")
+	assert.False(t, ok)
+	_, client := newRedis(t)
+	b := New[string](Config[string]{Client: client, Leases: true})
+	err := b.Set(context.Background(), "", cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)})
+	assert.ErrorIs(t, err, cachex.ErrUnsupportedKey)
+}
