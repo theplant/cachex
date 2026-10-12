@@ -62,8 +62,8 @@ func (s *Stripe) Lock(ctx context.Context, late func()) error {
 	case <-ctx.Done():
 		go func() {
 			<-locked
+			defer s.mu.Unlock() // even if late panics or calls runtime.Goexit
 			late()
-			s.mu.Unlock()
 		}()
 		return ctx.Err()
 	}

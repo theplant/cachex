@@ -108,10 +108,12 @@ func (c *Cache[T]) lockWrites(ctx context.Context, keys []string, local bool) (u
 			for _, j := range held {
 				dropped = append(dropped, byStripe[j]...)
 			}
-			if len(dropped) > 0 {
-				c.drop(ctx, dropped, local)
-			}
-			end(held)
+			func() {
+				defer end(held) // even if a layer calls runtime.Goexit
+				if len(dropped) > 0 {
+					c.drop(ctx, dropped, local)
+				}
+			}()
 			return nil, err
 		}
 	}
@@ -125,11 +127,18 @@ func (c *Cache[T]) lockWrites(ctx context.Context, keys []string, local bool) (u
 // drop.
 func (c *Cache[T]) lateWrite(ctx context.Context, s *stripe.Stripe, keys []string, local bool) func() {
 	return func() {
+		defer func() { // it runs in a goroutine of its own: a panic would end the process
+			if r := recover(); r != nil {
+				c.opts.logger.ErrorContext(ctx, "cachex: panic during a late drop", "keys", keys, "panic", r)
+			}
+		}()
+		defer func() { // even if a layer calls runtime.Goexit
+			c.countWrite(s, keys...)
+			if !local {
+				c.publish(ctx, keys)
+			}
+		}()
 		c.drop(ctx, keys, local)
-		c.countWrite(s, keys...)
-		if !local {
-			c.publish(ctx, keys)
-		}
 	}
 }
 
@@ -145,9 +154,7 @@ func (c *Cache[T]) drop(ctx context.Context, keys []string, local bool) {
 	dctx, cancel := context.WithTimeout(sharedCtx(ctx), c.opts.fetchTimeout)
 	defer cancel()
 	for _, j := range c.local {
-		if err := c.layers[j].backend.DelMany(dctx, keys); err != nil {
-			c.opts.logger.WarnContext(dctx, "cachex: broadcast invalidation failed", "layer", j, "error", err)
-		}
+		c.invalidateLayer(dctx, j, keys)
 	}
 }
 
@@ -258,18 +265,29 @@ func (c *Cache[T]) clearLocal() {
 	for i := range stripe.Count {
 		_ = c.stripes.At(i).Lock(ctx, func() {}) // a background ctx never gives up
 	}
-	cctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
-	for _, j := range c.local {
-		if err := c.layers[j].backend.(LocalBackend).Clear(cctx); err != nil {
-			c.opts.logger.ErrorContext(cctx, "cachex: clearing a local layer failed", "layer", j, "error", err)
+	defer func() { // even if a layer panics or calls runtime.Goexit
+		c.sourcing.Clear() // before the flights, as in dropFlights
+		c.flights.DropAll()
+		for i := range stripe.Count {
+			s := c.stripes.At(i)
+			s.AddWrite()
+			s.Unlock()
 		}
+	}()
+	cctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
+	defer cancel()
+	for _, j := range c.local {
+		c.clearLayer(cctx, j)
 	}
-	cancel()
-	c.sourcing.Clear() // before the flights, as in dropFlights
-	c.flights.DropAll()
-	for i := range stripe.Count {
-		s := c.stripes.At(i)
-		s.AddWrite()
-		s.Unlock()
+}
+
+func (c *Cache[T]) clearLayer(ctx context.Context, j int) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.opts.logger.ErrorContext(ctx, "cachex: panic while clearing a local layer", "layer", j, "panic", r)
+		}
+	}()
+	if err := c.layers[j].backend.(LocalBackend).Clear(ctx); err != nil {
+		c.opts.logger.ErrorContext(ctx, "cachex: clearing a local layer failed", "layer", j, "error", err)
 	}
 }

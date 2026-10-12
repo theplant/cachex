@@ -3,7 +3,9 @@ package cachex_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -285,4 +287,61 @@ func TestAWriteThatGaveUpPublishesAgainAfterItsDrop(t *testing.T) {
 	assert.Equal(t, "v2", v, "a reads the new value")
 	assert.Eventually(t, func() bool { v, err := b.c.Get(ctx, "k"); return err == nil && v == "v2" }, 5*time.Second, time.Millisecond,
 		"b too, once a's drop reached it")
+}
+
+// recovering recovers a panic in deliver, as go-que's worker does for
+// gobuscachex's handler: the process goes on.
+type recovering struct{ cachex.Broadcast }
+
+func (r recovering) Listen(ctx context.Context, ready func(), deliver func([]byte)) error {
+	return r.Broadcast.Listen(ctx, ready, func(msg []byte) {
+		defer func() { _ = recover() }()
+		deliver(msg)
+	})
+}
+
+func TestALocalLayerThatPanicsInAnInvalidationLeavesNoStripeLocked(t *testing.T) {
+	// the invalidation of [a, b] gives up on a's stripe (a write holds it),
+	// drops b at once, and the local layer panics there
+	ctx := context.Background()
+	src := newSource(nil)
+	bus := cachextest.NewBus()
+	w := newInstance(t, src, cachextest.NewLeasingMap[string](), bus)
+
+	m := cachextest.NewMap[string]()
+	gate, held, panicked := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var b atomic.Value
+	b.Store("")
+	h := hook[string](m, func(op string, keys []string, _ bool) {
+		if op == "set" && slices.Contains(keys, "a") {
+			close(held)
+			<-gate
+		}
+		if op == "del" && slices.Contains(keys, b.Load().(string)) {
+			close(panicked)
+			panic("local layer panics")
+		}
+	})
+	subscribed := bus.Subscribed()
+	r := cachex.New(src, []cachex.Layer[string]{cachex.NewLayer[string](localHooked{h, m}, cachex.TTL(time.Hour, 0))},
+		cachex.WithBroadcast(recovering{bus.Broadcast()}), cachex.WithFetchTimeout(20*time.Millisecond))
+	t.Cleanup(func() { _ = r.Close() })
+	require.Eventually(t, func() bool { return bus.Subscribed() > subscribed }, 5*time.Second, time.Millisecond)
+	for i := 0; ; i++ {
+		if k := fmt.Sprint("b", i); cachex.StripeIndex(r, k) != cachex.StripeIndex(r, "a") {
+			b.Store(k)
+			break
+		}
+	}
+
+	setDone := make(chan error, 1)
+	go func() { setDone <- r.Set(ctx, "a", "x") }()
+	<-held
+	require.NoError(t, w.c.DelMany(ctx, []string{"a", b.Load().(string)}))
+	<-panicked
+	close(gate)
+	require.NoError(t, <-setDone)
+	wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	require.NoError(t, r.Set(wctx, b.Load().(string), "y"), "b's stripe was released")
 }

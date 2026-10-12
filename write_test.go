@@ -594,3 +594,33 @@ func TestALayerThatPanicsInDelKeepsNoOldValueAbove(t *testing.T) {
 	_, ok := stored(t, top, "k")
 	assert.False(t, ok, "layer 0 is above the panicking layer and must not keep the old value")
 }
+
+func TestAGoexitInALateDropLeavesNoStripeLocked(t *testing.T) {
+	ctx := context.Background()
+	m := cachextest.NewMap[string]()
+	gate, held := make(chan struct{}), make(chan struct{})
+	var exit, first0 atomic.Bool
+	h := hook[string](m, func(op string, _ []string, _ bool) {
+		if op == "set" && first0.CompareAndSwap(false, true) { // the first write holds the stripe
+			close(held)
+			<-gate
+		}
+		if op == "del" && exit.CompareAndSwap(true, false) {
+			runtime.Goexit()
+		}
+	})
+	c := cachex.New(newSource(nil), oneLayer(h))
+	first := make(chan error, 1)
+	go func() { first <- c.Set(ctx, "k", "1") }()
+	<-held
+	done, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, c.Set(done, "k", "2"), "gives up; its late drop waits for the stripe")
+	exit.Store(true)
+	close(gate)
+	require.NoError(t, <-first)
+	require.Eventually(t, func() bool { return !exit.Load() }, 5*time.Second, time.Millisecond, "the late drop ran")
+	wctx, cancel2 := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel2()
+	require.NoError(t, c.Set(wctx, "k", "3"), "k's stripe was released")
+}

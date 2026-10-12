@@ -96,8 +96,8 @@ func (b *broadcast) Listen(ctx context.Context, ready func(), deliver func(msg [
 			return in.Destroy(ctx) // not ours: never retry it
 		}
 		mu.Lock()
+		defer mu.Unlock() // go-que recovers a panic in a handler: the lock must not stay held
 		deliver(msg)
-		mu.Unlock()
 		return in.Destroy(ctx) // Done would keep the row for good
 	}
 	backoff := 100 * time.Millisecond
