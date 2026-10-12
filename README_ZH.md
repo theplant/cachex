@@ -144,6 +144,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 | `WithFetchTimeout(d)` | 60s | 各自限时：回源的二次检查、读下面每一层连同它的回填、每次问数据源连同它的回填、写入失败后的失效 |
 | `WithGetManyConcurrency(n)` | 16 | 一次 `GetMany` 最多同时向数据源发几个请求 |
 | `WithGetManyChunkSize(n)` | 0：全部一段 | 把 `GetMany` 未命中的 key 切成最多 n 个一段回源，每段开始时才认领；所在段还没开始的 key，`Get` 不用等 |
+| `WithBroadcast(b)` | 不开 | 把每次写入的 key 发给其他实例，它们从本地层删掉；见「多个实例」 |
 | `WithLogger(l)` | `slog.Default()` | 记录不让调用失败的错误（回填、失效、后台刷新）和回源里的 panic |
 | `WithNow(f)` | `time.Now` | 计算和判断条目所用的时钟（后端的原生过期仍按真实时钟）；测试用 `cachextest.Clock` 手动推进 |
 
