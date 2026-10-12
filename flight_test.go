@@ -163,11 +163,11 @@ func (s *slowFirstGet) Get(ctx context.Context, key string) (cachex.Entry[string
 func TestDoubleCheck(t *testing.T) {
 	// A reads a miss; B fetches and backfills the key; only then does A claim
 	// the fetch. Re-reading the layer saves A's fetch.
-	run := func(t *testing.T, mode cachex.DoubleCheckMode) int64 {
-		ctx := context.Background()
+	ctx := context.Background()
+	{
 		src := newSource(map[string]string{"a": "1"})
 		mem := &slowFirstGet{Backend: cachextest.NewMap[string](), read: make(chan struct{}), release: make(chan struct{})}
-		c := cachex.New(src, oneLayer(mem), cachex.WithDoubleCheck(mode))
+		c := cachex.New(src, oneLayer(mem))
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -181,11 +181,8 @@ func TestDoubleCheck(t *testing.T) {
 		cachex.Settle(c) // B's fetch is backfilled and gone before A claims
 		close(mem.release)
 		<-done
-		return src.calls.Load()
+		assert.EqualValues(t, 1, src.calls.Load(), "this Cache filled the key since A read it")
 	}
-	assert.EqualValues(t, 1, run(t, cachex.DoubleCheckAuto), "auto: this Cache filled the key since A read it")
-	assert.EqualValues(t, 1, run(t, cachex.DoubleCheckEnabled))
-	assert.EqualValues(t, 2, run(t, cachex.DoubleCheckDisabled))
 }
 
 func TestADoubleCheckOfManyKeysReReadsThemInOneCall(t *testing.T) {
@@ -193,17 +190,23 @@ func TestADoubleCheckOfManyKeysReReadsThemInOneCall(t *testing.T) {
 	src := newBatchSource(map[string]string{"a": "src", "b": "src", "c": "src"})
 	mem := cachextest.NewMap[string]()
 	var gets atomic.Int64
+	var c *cachex.Cache[string]
 	layer := hook(mem, func(op string, keys []string, many bool) {
-		if op != "get" || gets.Add(1) != 2 {
+		if op != "get" {
 			return
 		}
-		assert.True(t, many, "the re-read of %v is one call", keys)
-		// another process filled a and b between the read and the re-read
-		for _, key := range []string{"a", "b"} {
-			require.NoError(t, mem.Set(ctx, key, cachex.Entry[string]{Value: "other", FreshUntil: time.Now().Add(time.Hour), ExpiresAt: time.Now().Add(time.Hour)}))
+		switch gets.Add(1) {
+		case 1: // this Cache writes a and b while the first read is out, so they are re-read
+			require.NoError(t, c.DelMany(ctx, []string{"a", "b"}))
+		case 2:
+			assert.True(t, many, "the re-read of %v is one call", keys)
+			// another process filled a and b between the read and the re-read
+			for _, key := range []string{"a", "b"} {
+				require.NoError(t, mem.Set(ctx, key, cachex.Entry[string]{Value: "other", FreshUntil: time.Now().Add(time.Hour), ExpiresAt: time.Now().Add(time.Hour)}))
+			}
 		}
 	})
-	c := cachex.New[string](src, oneLayer(layer), cachex.WithDoubleCheck(cachex.DoubleCheckEnabled))
+	c = cachex.New[string](src, oneLayer(layer))
 	m, err := c.GetMany(ctx, []string{"a", "b", "c"})
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"a": "other", "b": "other", "c": "src"}, m)
@@ -211,17 +214,11 @@ func TestADoubleCheckOfManyKeysReReadsThemInOneCall(t *testing.T) {
 	assert.EqualValues(t, 1, src.calls.Load(), "only c is left for the source")
 }
 
-func TestDoubleCheckAutoSkipsTheReReadWhenNothingWasWritten(t *testing.T) {
+func TestDoubleCheckSkipsTheReReadWhenNothingWasWritten(t *testing.T) {
 	src := newSource(map[string]string{"a": "1"})
 	var reads atomic.Int64
 	c := cachex.New(src, oneLayer(counting(cachextest.NewMap[string](), "get", &reads)))
 	_, err := c.Get(context.Background(), "a")
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, reads.Load(), "a cold miss reads the layer once")
-
-	c = cachex.New(src, oneLayer(counting(cachextest.NewMap[string](), "get", &reads)), cachex.WithDoubleCheck(cachex.DoubleCheckEnabled))
-	reads.Store(0)
-	_, err = c.Get(context.Background(), "a")
-	require.NoError(t, err)
-	assert.EqualValues(t, 2, reads.Load(), "enabled always re-reads")
 }

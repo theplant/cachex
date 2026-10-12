@@ -25,7 +25,8 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 | `NotFoundWithTTL`, `WithNotFound` (a second backend) | layer option `NotFoundTTL(fresh, stale)`, kept in the same backend |
 | a custom staleness check on the value | `WithMaxAge(func(T) time.Duration)` for values that expire on their own; put a version into the key for "invalidate everything" |
 | `WithFetchConcurrency` | none: the concurrent misses of a key always share one fetch |
-| `WithFetchTimeout`, `WithLogger`, `WithDoubleCheck` | same names, no type parameter |
+| `WithFetchTimeout`, `WithLogger` | same names, no type parameter |
+| `WithDoubleCheck` | none: the double check always runs on demand (see below) |
 | `NowFunc`, `MockClock` | `WithNow(func() time.Time)`, `cachextest.Clock` |
 | `DefaultFetchTimeout` and other `Default*` variables | constants |
 | `Transform`, `JSONTransform`, `StringJSONTransform` | removed: byte-storing backends take a `Codec[T]` (default `DefaultCodec`); your own store of bytes implements `ByteBackend` and is wrapped with `Encoded(b, codec, logger)` |
@@ -56,7 +57,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **A fetch that panics or calls `runtime.Goexit` answers every waiter with an error.** In v1, waiters of a Goexit'ed fetch waited until their own ctx ended.
 
-**`DoubleCheckAuto` re-reads the first layer only if this `Cache` wrote the key's stripe since the request read it.** In v1 it was on whenever `WithNotFound` was configured. Use `DoubleCheckEnabled` to see what other processes wrote to a shared first layer.
+**The double check re-reads the first layer only if this `Cache` wrote the key's stripe since the request read it, and is no longer configurable.** In v1 it was on whenever `WithNotFound` was configured. Always re-reading saves next to nothing, even on a first layer shared by several instances: they all miss at the same moment, so none has filled it yet. *What to do:* drop `WithDoubleCheck`.
 
 **Data that does not decode is a miss.** In v1, a value the codec could not read (after a type change, say) failed every `Get` until it expired. v2's byte-storing backends (through `cachex.Encoded`) drop it, log a warning, and the read fetches anew.
 

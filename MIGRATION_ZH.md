@@ -25,7 +25,8 @@ import "github.com/theplant/cachex/v2"
 | `NotFoundWithTTL`、`WithNotFound`（第二个后端） | 层选项 `NotFoundTTL(fresh, stale)`，存在同一个后端里 |
 | 按值内容自定义新鲜度判断 | 本身会过期的值用 `WithMaxAge(func(T) time.Duration)`；「整体作废」把版本号放进 key |
 | `WithFetchConcurrency` | 没有对应：同一个 key 的并发未命中总是共用一次回源 |
-| `WithFetchTimeout`、`WithLogger`、`WithDoubleCheck` | 名字不变，不再带类型参数 |
+| `WithFetchTimeout`、`WithLogger` | 名字不变，不再带类型参数 |
+| `WithDoubleCheck` | 没有了：二次检查总是按需进行（见下文） |
 | `NowFunc`、`MockClock` | `WithNow(func() time.Time)`、`cachextest.Clock` |
 | `DefaultFetchTimeout` 等 `Default*` 变量 | 常量 |
 | `Transform`、`JSONTransform`、`StringJSONTransform` | 去掉了：存字节的后端接收 `Codec[T]`（默认 `DefaultCodec`）；自己的字节存储实现 `ByteBackend`，再用 `Encoded(b, codec, logger)` 包一层 |
@@ -56,7 +57,7 @@ import "github.com/theplant/cachex/v2"
 
 **回源 panic 或调用 `runtime.Goexit` 时，每个等待方都会收到错误。** v1 里 Goexit 的回源的等待方要一直等到自己的 ctx 结束。
 
-**`DoubleCheckAuto` 只在请求读过第一层之后、本 `Cache` 写过这个 key 所在分片时才再读一次。** v1 里只要配置了 `WithNotFound` 就开启。要看到其他进程写进共享第一层的值，用 `DoubleCheckEnabled`。
+**二次检查只在请求读过第一层之后、本 `Cache` 写过这个 key 所在分片时才再读一次，而且不再可配。** v1 里只要配置了 `WithNotFound` 就开启。总是再读几乎省不下什么，第一层被多个实例共享时也一样：它们在同一时刻未命中，谁也还没回填。*怎么做：* 去掉 `WithDoubleCheck`。
 
 **解不出来的数据算未命中。** v1 里编解码器读不了的值（比如类型改了之后），会让每次 `Get` 都报错，直到它过期。v2 存字节的后端（经 `cachex.Encoded`）会删掉它、记一条警告，读取照常回源。
 

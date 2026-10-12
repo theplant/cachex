@@ -122,7 +122,7 @@ v2 重写了读写路径（见 [ADR 0012](../adr/0012-one-cache-over-layers.md)�
   | v1，`EntryWithTTL`（和 v2 一样要读时钟） | 43ns |
   | v2 | 59ns |
 
-  剩下的 16ns 里，约 7ns 是读第一层之前先读分片纪元（`DoubleCheckAuto` 需要它，见 ADR 0008），去掉这一步实测过。把分片纪元挪到读取之后也试过：远端的第一层读得慢时，读取期间的回填会被漏掉，`TestDoubleCheck` 失败，所以没有采用。
+  剩下的 16ns 里，约 7ns 是读第一层之前先读分片纪元（二次检查需要它，见 ADR 0008），去掉这一步实测过。把分片纪元挪到读取之后也试过：远端的第一层读得慢时，读取期间的回填会被漏掉，`TestDoubleCheck` 失败，所以没有采用。
 - **不存在命中几乎不花钱**：只读一层、只读一次，`ErrNotFound` 原样返回。
 - **otter 单 key 串行慢**：profile 显示约 80% 的时间在 `pthread_cond_signal/wait`，即 otter 的读缓冲攒满后唤醒维护 goroutine；cachex 自己约占 13%。并行、分散到很多 key 时，它比 v1 的 ristretto 快 4 到 5 倍。
 - **`Get/hit/l2` 慢 37% 到 47%**：profile 里约 90% 是 goroutine 交接（线程唤醒和休眠），cachex 自身约 5%。

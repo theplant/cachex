@@ -186,7 +186,6 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		"NaN jitter":            func() { cachex.NewLayer(mem, cachex.TTL(time.Second, 0), cachex.Jitter(math.NaN())) },
 		"TTLs over 100 years":   func() { cachex.NewLayer(mem, cachex.TTL(time.Hour, math.MaxInt64)) },
 		"not-found TTLs over":   func() { cachex.NewLayer(mem, cachex.TTL(time.Hour, 0), cachex.NotFoundTTL(time.Hour, math.MaxInt64)) },
-		"unknown double check":  func() { cachex.New[string](src, nil, cachex.WithDoubleCheck(3)) },
 		"stale not-found only":  func() { cachex.NewLayer(mem, cachex.TTL(time.Second, 0), cachex.NotFoundTTL(0, time.Second)) },
 		"nil logger":            func() { cachex.New[string](src, nil, cachex.WithLogger(nil)) },
 		"nil clock":             func() { cachex.New[string](src, nil, cachex.WithNow(nil)) },

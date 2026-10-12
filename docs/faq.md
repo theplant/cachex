@@ -76,15 +76,16 @@ In two layers:
 1. **Singleflight** (primary): concurrent misses of one key fetch it once, across all layers; the other requests wait for that result. See [design/singleflight.md](design/singleflight.md) (Chinese).
 2. **Double-check** (supplementary): request B reads a miss before request A's fetch backfills, but claims the key only after A's fetch has finished; B reads the first layer again instead of fetching again.
 
-### Is the double-check worth it? Is it on by default?
+### Is the double-check worth it? Can I turn it on or off?
 
-By default it runs on demand (`DoubleCheckAuto`): it re-reads only when this `Cache` wrote the key's stripe after the request read the first layer. Measured:
+It always runs on demand and has no option: it re-reads only when this `Cache` wrote the key's stripe after the request read the first layer. Measured:
 
 - with a 1 ms first-layer read and a hot key, source calls drop from 30 to 19 (18 when always on);
 - cold keys see almost no extra reads (1.005 reads per `Get`, against 2 when always on);
-- with an in-memory first layer it makes no difference.
+- with an in-memory first layer it makes no difference;
+- on a first layer shared by several instances, always re-reading saves about one call per instance (180 against 190 with 10 instances): they all miss at the same moment, so none has filled it yet. Each instance fetching once per expiry is what costs, and no re-read avoids it.
 
-Use `DoubleCheckEnabled` when you need to see values other processes wrote to a shared first layer. See [ADR 0008](adr/0008-on-demand-double-check.md) and [research/2026-10-double-check.md](research/2026-10-double-check.md) (Chinese).
+So neither "always" nor "never" earns an option. See [ADR 0008](adr/0008-on-demand-double-check.md) and [research/2026-10-double-check.md](research/2026-10-double-check.md) (Chinese).
 
 ### What happens if the source panics or calls `runtime.Goexit`?
 

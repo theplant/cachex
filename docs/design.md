@@ -111,7 +111,6 @@ flowchart LR
 | `WithGetManyConcurrency(n)` | `DefaultGetManyConcurrency` = 16 | 一次 `GetMany` 同时向数据源发出的请求数：数据源不是批量数据源时是 `Get` 调用，否则是每段一次的调用；名额不够时下一段等着 | [batch.md](design/batch.md#回源怎么发) |
 | `WithGetManyChunkSize(n)` | 0（全部一段） | 一次 `GetMany`（以及多个 key 的后台刷新）每段多少个 key：一段开始时才认领，每层一次调用、问数据源、各自回填；还没开始的段不认领，并发的 `Get` 不用等它 | [batch.md](design/batch.md#回源怎么发) |
 | `WithMaxAge(func(T) time.Duration)` | 不限 | 按值给条目定寿命上限，在回源拿到值时调用一次，`Set`/`SetMany` 写入值时也调用；返回 0 或负数表示不缓存；`T` 必须和 `Cache` 的一致，否则 `New` panic | [read-path.md](design/read-path.md#条目的寿命) |
-| `WithDoubleCheck(mode)` | `DoubleCheckAuto` | 二次检查的模式 | [read-path.md](design/read-path.md#二次检查) |
 | `WithNow(f)` | `time.Now` | `Cache` 计算和判断条目所用的时钟；后端的原生过期仍按真实时钟 | [backends.md](design/backends.md#过期按真实时钟) |
 | `WithLogger(l)` | `slog.Default()` | 不让调用失败的失败（回填、失效、后台刷新失败），以及回源里的 panic | — |
 

@@ -23,23 +23,6 @@ const (
 	DefaultGetManyConcurrency = 16
 )
 
-// DoubleCheckMode says when a request that claimed the fetch of a key reads the
-// first layer again before going down, in case another request has just filled
-// it.
-type DoubleCheckMode int8
-
-const (
-	// DoubleCheckAuto re-reads only if this Cache wrote the key's stripe since
-	// the request read the first layer: otherwise the re-read would find the
-	// same miss. The default.
-	DoubleCheckAuto DoubleCheckMode = iota
-	// DoubleCheckEnabled always re-reads: use it to see what other processes
-	// wrote to a shared first layer.
-	DoubleCheckEnabled
-	// DoubleCheckDisabled never re-reads.
-	DoubleCheckDisabled
-)
-
 // Cache reads through its layers to its source. Build it with New.
 type Cache[T any] struct {
 	source      Source[T]
@@ -79,7 +62,6 @@ type options struct {
 	logger       *slog.Logger
 	now          func() time.Time
 	maxAge       any
-	doubleCheck  DoubleCheckMode
 	broadcast    Broadcast
 }
 
@@ -108,8 +90,6 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 		panic("cachex: New: the GetMany concurrency must be positive")
 	case o.getManyChunk < 0:
 		panic("cachex: New: the GetMany chunk size must not be negative")
-	case o.doubleCheck < DoubleCheckAuto || o.doubleCheck > DoubleCheckDisabled:
-		panic(fmt.Sprintf("cachex: New: unknown double-check mode %d", o.doubleCheck))
 	case o.logger == nil:
 		panic("cachex: New: the logger must not be nil")
 	case o.now == nil:
@@ -217,11 +197,6 @@ func WithNow(now func() time.Time) Option {
 // New panics.
 func WithMaxAge[T any](maxAge func(T) time.Duration) Option {
 	return func(o *options) { o.maxAge = maxAge }
-}
-
-// WithDoubleCheck sets the double-check mode. Default DoubleCheckAuto.
-func WithDoubleCheck(mode DoubleCheckMode) Option {
-	return func(o *options) { o.doubleCheck = mode }
 }
 
 type sharedKey struct{}

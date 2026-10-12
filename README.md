@@ -145,7 +145,6 @@ It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `g
 | `WithFetchTimeout(d)` | 60s | Bounds, each on its own: a fetch's double check, each lower layer read with its backfill, each source call with its backfill, and the invalidation after a failed write |
 | `WithGetManyConcurrency(n)` | 16 | How many source requests one `GetMany` has in flight |
 | `WithGetManyChunkSize(n)` | 0: one chunk | Fetches a `GetMany`'s misses in chunks of at most n keys, each claimed when it starts; a `Get` of a key whose chunk has not started does not wait |
-| `WithDoubleCheck(mode)` | `DoubleCheckAuto` | When a request that claimed a fetch re-reads the first layer first |
 | `WithLogger(l)` | `slog.Default()` | Logs failures that do not fail a call (a backfill, an invalidation, a background refresh) and panics in fetches |
 | `WithNow(f)` | `time.Now` | The clock entries are computed and judged by (backends still expire entries by the wall clock); `cachextest.Clock` is a manual one for tests |
 

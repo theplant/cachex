@@ -370,20 +370,14 @@ func (c *Cache[T]) resolve(ctx context.Context, p *claimed[T], conc int) {
 	})
 }
 
-// shouldDoubleCheck reports whether a claimed fetch re-reads the first layer.
-// In DoubleCheckAuto it does only if this Cache wrote the key's stripe since
-// the request read the first layer (seen): otherwise the re-read would find
-// the same miss. A write to another key of the stripe makes it re-read for
-// nothing.
+// shouldDoubleCheck reports whether a claimed fetch re-reads the first layer:
+// only if this Cache wrote the key's stripe since the request read the first
+// layer (seen), since otherwise the re-read would find the same miss. A write
+// to another key of the stripe makes it re-read for nothing. What other
+// instances write to a shared first layer is not worth a re-read: they miss
+// at the same moment as this one, so none has filled it yet (ADR 0008).
 func (c *Cache[T]) shouldDoubleCheck(key string, seen uint64) bool {
-	switch c.opts.doubleCheck {
-	case DoubleCheckEnabled:
-		return true
-	case DoubleCheckDisabled:
-		return false
-	default:
-		return epoch(c.stripes, key) != seen
-	}
+	return epoch(c.stripes, key) != seen
 }
 
 // doubleCheck re-reads the first layer for the flights idxs that need it and
