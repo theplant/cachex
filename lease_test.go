@@ -3,6 +3,7 @@ package cachex_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -213,4 +214,26 @@ func TestLeasesAcrossLayers(t *testing.T) {
 		_, ok := stored(t, shared, k)
 		assert.True(t, ok, "%s: GetMany backfills under its leases", k)
 	}
+}
+
+// panickyRelease is a leasing map whose leaser panics in Release.
+type panickyRelease struct{ *cachextest.LeasingMap[string] }
+
+func (p panickyRelease) Leaser() cachex.Leaser[string] { return panickyLeaser{p.LeasingMap.Leaser()} }
+
+type panickyLeaser struct{ cachex.Leaser[string] }
+
+func (panickyLeaser) Release(context.Context, map[string]string) error { panic("release blew up") }
+
+func TestAPanicInReleaseIsLogged(t *testing.T) {
+	// the leases go back after every flight was answered, in the fetch's
+	// goroutine: a panic there would crash the process
+	src := cachex.SourceFunc[string](func(context.Context, string) (string, error) { return "", errBoom })
+	var logs syncBuffer
+	c := cachex.New[string](src, oneLayer(panickyRelease{cachextest.NewLeasingMap[string]()}),
+		cachex.WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	_, err := c.Get(context.Background(), "k")
+	require.ErrorIs(t, err, errBoom)
+	require.NoError(t, c.Close())
+	assert.Contains(t, logs.String(), "release blew up")
 }

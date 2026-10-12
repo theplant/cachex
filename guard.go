@@ -258,8 +258,8 @@ func (c *Cache[T]) clearLocal() {
 		}
 	}
 	cancel()
+	c.sourcing.Clear() // before the flights, as in dropFlights
 	c.flights.DropAll()
-	c.sourcing.Clear()
 	for i := range stripe.Count {
 		s := c.stripes.At(i)
 		s.AddWrite()

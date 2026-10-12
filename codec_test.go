@@ -180,7 +180,10 @@ func TestBatchedForwardsLocalAndLeases(t *testing.T) {
 	assert.True(t, local, "a local store stays local")
 
 	leasing := cachextest.NewLeasingMap[string]()
-	b := cachex.Batched[string](struct{ cachex.SingleBackend[string]; cachex.Leasing[string] }{leasing, leasing})
+	b := cachex.Batched[string](struct {
+		cachex.SingleBackend[string]
+		cachex.Leasing[string]
+	}{leasing, leasing})
 	_, local = b.(cachex.LocalBackend)
 	assert.False(t, local)
 	l, ok := b.(cachex.Leasing[string])

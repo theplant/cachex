@@ -236,9 +236,14 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (
 // and its call to the source, without interrupting them: their waiters still
 // get their results, and the next read starts a new fetch, which asks the
 // source anew.
+//
+// The call to the source goes first: a read that joins it must have claimed
+// its flight before, so the drop of the flights removes that one too. The
+// other way round, a read claiming in between would join the old call with
+// a flight that stays registered, and reads after the write would join it.
 func (c *Cache[T]) dropFlights(key string) {
-	c.flights.Drop(flightKey{key: key}, flightKey{key: key, refresh: true})
 	c.sourcing.Delete(key) // a fetch after the write asks the source anew
+	c.flights.Drop(flightKey{key: key}, flightKey{key: key, refresh: true})
 }
 
 // claimed are the flights one request leads, and what their fetch knows of

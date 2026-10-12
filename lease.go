@@ -3,6 +3,7 @@ package cachex
 import (
 	"context"
 	"errors"
+	"runtime/debug"
 	"slices"
 	"time"
 )
@@ -197,11 +198,22 @@ func (p *claimed[T]) release(ctx context.Context, idxs []int) {
 		if tokens == nil {
 			continue
 		}
-		rctx, cancel := context.WithTimeout(ctx, p.c.opts.fetchTimeout)
-		if err := leaser.Release(rctx, tokens); err != nil {
-			p.c.opts.logger.WarnContext(rctx, "cachex: lease release failed", "layer", li, "error", err)
+		p.c.releaseLeases(ctx, li, leaser, tokens)
+	}
+}
+
+// releaseLeases ends tokens' leases in layer li. It runs after the fetch's
+// panics are recovered (see claimed.run), so it recovers its own.
+func (c *Cache[T]) releaseLeases(ctx context.Context, li int, leaser Leaser[T], tokens map[string]string) {
+	rctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
+	defer cancel()
+	defer func() {
+		if r := recover(); r != nil {
+			c.opts.logger.ErrorContext(rctx, "cachex: panic during lease release", "layer", li, "panic", r, "stack", string(debug.Stack()))
 		}
-		cancel()
+	}()
+	if err := leaser.Release(rctx, tokens); err != nil {
+		c.opts.logger.WarnContext(rctx, "cachex: lease release failed", "layer", li, "error", err)
 	}
 }
 
