@@ -24,22 +24,20 @@ import (
 // from every layer once the stripe is free, since the caller may have changed
 // the source already (with a broadcast, it publishes the key again then).
 func (c *Cache[T]) Set(ctx context.Context, key string, value T) error {
-	err := c.writeOne(ctx, key, &value)
 	if c.opts.broadcast != nil {
-		c.publish(ctx, []string{key})
+		defer c.publish(ctx, []string{key}) // even if a layer panics
 	}
-	return err
+	return c.writeOne(ctx, key, &value)
 }
 
 // Del drops key from every layer, bottom up, so the next read asks the
 // source. Like Set, call it after changing the source; it records nothing
 // about whether the key exists. Failures and waiting are as for Set.
 func (c *Cache[T]) Del(ctx context.Context, key string) error {
-	err := c.writeOne(ctx, key, nil)
 	if c.opts.broadcast != nil {
-		c.publish(ctx, []string{key})
+		defer c.publish(ctx, []string{key})
 	}
-	return err
+	return c.writeOne(ctx, key, nil)
 }
 
 // SetMany is Set for many keys, with one call per layer. A key that fails in a
@@ -47,11 +45,10 @@ func (c *Cache[T]) Del(ctx context.Context, key string) error {
 // *BatchError; the other keys are written. An error that is not a *BatchError
 // means nothing was written (ctx ended while waiting).
 func (c *Cache[T]) SetMany(ctx context.Context, values map[string]T) error {
-	err := c.write(ctx, values, nil)
 	if c.opts.broadcast != nil {
-		c.publish(ctx, slices.Collect(maps.Keys(values)))
+		defer c.publish(ctx, slices.Collect(maps.Keys(values)))
 	}
-	return err
+	return c.write(ctx, values, nil)
 }
 
 // DelMany is Del for many keys, with one call per layer; failures are reported
@@ -61,9 +58,8 @@ func (c *Cache[T]) DelMany(ctx context.Context, keys []string) error {
 	if c.opts.broadcast == nil {
 		return c.write(ctx, nil, keys)
 	}
-	err := c.write(ctx, nil, slices.Clone(keys)) // write drops unsupported keys in place
-	c.publish(ctx, keys)
-	return err
+	defer c.publish(ctx, keys)
+	return c.write(ctx, nil, slices.Clone(keys)) // write drops unsupported keys in place
 }
 
 // writeOne is write for one key (deleting it if value is nil), without the
@@ -80,12 +76,19 @@ func (c *Cache[T]) writeOne(ctx context.Context, key string, value *T) error {
 	}
 	defer c.unlockWrite(key)
 
+	j := len(c.layers) - 1
+	defer func() {
+		if r := recover(); r != nil { // a panic is a failure too: drop the key at and above j
+			c.invalidate(ctx, []string{key}, j)
+			panic(r)
+		}
+	}()
 	var a Entry[T]
 	if value != nil {
 		a = c.answer(*value, false)
 	}
 	now := c.opts.now()
-	for j := len(c.layers) - 1; j >= 0; j-- {
+	for ; j >= 0; j-- {
 		l := &c.layers[j]
 		var err error
 		if value != nil {
@@ -122,13 +125,20 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 	}
 	defer unlock()
 
+	j := len(c.layers) - 1
+	defer func() {
+		if r := recover(); r != nil { // a panic is a failure too: drop the keys at and above j
+			c.invalidate(ctx, append(keys, dels...), j)
+			panic(r)
+		}
+	}()
 	answers := make(map[string]Entry[T], len(values))
 	for key, value := range values {
 		answers[key] = c.answer(value, false)
 	}
 	failedAt := map[string]int{}
 	now := c.opts.now()
-	for j := len(c.layers) - 1; j >= 0; j-- {
+	for ; j >= 0; j-- {
 		var drop []string
 		for _, key := range dels {
 			if _, failed := errs[key]; !failed {
@@ -146,8 +156,8 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 	for key, j := range failedAt {
 		byLayer[j] = append(byLayer[j], key)
 	}
-	for j, keys := range byLayer {
-		c.invalidate(ctx, keys, j)
+	for l, keys := range byLayer {
+		c.invalidate(ctx, keys, l)
 	}
 	return batchError(errs)
 }

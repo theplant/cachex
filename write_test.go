@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -429,4 +430,47 @@ func TestCloseWaitsForTheInvalidationOfAWriteThatGaveUp(t *testing.T) {
 	require.NoError(t, <-first)
 	<-closed
 	assert.Zero(t, mem.Len(), "done before Close returned, so the backend can be closed")
+}
+
+func TestALayerThatPanicsInAWriteKeepsNoOldValue(t *testing.T) {
+	// a panic is a failure too: the key is dropped from the panicking layer
+	// and those above, and the panic goes on
+	ctx := context.Background()
+	for _, many := range []bool{false, true} {
+		src := newSource(map[string]string{"k": "old"})
+		var panicking atomic.Bool
+		top := &hooked[string]{Backend: cachextest.NewMap[string](), hook: func(op string, _ []string, _ bool) error {
+			if op == "set" && panicking.Load() {
+				panic("layer 0 blew up")
+			}
+			return nil
+		}}
+		bottom := cachextest.NewMap[string]()
+		c := cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer[string](top, cachex.TTL(time.Hour, 0)),
+			cachex.NewLayer[string](bottom, cachex.TTL(time.Hour, 0)),
+		})
+		_, err := c.Get(ctx, "k")
+		require.NoError(t, err)
+		cachex.Settle(c)
+
+		src.set("k", "new")
+		panicking.Store(true)
+		assert.Panics(t, func() {
+			if many {
+				_ = c.SetMany(ctx, map[string]string{"k": "new"})
+			} else {
+				_ = c.Set(ctx, "k", "new")
+			}
+		})
+		panicking.Store(false)
+		e, ok := stored(t, bottom, "k")
+		require.True(t, ok)
+		require.Equal(t, "new", e.Value, "the layer below was written")
+		_, ok = stored(t, top, "k")
+		assert.False(t, ok, "many=%v: the panicking layer keeps no old value", many)
+		v, err := c.Get(ctx, "k")
+		require.NoError(t, err)
+		assert.Equal(t, "new", v)
+	}
 }
