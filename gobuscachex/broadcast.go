@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bus "github.com/qor5/go-bus"
@@ -35,7 +36,8 @@ type BroadcastConfig struct {
 	// TTL is how long an instance's subscription lives without a heartbeat;
 	// it beats every third of it. Once it expired, what was published is
 	// lost: the instance subscribes again, and the Cache clears its local
-	// layers. Default DefaultTTL.
+	// layers. It also bounds how long deliveries may stall unnoticed (see
+	// NewBroadcast). Default DefaultTTL.
 	TTL time.Duration
 	// WorkerConfig tunes the consumer; its MaxLockPerSecond is how often it
 	// polls the database, which bounds how soon a message arrives. Default
@@ -53,6 +55,13 @@ type BroadcastConfig struct {
 // the next heartbeat finds: Listen then subscribes again and calls ready.
 // The consumer polls the database, so a message arrives within about one
 // polling interval.
+//
+// Listen also checks that deliveries go on: with each heartbeat it publishes a
+// probe to a subject only its queue subscribes to, and if no probe arrived for
+// a TTL it subscribes again (and calls ready). A consumer can stall while the
+// heartbeats succeed: go-que's lock on the jobs lives on one connection, and
+// once that connection dropped (a database restart or failover) the consumer
+// fails for good.
 func NewBroadcast(cfg BroadcastConfig) cachex.Broadcast {
 	if cfg.Bus == nil {
 		panic("gobuscachex: NewBroadcast: Bus is required")
@@ -108,20 +117,38 @@ func (b *broadcast) Listen(ctx context.Context, ready func(), deliver func(msg [
 }
 
 // subscribe subscribes a new queue, calls ready, and consumes it until ctx
-// ends or the subscription is found expired.
+// ends, the subscription is found expired, or the probes stop arriving.
 func (b *broadcast) subscribe(ctx context.Context, ready func(), handler bus.Handler) error {
 	var id [8]byte
 	_, _ = rand.Read(id[:])
-	q := b.cfg.Bus.Queue("cachex-" + hex.EncodeToString(id[:]))
-	sub, err := q.Subscribe(ctx, b.cfg.Subject, bus.WithTTL(b.cfg.TTL), bus.WithAutoDrain(true))
-	if err != nil {
-		return fmt.Errorf("subscribe: %w", err)
-	}
+	name := hex.EncodeToString(id[:])
+	q := b.cfg.Bus.Queue("cachex-" + name)
+	probe := b.cfg.Subject + ".probe-" + name
+	var subs []bus.Subscription
 	defer func() { // not under ctx, which may be over
 		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
-		_ = sub.Unsubscribe(uctx)
+		for _, sub := range subs {
+			_ = sub.Unsubscribe(uctx)
+		}
 	}()
+	for _, subject := range []string{b.cfg.Subject, probe} {
+		sub, err := q.Subscribe(ctx, subject, bus.WithTTL(b.cfg.TTL), bus.WithAutoDrain(true))
+		if err != nil {
+			return fmt.Errorf("subscribe: %w", err)
+		}
+		subs = append(subs, sub)
+	}
+	var probed atomic.Int64 // when a probe last arrived, or when this began
+	probed.Store(time.Now().UnixNano())
+	inner := handler
+	handler = func(ctx context.Context, in *bus.Inbound) error {
+		if in.Subject == probe {
+			probed.Store(time.Now().UnixNano())
+			return in.Done(ctx)
+		}
+		return inner(ctx, in)
+	}
 	ready()
 	var opts []bus.ConsumeOption
 	if b.cfg.WorkerConfig != nil {
@@ -145,12 +172,20 @@ func (b *broadcast) subscribe(ctx context.Context, ready func(), handler bus.Han
 		case <-consumer.Done():
 			return fmt.Errorf("consumer stopped: %w", consumer.Err())
 		case <-tick.C:
-			err := sub.Heartbeat(ctx)
-			switch {
-			case errors.Is(err, bus.ErrSubscriptionNotFound):
-				return err // expired: messages may have been lost
-			case err != nil && ctx.Err() == nil: // the database may be down: try again on the next tick
-				b.cfg.Logger.WarnContext(ctx, "gobuscachex: heartbeat failed", "subject", b.cfg.Subject, "error", err)
+			for _, sub := range subs {
+				err := sub.Heartbeat(ctx)
+				switch {
+				case errors.Is(err, bus.ErrSubscriptionNotFound):
+					return err // expired: messages may have been lost
+				case err != nil && ctx.Err() == nil: // the database may be down: try again on the next tick
+					b.cfg.Logger.WarnContext(ctx, "gobuscachex: heartbeat failed", "subject", b.cfg.Subject, "error", err)
+				}
+			}
+			if time.Since(time.Unix(0, probed.Load())) > b.cfg.TTL {
+				return errors.New("deliveries stalled: no probe arrived for a TTL")
+			}
+			if _, err := b.cfg.Bus.Publish(ctx, &bus.Outbound{Message: bus.Message{Subject: probe}}); err != nil && ctx.Err() == nil {
+				b.cfg.Logger.WarnContext(ctx, "gobuscachex: probe failed", "subject", probe, "error", err)
 			}
 		}
 	}

@@ -135,3 +135,15 @@ func TestStartCleanupNeedsItsConfig(t *testing.T) {
 		assert.Error(t, err, name)
 	}
 }
+
+func TestTheCleanupSurvivesADroppedConnection(t *testing.T) {
+	// a database restart or failover cuts every connection: go-que's mutex
+	// stays broken after it, so the worker must get a new one
+	db := newDB(t)
+	c := &cleaner{}
+	start(t, db, c, "cache")
+	runsReach(t, c, 2, "running")
+	_, err := db.ExecContext(context.Background(), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database()")
+	require.NoError(t, err)
+	runsReach(t, c, c.runs.Load()+2, "running again")
+}

@@ -129,3 +129,40 @@ func TestTwoInstancesShareTheirWrites(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "v2", v)
 }
+
+func TestDeliveriesResumeAfterADroppedConnection(t *testing.T) {
+	// a database restart or failover cuts every connection: go-que's mutex
+	// behind the consumer stays broken while the heartbeats succeed, so
+	// Listen notices that its own probes stop arriving, and subscribes again
+	b, db := newBus(t)
+	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.drop", TTL: 3 * time.Second, WorkerConfig: fast}
+	br := NewBroadcast(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{}, 16)
+	got := make(chan []byte, 16)
+	go func() { _ = br.Listen(ctx, func() { ready <- struct{}{} }, func(m []byte) { got <- m }) }()
+	waitFor(t, ready)
+	require.NoError(t, NewBroadcast(cfg).Publish(ctx, []byte("before"))) // the consumer's mutex holds a connection
+	select {
+	case <-got:
+	case <-time.After(20 * time.Second):
+		t.Fatal("no first message")
+	}
+
+	_, err := db.ExecContext(ctx, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database()")
+	require.NoError(t, err)
+	// what is published before Listen subscribes again is lost (the Cache
+	// clears its local layers on ready): publish until one arrives
+	require.Eventually(t, func() bool {
+		if NewBroadcast(cfg).Publish(ctx, []byte("after")) != nil {
+			return false
+		}
+		select {
+		case m := <-got:
+			return string(m) == "after"
+		case <-time.After(500 * time.Millisecond):
+			return false
+		}
+	}, 40*time.Second, 10*time.Millisecond, "deliveries resumed")
+}
