@@ -98,6 +98,17 @@ func (g *Group[K, T]) Drop(keys ...K) {
 	}
 }
 
+// DropOther unregisters the flight that holds key unless it is f: a nil f
+// drops any.
+func (g *Group[K, T]) DropOther(key K, f *Flight[T]) {
+	s := g.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.flights[key]; ok && cur != f {
+		delete(s.flights, key)
+	}
+}
+
 // DropAll is Drop for every key.
 func (g *Group[K, T]) DropAll() {
 	for i := range g.shards {

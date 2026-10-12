@@ -307,11 +307,12 @@ func (p *claimed[T]) settle(ctx context.Context, origin int, idxs []int, entries
 	}
 	if origin > 0 {
 		if len(idxs) == 1 {
-			p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[idxs[0]], gen: p.ks[idxs[0]].gen, entry: entries[0], leases: p.ks[idxs[0]].leases})
+			i := idxs[0]
+			p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[0], leases: p.ks[i].leases, own: p.own(i)})
 		} else {
 			fills := make([]fill[T], len(idxs))
 			for j, i := range idxs {
-				fills[j] = fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[j], leases: p.ks[i].leases}
+				fills[j] = fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[j], leases: p.ks[i].leases, own: p.own(i)}
 			}
 			p.c.backfill(ctx, origin, fills)
 		}
@@ -319,6 +320,14 @@ func (p *claimed[T]) settle(ctx context.Context, origin int, idxs []int, entries
 	for _, i := range idxs {
 		p.forget(i)
 	}
+}
+
+// own is flight i if it is a read's, which readers join; nil for a refresh's.
+func (p *claimed[T]) own(i int) *flight.Flight[T] {
+	if p.refresh {
+		return nil
+	}
+	return p.ks[i].flight
 }
 
 // run runs body, which resolves flights idxs, and publishes an error for each
@@ -427,7 +436,8 @@ type fill[T any] struct {
 	key    string
 	gen    uint64
 	entry  Entry[T]
-	leases *keyLeases // the fetch's leases (see claimedKey)
+	leases *keyLeases        // the fetch's leases (see claimedKey)
+	own    *flight.Flight[T] // the read's flight it answers; nil for a refresh
 }
 
 // readBelow reads the layers below the first for the flights idxs, settles
@@ -625,6 +635,13 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	if len(ok) == 0 {
 		return
 	}
+	supersede := func() {
+		for _, i := range ok {
+			c.supersede(&fills[i])
+		}
+	}
+	supersede()
+	defer supersede() // before end: see supersede
 	answers := make(map[string]Entry[T], len(ok))
 	for _, i := range ok {
 		answers[fills[i].key] = fills[i].entry
@@ -651,6 +668,8 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 		return
 	}
 	defer c.endFill(f.key)
+	c.supersede(&f)
+	defer c.supersede(&f) // before endFill: see supersede
 	now := c.opts.now()
 	for j := origin - 1; j >= 0; j-- {
 		if c.leasers != nil && c.leasers[j] != nil {
@@ -664,6 +683,18 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 		}
 	}
+}
+
+// supersede unregisters the read's flight another fetch of f's key left
+// registered: its answer, published already, may be older than f's, and a
+// read that misses the first layer after f landed (and the entry was
+// evicted) would join it and go back. Later reads fetch anew instead. A
+// backfill calls it before it writes (for flights registered before) and
+// again after, still holding the fill lock (for those that registered while
+// it wrote, whose backfills wait for it). f's own flight stays: readers join
+// it until its backfill is done.
+func (c *Cache[T]) supersede(f *fill[T]) {
+	c.flights.DropOther(flightKey{key: f.key}, f.own)
 }
 
 // newerIn returns the keys of answers whose entry in layer j comes from a

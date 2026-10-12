@@ -154,3 +154,70 @@ func TestAKeyIsAskedOfTheSourceOnceAtATime(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, v, after, "what a read returned is not followed by an older value")
 }
+
+func TestAReadDoesNotJoinAFlightOlderThanWhatAReadReturned(t *testing.T) {
+	// a read copies the stale v1 up from the second layer and publishes it;
+	// its backfill waits for the fill lock, which a refresh holds while it
+	// writes the source's v2. A read gets v2 from the first layer; v2 is then
+	// evicted there, and the next read misses, joins the first read's flight
+	// (still registered until its backfill) and gets v1 back.
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v1"})
+	clock, now := newClock()
+
+	var l1Armed atomic.Bool
+	refreshInL1 := make(chan struct{})
+	proceed := make(chan struct{})
+	l1 := hook[string](cachextest.NewMap[string](), func(op string, _ []string, _ bool) {
+		if op == "set" && l1Armed.CompareAndSwap(true, false) {
+			close(refreshInL1) // the refresh's backfill, holding the fill lock
+			<-proceed
+		}
+	})
+	var l0SetArmed, l0GetArmed atomic.Bool
+	fillChecks := make(chan struct{})
+	release := make(chan struct{})
+	m0 := cachextest.NewMap[string]()
+	l0 := hook[string](m0, func(op string, _ []string, _ bool) {
+		switch {
+		case op == "set" && l0SetArmed.CompareAndSwap(true, false):
+			l0GetArmed.Store(true) // the next get is the read's backfill checking for a newer entry
+		case op == "get" && l0GetArmed.CompareAndSwap(true, false):
+			close(fillChecks)
+			<-release
+		}
+	})
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](l0, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
+		cachex.NewLayer[string](l1, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
+	}, now)
+	defer func() { _ = c.Close() }()
+	require.NoError(t, c.Set(ctx, "k", "v1"))
+	clock.Advance(2 * time.Minute) // stale in both layers
+	src.set("k", "v2")             // changed behind the Cache's back
+
+	l1Armed.Store(true)
+	l0SetArmed.Store(true)
+	v, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "v1", v, "stale, refreshed in the background")
+	<-refreshInL1
+
+	require.NoError(t, m0.Del(ctx, "k")) // evicted from the first layer
+	v, err = c.Get(ctx, "k")             // copies the stale v1 from the second layer
+	require.NoError(t, err)
+	assert.Equal(t, "v1", v)
+
+	close(proceed) // the refresh lands v2; the read's backfill checks the first layer
+	<-fillChecks
+
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v2", v, "the refresh's answer, from the first layer")
+
+	require.NoError(t, m0.Del(ctx, "k")) // evicted again
+	v, err = c.Get(ctx, "k")
+	close(release)
+	require.NoError(t, err)
+	assert.Equal(t, "v2", v, "a read after one that returned v2 must not go back")
+}
