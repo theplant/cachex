@@ -247,8 +247,9 @@ func (c *Cache[T]) dropFlights(key string) {
 }
 
 // claimed are the flights one request leads, and what their fetch knows of
-// each key. Each flight gets exactly one result, published as soon as it is
-// known and before it is backfilled; the flight stays registered until the
+// each key. Each flight gets exactly one result, published once its backfill
+// holds the fill lock, and before it lands unless the first layer may hold an
+// older answer (see publishesEarly); the flight stays registered until the
 // backfill is done, so a read that comes meanwhile joins it instead of
 // fetching again. run makes sure a fetch that panics or calls runtime.Goexit
 // still answers every waiter, with an error. A flight's result is a value, or
@@ -298,24 +299,25 @@ func (p *claimed[T]) publish(i int, value T, err error) {
 }
 
 // settle answers flights idxs with entries, found at layer origin
-// (len(c.layers) for the source's answers): it publishes them, backfills them
-// into the layers above origin, and only then unregisters the flights.
+// (len(c.layers) for the source's answers): it publishes them and backfills
+// them into the layers above origin (the backfill publishes, see
+// publishesEarly), and only then unregisters the flights.
 func (p *claimed[T]) settle(ctx context.Context, origin int, idxs []int, entries []Entry[T]) {
-	for j, i := range idxs {
-		value, err := entries[j].result()
-		p.c.flights.Publish(p.ks[i].flight, value, err)
-	}
-	if origin > 0 {
-		if len(idxs) == 1 {
-			i := idxs[0]
-			p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[0], leases: p.ks[i].leases, own: p.own(i)})
-		} else {
-			fills := make([]fill[T], len(idxs))
-			for j, i := range idxs {
-				fills[j] = fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[j], leases: p.ks[i].leases, own: p.own(i)}
-			}
-			p.c.backfill(ctx, origin, fills)
+	switch {
+	case origin == 0:
+		for j, i := range idxs {
+			value, err := entries[j].result()
+			p.c.flights.Publish(p.ks[i].flight, value, err)
 		}
+	case len(idxs) == 1:
+		i := idxs[0]
+		p.c.backfillOne(ctx, origin, fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[0], leases: p.ks[i].leases, own: p.own(i), k: &p.ks[i]})
+	case len(idxs) > 1:
+		fills := make([]fill[T], len(idxs))
+		for j, i := range idxs {
+			fills[j] = fill[T]{key: p.keys[i], gen: p.ks[i].gen, entry: entries[j], leases: p.ks[i].leases, own: p.own(i), k: &p.ks[i]}
+		}
+		p.c.backfill(ctx, origin, fills)
 	}
 	for _, i := range idxs {
 		p.forget(i)
@@ -438,6 +440,26 @@ type fill[T any] struct {
 	entry  Entry[T]
 	leases *keyLeases        // the fetch's leases (see claimedKey)
 	own    *flight.Flight[T] // the read's flight it answers; nil for a refresh
+	k      *claimedKey[T]    // what the fetch knows of the key: the flight it answers
+}
+
+// publishFill answers f's flight with its entry.
+func (c *Cache[T]) publishFill(f *fill[T]) {
+	value, err := f.entry.result()
+	c.flights.Publish(f.k.flight, value, err)
+}
+
+// publishesEarly reports whether f's answer is published before it lands,
+// holding its fill lock: only if no backfill or write touched the first layer
+// for its stripe since the read that missed it. Then the first layer still
+// misses until f lands there, and a read that misses joins f's flight, which
+// stays registered (no other backfill supersedes it meanwhile). Otherwise the
+// first layer may hold an older answer that landed meanwhile, and a read
+// after one that returned f's answer would hit it and go back (ADR 0022); so
+// f lands first. A refresh's always lands first: the stale entry it replaces
+// is served until then.
+func (c *Cache[T]) publishesEarly(f *fill[T]) bool {
+	return f.own != nil && epoch(c.stripes, f.key) == f.k.seen
 }
 
 // readBelow reads the layers below the first for the flights idxs, settles
@@ -628,10 +650,22 @@ func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], idxs []int
 // would otherwise undo a refresh. An answer of the source needs no such check
 // (the source is asked once at a time, see askSource, so no other answer is
 // newer), nor does a layer that leases (only the holder of its lease writes
-// it).
+// it). It publishes each fill's flight, holding the fill lock (see
+// publishesEarly), or at once if the fill is skipped.
 func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	ok, end := c.beginFills(fills)
 	defer end()
+	var late []int
+	for i, j := 0, 0; i < len(fills); i++ {
+		if j < len(ok) && ok[j] == i {
+			j++
+			if !c.publishesEarly(&fills[i]) {
+				late = append(late, i)
+				continue
+			}
+		}
+		c.publishFill(&fills[i])
+	}
 	if len(ok) == 0 {
 		return
 	}
@@ -654,20 +688,29 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 		}
 		var newer map[string]error
 		if origin < len(c.layers) {
-			newer = c.newerIn(ctx, j, answers)
+			newer = c.newerIn(ctx, j, answers, now)
 		}
 		if failed := c.layers[j].putMany(ctx, answers, nil, newer, now); len(failed) > 0 {
 			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", batchError(failed))
 		}
+	}
+	for _, i := range late {
+		fills[i].entry = answers[fills[i].key] // a newer entry it found (see newerIn)
+		c.publishFill(&fills[i])
 	}
 }
 
 // backfillOne is backfill for one answer, without the bookkeeping of many.
 func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 	if !c.beginFill(f.key, f.gen) {
+		c.publishFill(&f)
 		return
 	}
 	defer c.endFill(f.key)
+	early := c.publishesEarly(&f)
+	if early {
+		c.publishFill(&f)
+	}
 	c.supersede(&f)
 	defer c.supersede(&f) // before endFill: see supersede
 	now := c.opts.now()
@@ -676,12 +719,15 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 			c.putLeasedOne(ctx, j, &f, now)
 			continue
 		}
-		if origin < len(c.layers) && c.newerInOne(ctx, j, f.key, f.entry.CachedAt) {
+		if origin < len(c.layers) && c.newerInOne(ctx, j, &f, now) {
 			continue
 		}
 		if err := c.layers[j].put(ctx, f.key, f.entry, now); err != nil {
 			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 		}
+	}
+	if !early {
+		c.publishFill(&f)
 	}
 }
 
@@ -698,9 +744,11 @@ func (c *Cache[T]) supersede(f *fill[T]) {
 }
 
 // newerIn returns the keys of answers whose entry in layer j comes from a
-// later answer of the source: a backfill leaves them alone. A key the layer
-// fails to read is written as before.
-func (c *Cache[T]) newerIn(ctx context.Context, j int, answers map[string]Entry[T]) map[string]error {
+// later answer of the source: a backfill leaves them alone, and replaces its
+// answer with such an entry, unless rotten at now, for the layers above and
+// for its flight, which may publish after it lands (see publishesEarly). A key
+// the layer fails to read is written as before.
+func (c *Cache[T]) newerIn(ctx context.Context, j int, answers map[string]Entry[T], now time.Time) map[string]error {
 	es, _ := c.layers[j].backend.GetMany(ctx, slices.Collect(maps.Keys(answers)))
 	var newer map[string]error
 	for key, e := range es {
@@ -709,18 +757,27 @@ func (c *Cache[T]) newerIn(ctx context.Context, j int, answers map[string]Entry[
 				newer = map[string]error{}
 			}
 			newer[key] = nil
+			if e.state(now) != rotten {
+				answers[key] = e
+			}
 		}
 	}
 	return newer
 }
 
-// newerInOne is newerIn for one key, out of backfillOne so that its frame
+// newerInOne is newerIn for one fill, out of backfillOne so that its frame
 // does not grow the fetch goroutine's stack.
 //
 //go:noinline
-func (c *Cache[T]) newerInOne(ctx context.Context, j int, key string, cachedAt time.Time) bool {
-	e, ok, err := c.layers[j].backend.Get(ctx, key)
-	return err == nil && ok && e.CachedAt.After(cachedAt)
+func (c *Cache[T]) newerInOne(ctx context.Context, j int, f *fill[T], now time.Time) bool {
+	e, ok, err := c.layers[j].backend.Get(ctx, f.key)
+	if err != nil || !ok || !e.CachedAt.After(f.entry.CachedAt) {
+		return false
+	}
+	if e.state(now) != rotten {
+		f.entry = e // see newerIn
+	}
+	return true
 }
 
 // refresh refetches keys in the background (stale entries below the first

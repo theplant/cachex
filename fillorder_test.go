@@ -2,6 +2,7 @@ package cachex_test
 
 import (
 	"context"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -101,7 +102,7 @@ func TestAnOlderCopyFromBelowDoesNotReplaceANewerAnswer(t *testing.T) {
 	require.Eventually(t, func() bool { e, ok := stored(t, m0, "k"); return ok && e.Value == "v2" }, 5*time.Second, time.Millisecond)
 
 	l1.resume <- struct{}{}
-	assert.Equal(t, "v1", <-got, "the stale copy is still a valid answer")
+	assert.Equal(t, "v2", <-got, "the copy lands after the newer answer and returns it instead")
 	require.NoError(t, c.Close()) // the read's backfill, and the refresh it starts
 	w := m0.written()
 	i := slices.Index(w, "v2")
@@ -156,39 +157,31 @@ func TestAKeyIsAskedOfTheSourceOnceAtATime(t *testing.T) {
 }
 
 func TestAReadDoesNotJoinAFlightOlderThanWhatAReadReturned(t *testing.T) {
-	// a read copies the stale v1 up from the second layer and publishes it;
-	// its backfill waits for the fill lock, which a refresh holds while it
-	// writes the source's v2. A read gets v2 from the first layer; v2 is then
-	// evicted there, and the next read misses, joins the first read's flight
-	// (still registered until its backfill) and gets v1 back.
+	// a read copies the stale v1 up from the second layer while a refresh,
+	// holding the fill lock, writes the source's v2. Had the read published v1
+	// before its backfill, a read that got v2 from the first layer, saw it
+	// evicted, and joined the first read's flight would get v1 back. The copy
+	// waits for the refresh instead and answers the newer v2 it finds.
 	ctx := context.Background()
 	src := newSource(map[string]string{"k": "v1"})
 	clock, now := newClock()
 
-	var l1Armed atomic.Bool
+	var l1SetArmed, l1GetArmed atomic.Bool
 	refreshInL1 := make(chan struct{})
+	readInL1 := make(chan struct{})
 	proceed := make(chan struct{})
 	l1 := hook[string](cachextest.NewMap[string](), func(op string, _ []string, _ bool) {
-		if op == "set" && l1Armed.CompareAndSwap(true, false) {
+		switch {
+		case op == "set" && l1SetArmed.CompareAndSwap(true, false):
 			close(refreshInL1) // the refresh's backfill, holding the fill lock
 			<-proceed
+		case op == "get" && l1GetArmed.CompareAndSwap(true, false):
+			close(readInL1) // the read copying v1 up
 		}
 	})
-	var l0SetArmed, l0GetArmed atomic.Bool
-	fillChecks := make(chan struct{})
-	release := make(chan struct{})
 	m0 := cachextest.NewMap[string]()
-	l0 := hook[string](m0, func(op string, _ []string, _ bool) {
-		switch {
-		case op == "set" && l0SetArmed.CompareAndSwap(true, false):
-			l0GetArmed.Store(true) // the next get is the read's backfill checking for a newer entry
-		case op == "get" && l0GetArmed.CompareAndSwap(true, false):
-			close(fillChecks)
-			<-release
-		}
-	})
 	c := cachex.New[string](src, []cachex.Layer[string]{
-		cachex.NewLayer[string](l0, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
 		cachex.NewLayer[string](l1, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
 	}, now)
 	defer func() { _ = c.Close() }()
@@ -196,28 +189,91 @@ func TestAReadDoesNotJoinAFlightOlderThanWhatAReadReturned(t *testing.T) {
 	clock.Advance(2 * time.Minute) // stale in both layers
 	src.set("k", "v2")             // changed behind the Cache's back
 
-	l1Armed.Store(true)
-	l0SetArmed.Store(true)
+	l1SetArmed.Store(true)
 	v, err := c.Get(ctx, "k")
 	require.NoError(t, err)
 	assert.Equal(t, "v1", v, "stale, refreshed in the background")
 	<-refreshInL1
 
 	require.NoError(t, m0.Del(ctx, "k")) // evicted from the first layer
-	v, err = c.Get(ctx, "k")             // copies the stale v1 from the second layer
-	require.NoError(t, err)
-	assert.Equal(t, "v1", v)
+	l1GetArmed.Store(true)
+	got := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k") // copies the stale v1 from the second layer
+		assert.NoError(t, err)
+		got <- v
+	}()
+	<-readInL1
+	select {
+	case v := <-got:
+		close(proceed) // so that Close does not wait for the refresh forever
+		t.Fatalf("the copy returned %q before the refresh landed", v)
+	case <-time.After(10 * time.Millisecond):
+	}
 
-	close(proceed) // the refresh lands v2; the read's backfill checks the first layer
-	<-fillChecks
-
-	v, err = c.Get(ctx, "k")
-	require.NoError(t, err)
-	require.Equal(t, "v2", v, "the refresh's answer, from the first layer")
+	close(proceed) // the refresh lands v2
+	assert.Equal(t, "v2", <-got, "the copy answers the newer entry it found")
 
 	require.NoError(t, m0.Del(ctx, "k")) // evicted again
 	v, err = c.Get(ctx, "k")
-	close(release)
 	require.NoError(t, err)
 	assert.Equal(t, "v2", v, "a read after one that returned v2 must not go back")
+}
+
+func TestReadsNeverGoBackUnderChurn(t *testing.T) {
+	// the source moves on behind the Cache while entries keep turning stale
+	// and rotten in three layers: a read that starts after another returned v
+	// never returns older than v (ADR 0022)
+	if testing.Short() {
+		t.Skip("load")
+	}
+	ctx := context.Background()
+	var version atomic.Int64
+	src := cachex.SourceFunc[int64](func(context.Context, string) (int64, error) {
+		v := version.Load()
+		runtime.Gosched() // answers travel back while the source moves on
+		return v, nil
+	})
+	layer := func() cachex.Layer[int64] {
+		return cachex.NewLayer[int64](cachextest.NewMap[int64](), cachex.TTL(time.Millisecond, 3*time.Millisecond))
+	}
+	c := cachex.New[int64](src, []cachex.Layer[int64]{layer(), layer(), layer()})
+	defer func() { _ = c.Close() }()
+
+	stop := make(chan struct{})
+	var bumps sync.WaitGroup
+	bumps.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				version.Add(1)
+				time.Sleep(50 * time.Microsecond)
+			}
+		}
+	})
+	var returned atomic.Int64 // the newest version a read returned
+	var readers sync.WaitGroup
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for range 8 {
+		readers.Go(func() {
+			for time.Now().Before(deadline) {
+				floor := returned.Load()
+				v, err := c.Get(ctx, "k")
+				if !assert.NoError(t, err) {
+					return
+				}
+				if v < floor {
+					t.Errorf("read %d after a read had returned %d", v, floor)
+					return
+				}
+				for cur := returned.Load(); v > cur && !returned.CompareAndSwap(cur, v); cur = returned.Load() {
+				}
+			}
+		})
+	}
+	readers.Wait()
+	close(stop)
+	bumps.Wait()
 }
