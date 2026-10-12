@@ -60,10 +60,11 @@ func newToken() string {
 	return hex.EncodeToString(buf[:])
 }
 
-// chunks returns the storable keys in byte order (the order rows are locked
-// in, see setMany), with their prefixed forms, in chunks.
+// chunks returns the storable keys once each, in byte order (the order rows
+// are locked in, see setMany), with their prefixed forms, in chunks. A key
+// twice in one statement would get two tokens, the row only one of them.
 func (l leaser) chunks(keys []string) [][2][]string {
-	keys = slices.DeleteFunc(slices.Sorted(slices.Values(keys)), func(key string) bool { return !storable(l.b.prefix + key) })
+	keys = slices.DeleteFunc(slices.Compact(slices.Sorted(slices.Values(keys))), func(key string) bool { return !storable(l.b.prefix + key) })
 	var out [][2][]string
 	for chunk := range slices.Chunk(keys, min(l.b.chunkSize, maxLeaseChunk)) {
 		prefixed := make([]string, len(chunk))

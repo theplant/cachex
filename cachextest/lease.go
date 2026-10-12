@@ -57,6 +57,15 @@ func TestLeaser[T any](t *testing.T, newBackend func(t *testing.T) cachex.Backen
 		assert.Empty(t, lease(t, l, "k"), "leased already")
 	})
 
+	t.Run("a repeated key is leased once", func(t *testing.T) {
+		_, l := setup(t)
+		tokens := lease(t, l, "k", "k")
+		require.NotEmpty(t, tokens["k"])
+		assert.Empty(t, lease(t, l, "k"), "leased already")
+		require.NoError(t, l.Release(ctx, tokens))
+		assert.NotEmpty(t, lease(t, l, "k")["k"], "its token was the one held")
+	})
+
 	t.Run("PutLeased writes under the token and ends the lease", func(t *testing.T) {
 		b, l := setup(t)
 		tokens := lease(t, l, "k")
