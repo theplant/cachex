@@ -1,6 +1,7 @@
 // Package gobuscachex is the cachex invalidation broadcast over go-bus
-// (github.com/qor5/go-bus), a publish-subscribe bus on PostgreSQL: for
-// deployments that have a database but no Redis. See cachex.WithBroadcast.
+// (github.com/qor5/go-bus), a publish-subscribe bus on PostgreSQL, which it
+// needs: it is for deployments on PostgreSQL that have no Redis (with MySQL,
+// use rediscachex.NewBroadcast). See cachex.WithBroadcast.
 package gobuscachex
 
 import (

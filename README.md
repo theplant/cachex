@@ -132,7 +132,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
     rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
 ```
 
-It uses Redis Pub/Sub (Redis Cluster too); without Redis, `gobuscachex.NewBroadcast` does the same over go-bus, on PostgreSQL, with messages polled from a queue per instance. Messages published while an instance is disconnected are lost, so each time it subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
+It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `gobuscachex.NewBroadcast` does the same over go-bus, with messages polled from a queue per instance. Messages published while an instance is disconnected are lost, so each time it subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
 
 ## Options
 
@@ -157,7 +157,7 @@ It uses Redis Pub/Sub (Redis Cluster too); without Redis, `gobuscachex.NewBroadc
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
 | `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys; `Leases` for a Redis several instances share; `NewBroadcast` for the invalidation broadcast |
 | `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL 8.0.17+ only; see Pitfalls for keys, isolation and expired rows; `Leases` for a table several instances share |
-| `gobuscachex` | nothing: the invalidation broadcast over go-bus | For deployments without Redis; each instance subscribes a queue of its own, kept alive by heartbeats |
+| `gobuscachex` | nothing: the invalidation broadcast over go-bus | PostgreSQL only; for deployments with PostgreSQL and no Redis; each instance subscribes a queue of its own, kept alive by heartbeats |
 | `cachextest` | values in memory, unbounded | For tests only, with `Clock`, `NewLeasingMap` (a shared map with leases, for Caches standing for instances), `NewBus` (an in-memory broadcast that can lose messages), and `TestBackend`, `TestByteBackend`, `TestLeaser` and `TestBroadcast`, contract tests for your own backends and transports |
 
 `rediscachex.New` and `bigcachex.New` return a `cachex.Backend[T]`; `gormcachex.New` returns a `*gormcachex.Backend[T]`, which is one and adds `Migrate`.
@@ -202,6 +202,8 @@ Each item: the mistake, what happens, what to do.
 - **`gormcachex` without `Migrate`, or a MySQL table not in `utf8mb4_0900_bin`.** `Migrate` creates the table, and rejects an existing MySQL table whose key column uses any other collation. Keys, `KeyPrefix` included, are at most 255 characters of valid UTF-8 without NUL; any other key always misses and fails to be written. Expired rows are not deleted for you. Only each database's default isolation level is supported.
 - **Calling `Set`/`Del` inside the transaction that changes the source.** `gormcachex` never joins it: every statement commits on its own, so a rollback does not undo the cache. Call them after the commit.
 - **A `cachextest.Clock` far behind the wall clock, with a backend that expires entries.** Backends expire entries by the wall clock whatever `WithNow` says, so they drop entries computed by such a clock at once and every read misses. Start the clock at `time.Now()`, or use `cachextest.Map`.
+
+- **`gobuscachex` without PostgreSQL.** go-bus runs on PostgreSQL only: with MySQL, it would take a PostgreSQL of its own just for the broadcast. Use it when the database is PostgreSQL and there is no Redis; otherwise use `rediscachex.NewBroadcast`.
 
 **Lifecycle**
 

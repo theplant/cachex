@@ -200,7 +200,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 
 ## gobuscachex
 
-只有失效广播的传输，不存条目：`NewBroadcast` 返回一个基于 go-bus（github.com/qor5/go-bus，PostgreSQL 上的发布订阅）的 `cachex.Broadcast`，给没有 Redis 的部署用。机制见 [consistency.md](consistency.md#失效广播)。
+只有失效广播的传输，不存条目：`NewBroadcast` 返回一个基于 go-bus（github.com/qor5/go-bus，PostgreSQL 上的发布订阅）的 `cachex.Broadcast`。go-bus 只支持 PostgreSQL，所以它只适合数据库是 PostgreSQL、又没有 Redis 的部署；缓存表在 MySQL 的项目要用它，得另起一个 PostgreSQL，不如用 `rediscachex.NewBroadcast`。机制见 [consistency.md](consistency.md#失效广播)。
 
 - **主题**默认 `cachex.invalidate`；几份缓存共用一个 go-bus 时，各给各的（只能是小写、用点分隔）。
 - **每次 `Listen` 订阅一个自己的队列**（`cachex-` 加随机后缀），带 TTL（默认 1 分钟）和自动清空，订阅成功就调用 `ready`；`ctx` 结束时停掉消费者、退订（go-bus 的退订是软删除）。
