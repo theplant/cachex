@@ -127,6 +127,7 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 - 频道默认是 `cachex-invalidate:` 加 `KeyPrefix`（同一个前缀就是同一份缓存的几个实例），`Channel` 可以覆盖。
 - 用普通的 `PUBLISH`/`SUBSCRIBE`：Redis Cluster 上消息经集群总线到达所有节点，订阅者连在哪个节点都收得到。
 - go-redis 断线后，下一次 `Receive` 会自动重连并重新订阅，订阅成功时返回一条 `*redis.Subscription`，`Listen` 在这时调用 `ready`，`Cache` 随即清空本地层。出错时退避重试（50ms 起，最长 2 秒），不空转。
+- **连接无声地断了**（主从切换后旧主机消失、NAT 忘了这条连接）时，`Receive` 不会报错，会一直等下去，期间的消息全丢、本地层也不清空，要等 TCP keepalive 几十分钟后才发现。所以 `Listen` 收消息带超时（15 秒）：一直没动静就发一个 PING，再等 15 秒还是什么都没收到，就关掉这个订阅、重新订阅（随后调用 `ready`）。go-redis 自己的 `Channel()` 也是这样做健康检查的，但 `Receive` 不做。有测试用一个「冻住已有连接」的 TCP 代理复现。
 - go-redis 阻塞在读上的 `Receive` 不理会 ctx 的取消，所以 ctx 一结束就关掉订阅，让 `Listen` 返回。
 - 在 miniredis、真实的 Redis 7 和单节点 Redis Cluster 上跑过 `TestBroadcast`；miniredis 重启之后会再调用一次 `ready`。
 
