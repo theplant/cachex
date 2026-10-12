@@ -120,6 +120,16 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 - **写入**：同一个 pipeline 里**先删租约 key、再写数据**。顺序反过来的话，写完数据、还没删租约的那一刻，持有旧令牌的回填仍能把旧值写进去。有测试截获 pipeline 检查这个顺序。
 - 在真实的 Redis 7 和单节点 Cluster（`CROSSSLOT` 检查生效）上跑过 `TestLeaser`；平时的测试用 miniredis，它的 TTL 由测试按真实时间推进。
 
+### 失效广播（`NewBroadcast`）
+
+`NewBroadcast` 返回一个 `cachex.Broadcast`，机制见 [consistency.md](consistency.md#失效广播)。
+
+- 频道默认是 `cachex-invalidate:` 加 `KeyPrefix`（同一个前缀就是同一份缓存的几个实例），`Channel` 可以覆盖。
+- 用普通的 `PUBLISH`/`SUBSCRIBE`：Redis Cluster 上消息经集群总线到达所有节点，订阅者连在哪个节点都收得到。
+- go-redis 断线后，下一次 `Receive` 会自动重连并重新订阅，订阅成功时返回一条 `*redis.Subscription`，`Listen` 在这时调用 `ready`，`Cache` 随即清空本地层。出错时退避重试（50ms 起，最长 2 秒），不空转。
+- go-redis 阻塞在读上的 `Receive` 不理会 ctx 的取消，所以 ctx 一结束就关掉订阅，让 `Listen` 返回。
+- 在 miniredis、真实的 Redis 7 和单节点 Redis Cluster 上跑过 `TestBroadcast`；miniredis 重启之后会再调用一次 `ready`。
+
 ## gormcachex
 
 ### 表结构

@@ -124,7 +124,14 @@ if errors.As(err, &be) {
 shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
 ```
 
-`gormcachex` 也有同样的 `Leases` 选项，给多个实例共用的表用（要先调 `Migrate`）。一次回源在 Redis 未命中的每个 key 上领租约，写入这个 key 会结束租约，回源只有还持有租约时才写 Redis。别的实例持有租约时，未命中照样返回结果，只是不写 Redis；后台刷新则把这个 key 交给那个实例。租约管不到其他实例的内存层：写入要等它们的条目腐烂才看得到，所以内存层的 TTL 要短，Redis 层的 TTL 可以长。
+`gormcachex` 也有同样的 `Leases` 选项，给多个实例共用的表用（要先调 `Migrate`）。一次回源在 Redis 未命中的每个 key 上领租约，写入这个 key 会结束租约，回源只有还持有租约时才写 Redis。别的实例持有租约时，未命中照样返回结果，只是不写 Redis；后台刷新则把这个 key 交给那个实例。租约管不到其他实例的内存层。要让写入也到达那里，打开失效广播：一次写入之后，每个实例都从自己的内存层里删掉写过的 key。
+
+```go
+products := cachex.New(source, layers, cachex.WithBroadcast(
+    rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
+```
+
+它用 Redis Pub/Sub（Redis Cluster 也可以）。实例断线期间发布的消息会丢，所以每次重新订阅时，它都清空自己的内存层：丢一条消息的代价是内存层变冷，而不是读到旧值。广播只碰后端在进程内的层（`ottercachex`、`bigcachex`，或者自己实现了 `cachex.LocalBackend` 的后端），开了广播就至少要有一个这样的层。发布失败只记日志，不返回错误。租约和失效广播都打开时，Redis 层的 TTL 可以设长，一次写入在消息到达时就在每个实例上可见。
 
 ## 选项
 
@@ -147,9 +154,9 @@ shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, Ke
 |---|---|---|
 | `ottercachex` | 内存里的值 | 必须设 `MaximumSize`（条目数）或 `MaximumWeight` 加 `Weigher`；每个条目各自到期 |
 | `bigcachex` | 内存里编码后的条目 | 数百万条目、GC 在 profile 里显眼时使用；每次读取都要解码 |
-| `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline；多个实例共用时打开 `Leases` |
+| `rediscachex` | Redis 或 Redis Cluster 里编码后的条目 | 每个条目原生过期；批量调用是每段 `ChunkSize` 个 key 的 pipeline；多个实例共用时打开 `Leases`；`NewBroadcast` 提供失效广播 |
 | `gormcachex` | 数据表里编码后的条目 | 先调 `Migrate`；MySQL 只支持 8.0.17 及以上；key、隔离级别、过期的行见注意事项；多个实例共用时打开 `Leases` |
-| `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`、`NewLeasingMap`（打开了租约的 map，几个代表不同实例的 `Cache` 共用它），以及给自写后端用的契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser` |
+| `cachextest` | 内存里的值，没有上限 | 只用于测试，另有 `Clock`、`NewLeasingMap`（打开了租约的共享 map，几个代表不同实例的 `Cache` 共用它）、`NewBus`（内存里的失效广播，可以模拟丢消息），以及给自写后端和传输用的契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser`、`TestBroadcast` |
 
 `rediscachex.New` 和 `bigcachex.New` 返回 `cachex.Backend[T]`；`gormcachex.New` 返回 `*gormcachex.Backend[T]`，它也是一个 `cachex.Backend[T]`，另有 `Migrate`。
 
@@ -180,7 +187,7 @@ shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, Ke
 **写入**
 
 - **先写缓存再写数据源，或者只写缓存。** `Set` 和 `Del` 从不写数据源。先改数据源，再对同一个 `Cache` 调用 `Set` 或 `Del`；顺序反过来，中间的读取可能把旧值重新缓存进去。
-- **以为一个进程的写入会到达另一个进程的内存层。** 不会；那里只靠 TTL 限制旧数据活多久。内存层的 TTL 按能接受的程度来设；共用的 Redis 要打开租约（见「多个实例」），否则它的 TTL 也决定旧数据能活多久。
+- **以为一个进程的写入会到达另一个进程的内存层。** 不会；那里只靠 TTL 限制旧数据活多久。打开失效广播，或者把内存层的 TTL 设成能接受的程度；共用的 Redis 要打开租约（见「多个实例」），否则它的 TTL 也决定旧数据能活多久。
 - **以为 `Del` 会记下「这个 key 已经不存在」。** 它只删除条目；下次读取会去问数据源。
 - **忽略 `Set` 或 `Del` 的错误。** 失败那一层下面的层可能已经是新值；失败的层和它上面的层会删掉这个 key（尽力而为）。数据源保持你改过的样子。
 

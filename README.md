@@ -125,7 +125,14 @@ When several processes share a Redis layer, one of them may read a value from th
 shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
 ```
 
-`gormcachex` has the same `Leases` option, for a table several instances share (after `Migrate`). A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. Leases do not reach other instances' memory layers: a write still shows there only when their entries rot, so keep the memory layer's TTLs short, and the Redis layer's TTLs can be long.
+`gormcachex` has the same `Leases` option, for a table several instances share (after `Migrate`). A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. Leases do not reach other instances' memory layers. For that, turn on the invalidation broadcast: after a write, each instance drops the written keys from its memory layers.
+
+```go
+products := cachex.New(source, layers, cachex.WithBroadcast(
+    rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
+```
+
+It uses Redis Pub/Sub (Redis Cluster too). Messages published while an instance is disconnected are lost, so each time it subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
 
 ## Options
 
@@ -148,9 +155,9 @@ shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, Ke
 |---|---|---|
 | `ottercachex` | values in memory | `MaximumSize` (entries) or `MaximumWeight` with `Weigher` is required; each entry expires at its own time |
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
-| `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys; `Leases` for a Redis several instances share |
+| `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys; `Leases` for a Redis several instances share; `NewBroadcast` for the invalidation broadcast |
 | `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL 8.0.17+ only; see Pitfalls for keys, isolation and expired rows; `Leases` for a table several instances share |
-| `cachextest` | values in memory, unbounded | For tests only, with `Clock`, `NewLeasingMap` (a map with leases, to share between Caches standing for instances), and `TestBackend`, `TestByteBackend` and `TestLeaser`, contract tests for your own backends |
+| `cachextest` | values in memory, unbounded | For tests only, with `Clock`, `NewLeasingMap` (a shared map with leases, for Caches standing for instances), `NewBus` (an in-memory broadcast that can lose messages), and `TestBackend`, `TestByteBackend`, `TestLeaser` and `TestBroadcast`, contract tests for your own backends and transports |
 
 `rediscachex.New` and `bigcachex.New` return a `cachex.Backend[T]`; `gormcachex.New` returns a `*gormcachex.Backend[T]`, which is one and adds `Migrate`.
 
@@ -181,7 +188,7 @@ Each item: the mistake, what happens, what to do.
 **Writes**
 
 - **Writing the cache before the source, or only the cache.** `Set` and `Del` never write the source. Change the source first, then call `Set` or `Del` on the same `Cache`; the other order lets a read in between cache the old value again.
-- **Expecting a write in one process to reach another's memory layer.** It does not; there only the TTLs bound how long old data lives. Set the memory layer's TTLs to what you can accept, and turn leases on for a shared Redis (see Several instances), or its TTLs bound old data too.
+- **Expecting a write in one process to reach another's memory layer.** It does not; there only the TTLs bound how long old data lives. Turn on the invalidation broadcast, or set the memory layer's TTLs to what you can accept; turn leases on for a shared Redis (see Several instances), or its TTLs bound old data too.
 - **Expecting `Del` to record that the key no longer exists.** It only drops the entries; the next read asks the source.
 - **Ignoring an error from `Set` or `Del`.** The layers below the failed one may hold the new value; the key is dropped from the failed layer and those above (best effort). The source is as you left it.
 
