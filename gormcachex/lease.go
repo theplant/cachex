@@ -89,8 +89,25 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 		}
 	}
 	db := l.b.db.WithContext(ctx)
+	orphans := map[string]string{} // tokens a failed chunk may have left in rows
+	defer func() {
+		if len(orphans) == 0 {
+			return
+		}
+		// end them, or nobody could lease the keys until the TTL; best
+		// effort, once, with a budget of its own (ctx may be what ended)
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = l.Release(rctx, orphans)
+	}()
 	for _, c := range l.chunks(keys) {
 		chunk, prefixed := c[0], c[1]
+		if err := ctx.Err(); err != nil { // the chunks left would fail too
+			for _, key := range chunk {
+				errs[key] = fmt.Errorf("gormcachex: lease %q: %w", key, err)
+			}
+			continue
+		}
 		now := time.Now().UTC() // see utc in gorm.go
 		until := now.Add(ttl)
 		tokens := make([]string, len(chunk))
@@ -104,6 +121,7 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 		err := l.b.write(ctx, func(db *gorm.DB) error {
 			return db.Table(l.b.table).Clauses(clause.OnConflict{Columns: []clause.Column{keyColumn}, DoNothing: true}).Create(&rows).Error
 		})
+		inserted := err == nil
 		if err == nil {
 			err = l.b.write(ctx, func(db *gorm.DB) error {
 				free := clause.Or(clause.Eq{Column: leaseToken, Value: nil}, clause.Lt{Column: leaseUntil, Value: now})
@@ -120,16 +138,11 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 			for _, key := range chunk {
 				errs[key] = fmt.Errorf("gormcachex: lease %q: %w", key, err)
 			}
-			// the rows the first statement inserted (or the second took) hold
-			// tokens the caller never gets: end them, or nobody could lease
-			// the keys until the TTL (best effort; ctx may be what ended)
-			ours := make(map[string]string, len(chunk))
-			for i, key := range chunk {
-				ours[key] = tokens[i]
+			if inserted { // its rows (or the leases the second statement took) hold tokens the caller never gets
+				for i, key := range chunk {
+					orphans[key] = tokens[i]
+				}
 			}
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-			_ = l.Release(rctx, ours)
-			cancel()
 			continue
 		}
 		mine := make(map[string]string, len(chunk))

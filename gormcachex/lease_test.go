@@ -186,3 +186,17 @@ func TestAFailedLeaseLeavesNoLeaseBehind(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEmpty(t, tokens["k"], "nobody holds k's lease")
 }
+
+func TestALeaseOnAHungDatabaseKeepsToItsContext(t *testing.T) {
+	db := newSQLite(t)
+	b := newBackend(t, Config[string]{DB: db, Leases: true, ChunkSize: 1})
+	hang := func(tx *gorm.DB) { <-tx.Statement.Context.Done(); _ = tx.AddError(tx.Statement.Context.Err()) }
+	require.NoError(t, db.Callback().Create().Before("gorm:create").Register("test:hang", hang))
+	require.NoError(t, db.Callback().Delete().Before("gorm:delete").Register("test:hang", hang))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := b.Leaser().Lease(ctx, []string{"a", "b"}, time.Minute)
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), time.Second, "nothing was inserted: nothing to release")
+}

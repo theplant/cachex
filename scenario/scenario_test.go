@@ -364,7 +364,12 @@ func testOneRefresh(t *testing.T, e env) {
 	for _, in := range ins {
 		require.NoError(t, in.Close()) // waits for its refresh
 	}
-	assert.EqualValues(t, 2, src.calls.Load(), "one refresh asked the source")
+	// one refresh asks the source (2 with the first fetch); a refresh that read
+	// the shared layer stale just before another landed and ended its lease
+	// takes the lease anew and asks again (ADR 0020 accepts that window), so
+	// 3 under load; without leases every instance would (4)
+	calls := src.calls.Load()
+	assert.True(t, calls == 2 || calls == 3, "the leases kept the refreshes to one (or two): %d source calls", calls)
 	e2, ok, err := shared.Get(ctx, "k")
 	require.NoError(t, err)
 	require.True(t, ok)
