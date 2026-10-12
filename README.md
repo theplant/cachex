@@ -132,7 +132,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
     rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
 ```
 
-It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `gobuscachex.NewBroadcast` does the same over go-bus, with messages polled from a queue per instance. Messages published while an instance is disconnected are lost, so each time it subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
+It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `gobuscachex.NewBroadcast` does the same over go-bus, with messages polled from a queue per instance. Over Redis, messages published while an instance is disconnected are lost; over go-bus they wait in its queue, unless its subscription expired. Either way, each time an instance subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
 
 ## Options
 

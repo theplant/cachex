@@ -1,6 +1,6 @@
 # 用自己的合并回源实现（internal/flight）替换 x/sync/singleflight
 
-> 后台刷新后来改为认领自己的在途回源，不再和 `Get`、`GetMany` 合并，见 [ADR 0016](0016-refresh-has-its-own-flights.md)。
+> 后台刷新后来改为认领自己的在途回源，不再和 `Get`、`GetMany` 合并，见 [ADR 0016](0016-refresh-has-its-own-flights.md)。`WithFetchesPerKey` 和 `slot` 后来删掉了，现在的 key 是 `flightKey{key, refresh}`，见 [ADR 0021](0021-one-fetch-per-key.md)。
 
 `GetMany` 要在同一套合并回源里**逐个认领**多个 key，然后把自己领头的那些 key 合成每层一次调用。认领时必须**当场**知道自己是不是领头请求。`golang.org/x/sync/singleflight` 的 `DoChan` 做不到：它在锁内决定谁是领头，但把回源函数放进另一个 goroutine 执行，不把结果告诉调用方。如果为了得到答案而等待，两个互相重叠的批量读会各自等对方手里的 key，从而死锁。所以我们写了 `flight.Group`（内部包 `internal/flight`）：`Claim` 立即返回（在途回源，是否领头），`Publish` 发布结果，`Forget` 注销登记。`Get` 和 `GetMany` 共用它，因此它们之间也只回源一次。
 

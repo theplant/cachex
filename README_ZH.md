@@ -131,7 +131,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
     rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
 ```
 
-它用 Redis Pub/Sub（Redis Cluster 也可以）；没有 Redis、但数据库是 PostgreSQL 时，`gobuscachex.NewBroadcast` 用 go-bus 做同样的事，每个实例一个队列，轮询取消息。实例断线期间发布的消息会丢，所以每次重新订阅时，它都清空自己的内存层：丢一条消息的代价是内存层变冷，而不是读到旧值。广播只碰后端在进程内的层（`ottercachex`、`bigcachex`，或者自己实现了 `cachex.LocalBackend` 的后端），开了广播就至少要有一个这样的层。发布失败只记日志，不返回错误。租约和失效广播都打开时，Redis 层的 TTL 可以设长，一次写入在消息到达时就在每个实例上可见。
+它用 Redis Pub/Sub（Redis Cluster 也可以）；没有 Redis、但数据库是 PostgreSQL 时，`gobuscachex.NewBroadcast` 用 go-bus 做同样的事，每个实例一个队列，轮询取消息。用 Redis 时，实例断线期间发布的消息会丢；用 go-bus 时消息留在它的队列里，除非订阅已经过期。不管哪种，实例每次重新订阅时都清空自己的内存层：丢一条消息的代价是内存层变冷，而不是读到旧值。广播只碰后端在进程内的层（`ottercachex`、`bigcachex`，或者自己实现了 `cachex.LocalBackend` 的后端），开了广播就至少要有一个这样的层。发布失败只记日志，不返回错误。租约和失效广播都打开时，Redis 层的 TTL 可以设长，一次写入在消息到达时就在每个实例上可见。
 
 ## 选项
 
