@@ -150,10 +150,29 @@ func errForKey(err error, key string) error {
 }
 
 // Batched turns a SingleBackend into a Backend whose Many methods go key by
-// key, best effort: the keys that fail are reported in a *BatchError.
-func Batched[T any](b SingleBackend[T]) Backend[T] { return batched[T]{b} }
+// key, best effort: the keys that fail are reported in a *BatchError. It
+// forwards b's LocalBackend and Leasing, if b has them.
+func Batched[T any](b SingleBackend[T]) Backend[T] {
+	if _, local := b.(LocalBackend); local {
+		return batchedLocal[T]{batched[T]{b}}
+	}
+	return batched[T]{b}
+}
 
 type batched[T any] struct{ SingleBackend[T] }
+
+func (b batched[T]) Leaser() Leaser[T] {
+	if l, ok := b.SingleBackend.(Leasing[T]); ok {
+		return l.Leaser()
+	}
+	return nil
+}
+
+type batchedLocal[T any] struct{ batched[T] }
+
+func (b batchedLocal[T]) Clear(ctx context.Context) error {
+	return b.SingleBackend.(LocalBackend).Clear(ctx)
+}
 
 func (b batched[T]) GetMany(ctx context.Context, keys []string) (map[string]Entry[T], error) {
 	out := make(map[string]Entry[T], len(keys))

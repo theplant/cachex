@@ -174,3 +174,20 @@ func TestMapBackend(t *testing.T) {
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[string] { return cachextest.NewMap[string]() }, strs)
 	cachextest.TestBackend(t, func(t *testing.T) cachex.Backend[product] { return cachextest.NewMap[product]() }, products)
 }
+
+func TestBatchedForwardsLocalAndLeases(t *testing.T) {
+	_, local := cachex.Batched[string](&singleMap{Map: cachextest.NewMap[string]()}).(cachex.LocalBackend)
+	assert.True(t, local, "a local store stays local")
+
+	leasing := cachextest.NewLeasingMap[string]()
+	b := cachex.Batched[string](struct{ cachex.SingleBackend[string]; cachex.Leasing[string] }{leasing, leasing})
+	_, local = b.(cachex.LocalBackend)
+	assert.False(t, local)
+	l, ok := b.(cachex.Leasing[string])
+	require.True(t, ok)
+	assert.NotNil(t, l.Leaser(), "its leases are kept")
+
+	l, ok = cachex.Batched[string](&singleMap{Map: cachextest.NewMap[string]()}).(cachex.Leasing[string])
+	require.True(t, ok)
+	assert.Nil(t, l.Leaser(), "a store that does not lease has no Leaser")
+}
