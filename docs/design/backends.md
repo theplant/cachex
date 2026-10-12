@@ -219,7 +219,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 - **探测投递**：消费者可能停了却不报告。go-que 的 mutex 把锁住的任务挂在一条连接上，这条连接断过一次（数据库重启、主从切换），它之后每次都报 `que: bad mutex`，quex 用同一个 mutex 重建 worker，于是永远失败；心跳走连接池，照常成功。所以队列另外订阅一个只有它自己的主题（`cachex.probe.` 加队列后缀；不拼在配置的主题后面，因为 go-bus 限制主题最多 16 段、255 个字符），每次心跳时往里发一条探测；超过一个 TTL 没收到探测，就当订阅丢了，重新订阅（新的消费者带新的 mutex）并调用 `ready`。代价是每个实例每 TTL 三分之一一条消息。
 - **消息不会因为断线而丢**：实例慢了或者短暂断开，消息留在它的队列里；只有订阅过期才会丢，上面已经兜住。
 - **延迟取决于轮询**：消费者按 `WorkerConfig.MaxLockPerSecond` 轮询数据库，消息大约在一个轮询间隔内到达。go-bus 并发执行处理函数，这里加锁，一次只交给 `Cache` 一条。
-- 载荷是 `[]byte`，go-bus 把它编成 base64 的 JSON 字符串；解不开的消息直接销毁，不重试。处理完的消息和探测也用 `Destroy` 删掉：go-que 的 `Done` 只给行打上完成时间，没有任何东西会再删它，`goque_jobs` 会一直长。
+- 载荷是 `[]byte`，go-bus 把它编成 base64 的 JSON 字符串；解不开的消息直接销毁，不重试。处理完的消息和探测也用 `Destroy` 删掉：go-que 的 `Done` 只给行打上完成时间，没有任何东西会再删它，`goque_jobs` 会一直长。崩溃（没有退订）的实例留下的队列，以及 `Destroy` 失败后重试过的任务，go-bus 目前都不回收，见 [todo](../todo.md)。
 - 在 PostgreSQL 16 容器上跑 `TestBroadcast`、订阅过期后续订、两个实例的端到端测试；没有 Docker 时跳过。
 
 依赖 go-bus 时要注意：go-bus v0.1.2 的 go.mod 要求被撤回的 `go-sqlite3 v2.0.3+incompatible`，Go 会按版本号选中它，把每个依赖 cachex、自己也用 go-sqlite3 的项目降级到 2020 年的版本。所以这里依赖的是修好之后的提交（qor5/go-bus#36），go-bus 发版后换成正式版本（见 [todo](../todo.md)）。
