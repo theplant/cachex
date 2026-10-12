@@ -107,7 +107,6 @@ flowchart LR
 | 选项 | 默认 | 作用 | 详见 |
 |---|---|---|---|
 | `WithFetchTimeout(d)` | `DefaultFetchTimeout` = 60 秒 | 回源的每一步、写入失败后的失效，各自受它限时 | [singleflight.md](design/singleflight.md#回源用的-ctx) |
-| `WithFetchesPerKey(n)` | `DefaultFetchesPerKey` = 1 | 同一个 key 同时最多几个读取的回源（后台刷新另算一个）；1 表示并发未命中共用一次回源 | [singleflight.md](design/singleflight.md#每个-key-的回源数) |
 | `WithGetManyConcurrency(n)` | `DefaultGetManyConcurrency` = 16 | 一次 `GetMany` 同时向数据源发出的请求数：数据源不是批量数据源时是 `Get` 调用，否则是每段一次的调用；名额不够时下一段等着 | [batch.md](design/batch.md#回源怎么发) |
 | `WithGetManyChunkSize(n)` | 0（全部一段） | 一次 `GetMany`（以及多个 key 的后台刷新）每段多少个 key：一段开始时才认领，每层一次调用、问数据源、各自回填；还没开始的段不认领，并发的 `Get` 不用等它 | [batch.md](design/batch.md#回源怎么发) |
 | `WithMaxAge(func(T) time.Duration)` | 不限 | 按值给条目定寿命上限，在回源拿到值时调用一次，`Set`/`SetMany` 写入值时也调用；返回 0 或负数表示不缓存；`T` 必须和 `Cache` 的一致，否则 `New` panic | [read-path.md](design/read-path.md#条目的寿命) |
@@ -135,7 +134,7 @@ flowchart LR
 | 文档 | 内容 |
 |---|---|
 | [design/read-path.md](design/read-path.md) | 一次 `Get` 的完整流程：条目的寿命、三态、不存在记录、返回陈旧值、二次检查、回填 |
-| [design/singleflight.md](design/singleflight.md) | 合并回源：认领、发布与注销、回源 ctx 和 `WithFetchTimeout`、panic 与 Goexit、每个 key 的回源数、后台刷新 |
+| [design/singleflight.md](design/singleflight.md) | 合并回源：认领、发布与注销、回源 ctx 和 `WithFetchTimeout`、panic 与 Goexit、后台刷新 |
 | [design/write-order.md](design/write-order.md) | 写入顺序：先写下层、分片锁、写入代数、回填保护、摘除在途回源、写入顺序守卫、失败时怎么办 |
 | [design/batch.md](design/batch.md) | 批量读：流程、分段与并发、错误模型和三种结果 |
 | [design/backends.md](design/backends.md) | 后端接口、字节后端与 `Encoded`、编解码、过期按真实时钟、各子包的实现要点、契约测试 |

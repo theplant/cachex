@@ -337,7 +337,7 @@ func TestWritesAreNeverUndoneByReads(t *testing.T) {
 		c := cachex.New(src, []cachex.Layer[string]{
 			cachex.NewLayer(jittery(m1), cachex.TTL(time.Hour, 0), cachex.NotFoundTTL(time.Hour, 0)),
 			cachex.NewLayer(jittery(m2), cachex.TTL(time.Hour, 0), cachex.NotFoundTTL(time.Hour, 0)),
-		}, cachex.WithFetchesPerKey(1+r.IntN(3)), cachex.WithGetManyChunkSize(r.IntN(3)))
+		}, cachex.WithGetManyChunkSize(r.IntN(3)))
 		keys := []string{"a", "b", "c"}
 		var rowLocks [3]sync.Mutex
 		var wg sync.WaitGroup

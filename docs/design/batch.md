@@ -65,7 +65,7 @@ sequenceDiagram
 | 实现了 `BatchSource` | 每段一次 `GetMany`；默认只有一段 | 每段一个 `WithFetchTimeout`，覆盖这次调用和随后的回填（见 [singleflight.md](singleflight.md#回源用的-ctx)） | 这一段返回时，一起拿到 |
 | 没有实现 | 每个 key 一次 `Get`，一段之内并发执行 | 每个 key 一个 `WithFetchTimeout` | 自己那个 key 返回时 |
 
-两种情况的并发上限都是 `WithGetManyConcurrency`（默认 16），它的含义是「一次 `GetMany` 同时向数据源发出的请求数」：批量数据源每段占一个名额，普通数据源每段占 `min(分段大小, 并发数)` 个名额，名额不够时下一段等着，不认领。不要和 `WithFetchesPerKey` 混淆，后者是同一个 key 同时最多几个在途回源。
+两种情况的并发上限都是 `WithGetManyConcurrency`（默认 16），它的含义是「一次 `GetMany` 同时向数据源发出的请求数」：批量数据源每段占一个名额，普通数据源每段占 `min(分段大小, 并发数)` 个名额，名额不够时下一段等着，不认领。同一个 key 的并发未命中总是共用一次回源，这个选项管的不是它。
 
 分段大小是一个取舍：
 

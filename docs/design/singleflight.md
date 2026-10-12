@@ -30,7 +30,6 @@ type Group[K comparable, T any] struct {
 // package cachex
 type flightKey struct {
     key     string
-    slot    int  // 见「每个 key 的回源数」
     refresh bool // 后台刷新的在途回源，见「后台刷新」
 }
 ```
@@ -139,15 +138,6 @@ sequenceDiagram
 
 这一点和 `x/sync/singleflight` 不同：x/sync 在 Goexit 时，不会给 `DoChan` 的等待方发送任何结果，等待方要一直等到自己的 ctx 结束；没有截止时间的话，就永远挂着（[golang/go#52557](https://github.com/golang/go/issues/52557)）。cachex 有意偏离了这一点，见 [ADR 0006](../adr/0006-goexit-publishes-an-error.md)。
 
-## 每个 key 的回源数
-
-`WithFetchesPerKey(n)` 允许同一个 key 同时有 n 个读取的在途回源；后台刷新另有自己的在途回源（一个 key 同时最多一个刷新），不算在 n 里。实现上，登记的 key 是 `flightKey{key, slot, refresh}`，n 大于 1 时读取的 `slot` 是 `[0, n)` 里的随机数，每次请求随机落进一份；n 为 1 时、以及刷新，`slot` 恒为 0。用结构体而不是拼字符串，认领时不分配内存。
-
-- `n = 1`（默认）：完全合并，一个 key 同一时刻只回源一次。
-- `n > 1`：请求分散到 n 份，最多同时回源 n 次。代价是多打下层和数据源，好处是避免单个慢回源拖住所有请求。
-- 二次检查读的是 key 本身，所以任何一份先完成回填，其他份之后的请求都能读到它，很快收敛。
-- 写入摘除在途回源时，会摘掉这个 key 的**所有**份，包括刷新的。
-
 ## 批量认领
 
 `GetMany` 按段认领未命中的 key（分段大小是 `WithGetManyChunkSize`，默认全部一段）：一段开始时当场认领它的 key，把自己领头的交给一个回源 goroutine，别人正在回源的就等别人的结果。下图是只有一段的情况：
@@ -177,7 +167,7 @@ sequenceDiagram
 
 ## 后台刷新
 
-返回陈旧值时发起的后台刷新，用一个 `sync.Map`（`refreshing`）按 key 去重：同一个 key 的刷新还没结束时，不会再发起新的刷新，和 `WithFetchesPerKey` 无关；查已有的 key 不加锁，陈旧命中很便宜。抢到 `refreshing` 的请求先登记到 `Close` 要等的后台工作里（`Close` 之后不再发起刷新），再当场认领 `flightKey{key, refresh: true}`（这时这个 key 不会有别的刷新在途，所以总是领头），然后由这个被登记的 goroutine 回源、回填：分段时每段一个子 goroutine，被登记的 goroutine 等它们全部结束才注销登记。不能另起一个自己去登记的 goroutine：它如果在 `Close` 之后才登记，就不在 `Close` 的等待范围里，`Close` 可能在刷新的回填写完之前返回。刷新用共享 ctx（见[回源用的 ctx](#回源用的-ctx)）；失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。
+返回陈旧值时发起的后台刷新，用一个 `sync.Map`（`refreshing`）按 key 去重：同一个 key 的刷新还没结束时，不会再发起新的刷新；查已有的 key 不加锁，陈旧命中很便宜。抢到 `refreshing` 的请求先登记到 `Close` 要等的后台工作里（`Close` 之后不再发起刷新），再当场认领 `flightKey{key, refresh: true}`（这时这个 key 不会有别的刷新在途，所以总是领头），然后由这个被登记的 goroutine 回源、回填：分段时每段一个子 goroutine，被登记的 goroutine 等它们全部结束才注销登记。不能另起一个自己去登记的 goroutine：它如果在 `Close` 之后才登记，就不在 `Close` 的等待范围里，`Close` 可能在刷新的回填写完之前返回。刷新用共享 ctx（见[回源用的 ctx](#回源用的-ctx)）；失败（不包括「不存在」）记一条 ERROR 日志，陈旧的条目保留。
 
 刷新也走这套登记，但认领的是自己的在途回源（`flightKey.refresh` 为真）：它不加入普通回源，普通读取也不加入它。原因是刷新时下层的陈旧条目不算数，而普通回源会接受下层的陈旧条目；刷新加入普通回源，可能拿着一个陈旧条目就结束了，根本没问数据源。代价是同一个 key 的普通回源和刷新可以同时进行，最多多问一次数据源。写入摘除时两种都摘。见 [ADR 0016](../adr/0016-refresh-has-its-own-flights.md)。
 

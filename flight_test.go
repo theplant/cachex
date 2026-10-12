@@ -54,33 +54,6 @@ func TestConcurrentMissesShareOneFetch(t *testing.T) {
 	assert.EqualValues(t, 1, src.calls.Load())
 }
 
-func TestFetchesPerKeyBoundsConcurrentFetchesOfAKey(t *testing.T) {
-	ctx := context.Background()
-	gate := make(chan struct{})
-	var running, peak atomic.Int64
-	src := cachex.SourceFunc[string](func(context.Context, string) (string, error) {
-		n := running.Add(1)
-		defer running.Add(-1)
-		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
-		}
-		<-gate
-		return "1", nil
-	})
-	c := cachex.New[string](src, nil, cachex.WithFetchesPerKey(3))
-	var wg sync.WaitGroup
-	for range 50 {
-		wg.Go(func() {
-			_, err := c.Get(ctx, "a")
-			assert.NoError(t, err)
-		})
-	}
-	// 50 callers spread over 3 slots fill all of them (all but surely)
-	require.Eventually(t, func() bool { return running.Load() == 3 }, time.Second, time.Millisecond)
-	close(gate)
-	wg.Wait()
-	assert.EqualValues(t, 3, peak.Load())
-}
-
 func TestAFetchThatPanicsOrExitsAnswersEveryWaiter(t *testing.T) {
 	ctx := context.Background()
 	for name, tc := range map[string]struct {

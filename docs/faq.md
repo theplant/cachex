@@ -69,7 +69,7 @@ v2 cannot read it. In Redis, a backend that stores bytes treats data that does n
 
 In two layers:
 
-1. **Singleflight** (primary): concurrent misses of one key fetch it once, across all layers; the other requests wait for that result. `WithFetchesPerKey(n)` allows n concurrent fetches of one key (default 1), trading some load on the layers below for throughput. See [design/singleflight.md](design/singleflight.md) (Chinese).
+1. **Singleflight** (primary): concurrent misses of one key fetch it once, across all layers; the other requests wait for that result. See [design/singleflight.md](design/singleflight.md) (Chinese).
 2. **Double-check** (supplementary): request B reads a miss before request A's fetch backfills, but claims the key only after A's fetch has finished; B reads the first layer again instead of fetching again.
 
 ### Is the double-check worth it? Is it on by default?
@@ -132,11 +132,6 @@ All together. Fresh values, stale values and fetched values all go into one resu
 - if the key's chunk has not started, fetches the key itself, without waiting; the `GetMany` then takes that result.
 
 For large `GetMany` calls next to concurrent `Get`s, implement `BatchSource`, or set `WithGetManyChunkSize` to about `WithGetManyConcurrency` so that a `Get` waits for one source call at most.
-
-### What is the difference between `WithFetchesPerKey` and `WithGetManyConcurrency`?
-
-- The former bounds how many fetches **one key** can have at once;
-- the latter bounds how many requests **one `GetMany`** sends to the source at once (`Get` calls of a plain source, or chunk calls of a `BatchSource`).
 
 ## Backends
 

@@ -19,7 +19,6 @@ import (
 // Defaults of the Cache options.
 const (
 	DefaultFetchTimeout       = 60 * time.Second
-	DefaultFetchesPerKey      = 1
 	DefaultGetManyConcurrency = 16
 )
 
@@ -58,24 +57,22 @@ type Cache[T any] struct {
 	wg     sync.WaitGroup // fetches and refreshes started before Close
 }
 
-// flightKey is a key and one of its fetch slots (see WithFetchesPerKey). A
-// background refresh has flights of its own, in slot 0: it must not join a
-// fetch that takes a stale entry from below.
+// flightKey is what a flight is registered under: a key, and whether it is a
+// background refresh, which has flights of its own: it must not join a fetch
+// that takes a stale entry from below.
 type flightKey struct {
 	key     string
-	slot    int
 	refresh bool
 }
 
 type options struct {
-	fetchTimeout  time.Duration
-	fetchesPerKey int
-	getManyConc   int
-	getManyChunk  int
-	logger        *slog.Logger
-	now           func() time.Time
-	maxAge        any
-	doubleCheck   DoubleCheckMode
+	fetchTimeout time.Duration
+	getManyConc  int
+	getManyChunk int
+	logger       *slog.Logger
+	now          func() time.Time
+	maxAge       any
+	doubleCheck  DoubleCheckMode
 }
 
 // Option configures a Cache.
@@ -88,11 +85,10 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 		panic("cachex: New: source is required")
 	}
 	o := options{
-		fetchTimeout:  DefaultFetchTimeout,
-		fetchesPerKey: DefaultFetchesPerKey,
-		getManyConc:   DefaultGetManyConcurrency,
-		logger:        slog.Default(),
-		now:           time.Now,
+		fetchTimeout: DefaultFetchTimeout,
+		getManyConc:  DefaultGetManyConcurrency,
+		logger:       slog.Default(),
+		now:          time.Now,
 	}
 	for _, opt := range opts {
 		opt(&o)
@@ -100,8 +96,6 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 	switch {
 	case o.fetchTimeout <= 0:
 		panic("cachex: New: the fetch timeout must be positive")
-	case o.fetchesPerKey <= 0:
-		panic("cachex: New: fetches per key must be positive")
 	case o.getManyConc <= 0:
 		panic("cachex: New: the GetMany concurrency must be positive")
 	case o.getManyChunk < 0:
@@ -149,14 +143,6 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 // a failed write. Default DefaultFetchTimeout.
 func WithFetchTimeout(timeout time.Duration) Option {
 	return func(o *options) { o.fetchTimeout = timeout }
-}
-
-// WithFetchesPerKey sets how many fetches of one key may run at once. With 1
-// (the default) concurrent misses of a key share one fetch; with n they are
-// spread over n, trading some load on the layers below for throughput. A
-// background refresh of the key is one more fetch, of its own.
-func WithFetchesPerKey(n int) Option {
-	return func(o *options) { o.fetchesPerKey = n }
 }
 
 // WithGetManyConcurrency sets how many source requests one GetMany has in

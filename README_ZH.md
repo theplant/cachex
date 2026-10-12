@@ -135,7 +135,6 @@ shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, Ke
 | `Jitter(ratio)`（层） | `0.1` | 把每个条目的新鲜期最多缩短这个比例，让同时写入的条目不在同一时刻变陈旧、腐烂 |
 | `WithMaxAge(func(T) time.Duration)` | 无 | 按值限制在每一层保存多久；回源拿到的值和 `Set`/`SetMany` 写入的值都会经过它 |
 | `WithFetchTimeout(d)` | 60s | 各自限时：回源的二次检查、读下面每一层连同它的回填、每次问数据源连同它的回填、写入失败后的失效 |
-| `WithFetchesPerKey(n)` | 1 | 同一个 key 最多同时几次回源；1 表示并发未命中全部合并 |
 | `WithGetManyConcurrency(n)` | 16 | 一次 `GetMany` 最多同时向数据源发几个请求 |
 | `WithGetManyChunkSize(n)` | 0：全部一段 | 把 `GetMany` 未命中的 key 切成最多 n 个一段回源，每段开始时才认领；所在段还没开始的 key，`Get` 不用等 |
 | `WithDoubleCheck(mode)` | `DoubleCheckAuto` | 认领回源的请求什么时候先再读一次第一层 |

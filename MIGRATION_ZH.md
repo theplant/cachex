@@ -24,7 +24,7 @@ import "github.com/theplant/cachex/v2"
 | `Entry[T]`、`EntryWithTTL`、`WithStale`、`WithServeStale` | 层选项 `TTL(fresh, stale)`：陈旧期大于零就是返回陈旧值。值就是普通的 `T` |
 | `NotFoundWithTTL`、`WithNotFound`（第二个后端） | 层选项 `NotFoundTTL(fresh, stale)`，存在同一个后端里 |
 | 按值内容自定义新鲜度判断 | 本身会过期的值用 `WithMaxAge(func(T) time.Duration)`；「整体作废」把版本号放进 key |
-| `WithFetchConcurrency` | `WithFetchesPerKey` |
+| `WithFetchConcurrency` | 没有对应：同一个 key 的并发未命中总是共用一次回源 |
 | `WithFetchTimeout`、`WithLogger`、`WithDoubleCheck` | 名字不变，不再带类型参数 |
 | `NowFunc`、`MockClock` | `WithNow(func() time.Time)`、`cachextest.Clock` |
 | `DefaultFetchTimeout` 等 `Default*` 变量 | 常量 |

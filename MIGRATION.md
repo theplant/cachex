@@ -24,7 +24,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 | `Entry[T]`, `EntryWithTTL`, `WithStale`, `WithServeStale` | layer option `TTL(fresh, stale)`: a stale TTL above zero is serve-stale. Values are plain `T` |
 | `NotFoundWithTTL`, `WithNotFound` (a second backend) | layer option `NotFoundTTL(fresh, stale)`, kept in the same backend |
 | a custom staleness check on the value | `WithMaxAge(func(T) time.Duration)` for values that expire on their own; put a version into the key for "invalidate everything" |
-| `WithFetchConcurrency` | `WithFetchesPerKey` |
+| `WithFetchConcurrency` | none: the concurrent misses of a key always share one fetch |
 | `WithFetchTimeout`, `WithLogger`, `WithDoubleCheck` | same names, no type parameter |
 | `NowFunc`, `MockClock` | `WithNow(func() time.Time)`, `cachextest.Clock` |
 | `DefaultFetchTimeout` and other `Default*` variables | constants |

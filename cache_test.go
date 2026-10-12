@@ -191,7 +191,6 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		"nil logger":            func() { cachex.New[string](src, nil, cachex.WithLogger(nil)) },
 		"nil clock":             func() { cachex.New[string](src, nil, cachex.WithNow(nil)) },
 		"zero fetch timeout":    func() { cachex.New[string](src, nil, cachex.WithFetchTimeout(0)) },
-		"zero fetches per key":  func() { cachex.New[string](src, nil, cachex.WithFetchesPerKey(0)) },
 		"zero GetMany conc":     func() { cachex.New[string](src, nil, cachex.WithGetManyConcurrency(0)) },
 		"negative chunk size":   func() { cachex.New[string](src, nil, cachex.WithGetManyChunkSize(-1)) },
 		"max age of other type": func() { cachex.New[string](src, nil, cachex.WithMaxAge(func(int) time.Duration { return 0 })) },

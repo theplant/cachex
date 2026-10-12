@@ -136,7 +136,6 @@ shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, Ke
 | `Jitter(ratio)` (layer) | `0.1` | Shortens each entry's fresh period by up to this share, so entries written together do not turn stale or rotten together |
 | `WithMaxAge(func(T) time.Duration)` | none | Caps how long a value is kept, in every layer; called for fetched values and for those `Set`/`SetMany` write |
 | `WithFetchTimeout(d)` | 60s | Bounds, each on its own: a fetch's double check, each lower layer read with its backfill, each source call with its backfill, and the invalidation after a failed write |
-| `WithFetchesPerKey(n)` | 1 | How many fetches of one key may run at once; 1 merges every concurrent miss |
 | `WithGetManyConcurrency(n)` | 16 | How many source requests one `GetMany` has in flight |
 | `WithGetManyChunkSize(n)` | 0: one chunk | Fetches a `GetMany`'s misses in chunks of at most n keys, each claimed when it starts; a `Get` of a key whose chunk has not started does not wait |
 | `WithDoubleCheck(mode)` | `DoubleCheckAuto` | When a request that claimed a fetch re-reads the first layer first |

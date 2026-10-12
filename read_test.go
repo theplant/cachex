@@ -74,12 +74,12 @@ func TestFreshness(t *testing.T) {
 		assert.Equal(t, "2", v)
 	})
 
-	t.Run("one refresh per key, whatever the fetches per key", func(t *testing.T) {
+	t.Run("one refresh per key", func(t *testing.T) {
 		src := newSource(map[string]string{"a": "1"})
 		clock, now := newClock()
 		c := cachex.New(src, []cachex.Layer[string]{
 			cachex.NewLayer(cachextest.NewMap[string](), cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
-		}, now, cachex.WithFetchesPerKey(8))
+		}, now)
 		_, err := c.Get(ctx, "a")
 		require.NoError(t, err)
 		cachex.Settle(c)

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"runtime/debug"
 	"slices"
 	"sync"
@@ -42,7 +41,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 		var zero T
 		return zero, unsupportedKey(key)
 	}
-	fk := c.flightKey(key, false)
+	fk := flightKey{key: key}
 	f, leader := c.flights.Claim(fk)
 	if leader {
 		p := c.claim(false)
@@ -185,7 +184,7 @@ func (c *Cache[T]) fetchChunks(ctx context.Context, stop <-chan struct{}, keys [
 		}
 		var p *claimed[T]
 		for i := start; i < end; i++ {
-			fk := c.flightKey(keys[i], refresh)
+			fk := flightKey{key: keys[i], refresh: refresh}
 			f, leader := c.flights.Claim(fk)
 			flights[i] = f
 			if leader {
@@ -223,26 +222,11 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (
 	}
 }
 
-func (c *Cache[T]) flightKey(key string, refresh bool) flightKey {
-	if refresh || c.opts.fetchesPerKey == 1 { // refreshing allows one refresh of a key at a time
-		return flightKey{key: key, refresh: refresh}
-	}
-	return flightKey{key: key, slot: rand.IntN(c.opts.fetchesPerKey), refresh: refresh}
-}
-
-// dropFlights unregisters every fetch of key without interrupting it: its
-// waiters still get its result, and the next read starts a new fetch.
+// dropFlights unregisters both fetches of key, the read's and the refresh's,
+// without interrupting them: their waiters still get their results, and the
+// next read starts a new fetch.
 func (c *Cache[T]) dropFlights(key string) {
-	if c.opts.fetchesPerKey == 1 {
-		c.flights.Drop(flightKey{key: key}, flightKey{key: key, refresh: true})
-		return
-	}
-	fks := make([]flightKey, 0, c.opts.fetchesPerKey+1)
-	fks = append(fks, flightKey{key: key, refresh: true})
-	for slot := range c.opts.fetchesPerKey {
-		fks = append(fks, flightKey{key: key, slot: slot})
-	}
-	c.flights.Drop(fks...)
+	c.flights.Drop(flightKey{key: key}, flightKey{key: key, refresh: true})
 }
 
 // claimed are the flights one request leads, and what their fetch knows of

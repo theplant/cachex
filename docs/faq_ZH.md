@@ -69,7 +69,7 @@ v2 读不了。在 Redis 里，存字节的后端把解不出来的数据当作�
 
 两层：
 
-1. **合并回源**（主要）：同一个 key 的并发未命中，在所有层之间只回源一次，其他请求等它的结果。`WithFetchesPerKey(n)` 允许同一个 key 同时有 n 个回源（默认 1），用下层多一些负载换取更高的吞吐。见 [design/singleflight.md](design/singleflight.md)。
+1. **合并回源**（主要）：同一个 key 的并发未命中，在所有层之间只回源一次，其他请求等它的结果。见 [design/singleflight.md](design/singleflight.md)。
 2. **二次检查**（补充）：请求 B 在请求 A 回填之前读到未命中，却在 A 的回源结束之后才认领，B 会再读一次第一层，而不是再回源一次。
 
 ### 二次检查值得开吗？默认开吗？
@@ -132,11 +132,6 @@ TTL 是**不主动写入**时旧数据的存活上限。`Set`/`Del` 是你主动
 - 这个 key 所在的段还没开始，就自己回源，不用等；之后 `GetMany` 直接用这个结果。
 
 大批量的 `GetMany` 旁边还有并发的 `Get` 时，数据源实现 `BatchSource`，或者把 `WithGetManyChunkSize` 设成 `WithGetManyConcurrency` 左右，这样 `Get` 最多等一次数据源调用。
-
-### `WithFetchesPerKey` 和 `WithGetManyConcurrency` 有什么区别？
-
-- 前者限制**同一个 key** 最多同时有几个回源；
-- 后者限制**一次 `GetMany`** 最多同时向数据源发出几个请求（普通数据源的 `Get` 调用，或 `BatchSource` 的分段调用）。
 
 ## 后端
 
