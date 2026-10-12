@@ -55,6 +55,10 @@ See [ADR 0004](adr/0004-batch-result-shape.md) (Chinese).
 
 Both report the same three outcomes, each in its own way. `Get` returns a single value, so it cannot say "does not exist" by leaving something out: the value itself may legitimately be nil, and when `T` is an int, the zero value cannot mean "absent" at all. It is the same in `database/sql`: `QueryRow` returns `ErrNoRows` when nothing matches, while `Query` just returns no rows.
 
+### The memory layer is empty after a restart. Should I warm it up?
+
+With a shared layer (Redis or a table), hardly: the restarted instance's misses read the shared layer, which is warm, at the cost of some extra round trips for a while; the source is not touched. With a memory layer only, if a restart would hit the source too hard, call `GetMany` at start with the keys you know are hot (the home page's data, global settings): that is the warm-up. The library does not count hits: that would slow down the hottest path on every hit, and which data is hot the application knows best.
+
 ### Do I need to call `Close`?
 
 Call it at shutdown, before closing the backends. It waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting, all of which still write the backends; it starts no more refreshes. It does not close the backends. A `Cache` that is never closed leaks nothing once its last fetch ends.
