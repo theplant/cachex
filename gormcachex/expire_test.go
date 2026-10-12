@@ -87,3 +87,15 @@ func TestDeleteExpiredOnATableWithoutLeaseColumns(t *testing.T) {
 	require.NoError(t, err, "leases off: the lease columns are not needed")
 	assert.Equal(t, int64(1), n)
 }
+
+func TestTimesInAnotherOffsetCompareRightOnSQLite(t *testing.T) {
+	// SQLite compares times as text with their offsets: an hour ahead in
+	// UTC-10 reads as long past next to now in UTC or local time
+	ctx := context.Background()
+	b := newBackend(t, Config[string]{})
+	far := time.Now().Add(time.Hour).In(time.FixedZone("W", -10*3600))
+	require.NoError(t, b.Set(ctx, "live", cachex.Entry[string]{Value: "v", ExpiresAt: far}))
+	n, err := b.DeleteExpired(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, n, "the entry has an hour left")
+}

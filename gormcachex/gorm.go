@@ -31,6 +31,11 @@ import (
 	"github.com/theplant/cachex/v2"
 )
 
+// utc: every time bound into SQL is in UTC. SQLite stores a time as text with
+// its offset and compares the text, so times in different offsets (an entry
+// decoded in UTC, time.Now in local time, two instances in different zones,
+// a DST change) would compare wrongly.
+
 // DefaultChunkSize is how many keys one statement carries by default.
 const DefaultChunkSize = 1000
 
@@ -309,7 +314,7 @@ func (b *byteBackend) SetMany(ctx context.Context, entries map[string]cachex.Byt
 // in key order.
 func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.ByteEntry) map[string]error {
 	errs := map[string]error{}
-	now := time.Now()
+	now := time.Now().UTC() // see utc
 	type pending struct {
 		key string
 		row row
@@ -320,7 +325,7 @@ func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.Byt
 			errs[key] = fmt.Errorf("gormcachex: set %q: %w", key, errUnstorable)
 			continue
 		}
-		rows = append(rows, pending{key, row{Key: b.prefix + key, Value: e.Data, ExpiresAt: e.ExpiresAt, UpdatedAt: now}})
+		rows = append(rows, pending{key, row{Key: b.prefix + key, Value: e.Data, ExpiresAt: e.ExpiresAt.UTC(), UpdatedAt: now}})
 	}
 	// one row order for every writer, or overlapping batches lock rows in
 	// opposite orders and deadlock

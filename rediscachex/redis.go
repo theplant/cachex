@@ -42,7 +42,10 @@ type Config[T any] struct {
 	// lease key in the key's Cluster slot, a write deletes the lease first,
 	// and a backfill writes the key, with a Lua script, only if its lease
 	// still holds the fetch's token. So a value read from the source before
-	// another instance wrote the key is never written over that write.
+	// another instance wrote the key is never written over that write. The
+	// empty key under an empty KeyPrefix has no lease key in its slot ("{}" is
+	// no hash tag): with leases on, writes of it fail with
+	// cachex.ErrUnsupportedKey.
 	Leases bool
 	// Codec encodes values. Default cachex.DefaultCodec.
 	Codec cachex.Codec[T]

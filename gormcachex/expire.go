@@ -30,7 +30,7 @@ func (b *byteBackend) deleteExpired(ctx context.Context) (int64, error) {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
-		rotten := b.rotten(time.Now())
+		rotten := b.rotten(time.Now().UTC())
 		var keys []string
 		if err := b.db.WithContext(ctx).Table(b.table).Select("?", keyColumn).
 			Where(rotten).Limit(b.chunkSize).Find(&keys).Error; err != nil {

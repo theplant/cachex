@@ -91,7 +91,7 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 	db := l.b.db.WithContext(ctx)
 	for _, c := range l.chunks(keys) {
 		chunk, prefixed := c[0], c[1]
-		now := time.Now()
+		now := time.Now().UTC() // see utc in gorm.go
 		until := now.Add(ttl)
 		tokens := make([]string, len(chunk))
 		rows := make([]leasedRow, len(chunk))
@@ -153,16 +153,12 @@ func caseByKey(db *gorm.DB, pgType string, pairs []any) clause.Expr {
 	return clause.Expr{SQL: sql.String(), Vars: append([]any{keyColumn}, pairs...)}
 }
 
-// holding matches the rows of prefixed whose lease holds tokens.
+// holding matches the rows of prefixed whose lease holds tokens (tokens[i]
+// for prefixed[i]). Two IN lists do: a token is random and only ever set on
+// its own key's row, so no row holds another key's token. (One OR term a key
+// would nest past SQLite's expression depth of 1000.)
 func holding(prefixed, tokens []string) clause.Expression {
-	ors := make([]clause.Expression, len(prefixed))
-	for i := range prefixed {
-		ors[i] = clause.And(clause.Eq{Column: keyColumn, Value: prefixed[i]}, clause.Eq{Column: leaseToken, Value: tokens[i]})
-	}
-	if len(ors) == 1 { // a lone clause.Or joins the conditions around it with OR
-		return ors[0]
-	}
-	return clause.Or(ors...)
+	return clause.And(clause.IN{Column: keyColumn, Values: anys(prefixed)}, clause.IN{Column: leaseToken, Values: anys(tokens)})
 }
 
 // PutLeased updates the rows whose lease holds its token in one statement a
@@ -180,12 +176,12 @@ func (l leaser) PutLeased(ctx context.Context, tokens map[string]string, entries
 			if e, ok := entries[key]; ok {
 				setKeys, setP, setT = append(setKeys, key), append(setP, prefixed[i]), append(setT, tokens[key])
 				values = append(values, prefixed[i], e.Data)
-				expires = append(expires, prefixed[i], e.ExpiresAt)
+				expires = append(expires, prefixed[i], e.ExpiresAt.UTC())
 			} else {
 				delKeys, delP, delT = append(delKeys, key), append(delP, prefixed[i]), append(delT, tokens[key])
 			}
 		}
-		now := time.Now()
+		now := time.Now().UTC()
 		if len(setKeys) > 0 {
 			if err := l.b.write(ctx, func(db *gorm.DB) error {
 				return l.b.inLockOrder(db, holding(setP, setT)).Updates(map[string]any{

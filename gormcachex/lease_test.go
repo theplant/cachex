@@ -136,3 +136,28 @@ func TestAKeyTooLongToLeaseIsStillRefreshed(t *testing.T) {
 	clock.Advance(2 * time.Second)
 	assert.Eventually(t, func() bool { v, err := c.Get(ctx, key); return err == nil && v == "v2" }, 5*time.Second, 5*time.Millisecond)
 }
+
+func TestALeasedBatchOfAThousandKeysBackfillsOnSQLite(t *testing.T) {
+	// one OR term a key nested past SQLite's expression depth of 1000
+	ctx := context.Background()
+	b := newBackend(t, Config[string]{Leases: true})
+	l := b.Leaser()
+	keys := make([]string, 1000)
+	for i := range keys {
+		keys[i] = fmt.Sprint("k", i)
+	}
+	tokens, err := l.Lease(ctx, keys, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, tokens, len(keys))
+	entries := map[string]cachex.Entry[string]{}
+	for _, k := range keys[:500] {
+		entries[k] = cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}
+	}
+	require.NoError(t, l.PutLeased(ctx, tokens, entries))
+	stored, err := b.GetMany(ctx, keys)
+	require.NoError(t, err)
+	assert.Len(t, stored, 500)
+	tokens, err = l.Lease(ctx, keys, time.Minute)
+	require.NoError(t, err)
+	require.NoError(t, l.Release(ctx, tokens))
+}

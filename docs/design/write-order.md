@@ -43,7 +43,7 @@ sequenceDiagram
     K->>K: 拿 k 所在分片的写锁
     K->>L1: 写 v
     K->>L0: 写 v
-    K->>K: 写入代数 +1，摘除 k 的在途回源
+    K->>K: 摘除 k 的在途回源，写入代数 +1
     K->>K: 释放写锁
     K-->>C: 成功
 ```
@@ -220,7 +220,7 @@ sequenceDiagram
     participant S as 数据源
     A->>G: Claim(k)，回源中（读到旧值 v1）
     W->>W: 从下往上删各层
-    W->>G: gen +1，Drop(k)，Del 返回
+    W->>G: Drop(k)，gen +1，Del 返回
     B->>G: Claim(k)：没有登记，新建回源
     B->>S: Get(k)
     S-->>B: 新的结果 ✓
@@ -235,12 +235,12 @@ sequenceDiagram
 |---|---|---|
 | `epoch(stripes, key)` | 读取，读第一层之前 | 取分片纪元，给二次检查用；它是普通函数而不是 `Cache` 的方法，因为泛型方法在命中路径上不会内联，多一层调用约慢 3ns |
 | `generation(key)` | 回源，读下面各层之前 | 取写入代数，回填时核对 |
-| `lockWrite` / `unlockWrite` | `Set`/`Del` | 拿分片写锁（空闲时 `TryLock`，不分配）；结束时写入代数 +1、摘除在途回源、释放 |
+| `lockWrite` / `unlockWrite` | `Set`/`Del` | 拿分片写锁（空闲时 `TryLock`，不分配）；结束时摘除在途回源、写入代数 +1、释放 |
 | `lockWrites` | `SetMany`/`DelMany` | 按分片编号从小到大拿多把写锁；放弃等待时按上一节收尾 |
 | `beginFill` / `endFill` | 单个 key 的回填 | `TryRLock` 并核对写入代数，不行就跳过；再拿分片的回填锁；结束时回填计数 +1 |
 | `beginFills` | 批量回填 | 同上，每个分片只拿一次读锁；回填锁按分片编号从小到大拿；返回可以落下的回填 |
 
-写入结束时的「写入代数 +1、摘除在途回源」（`countWrite`）对部分失败的写入同样执行。
+写入结束时的「摘除在途回源、写入代数 +1」（`countWrite`）对部分失败的写入同样执行。顺序不能反：先加代数再摘除的话，在两步之间登记问数据源的回源，代数已经是新的、登记却被摘掉，它的回填照样落下，写入之后的读取又会同时问一次数据源，两个回答谁后落下不一定（[ADR 0022](../adr/0022-reads-never-go-back.md)）。先摘除，两步之间登记的回源拿的是旧代数，回填被跳过；摘除本身也是先删 `sourcing` 的登记、再摘合并回源的登记。
 
 分片本身留在 `internal/stripe`，没有并进 `guard.go`：其中只有 `Lock(ctx, late)` 有真正的逻辑（见下文「等写锁时尊重 ctx」），它的时序要直接测；核心包的测试只走公开接口，并进来就只能隔着 `Cache` 去测它。`internal/stripe` 的其余方法是对读写锁和计数器的一层薄包装，只有守卫调用。
 

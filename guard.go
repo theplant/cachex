@@ -10,8 +10,8 @@ import (
 )
 
 // The write-order guard: every use of the stripes is here. A write holds its
-// keys' stripes for writing and, when it ends, counts itself and drops the
-// keys' flights; a backfill holds its key's stripe for reading and lands only
+// keys' stripes for writing and, when it ends, drops the keys' flights and
+// counts itself; a backfill holds its key's stripe for reading and lands only
 // if no write counted since it took the generation. So a backfill either
 // lands before a write or not at all, and a read never waits on a write.
 // Backfills of a stripe also take its fill lock, so that they land one at a
