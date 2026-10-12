@@ -114,7 +114,8 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 
 `Config.Leases` 打开租约（默认关闭），机制见 [consistency.md](consistency.md#租约lease)。
 
-- **租约 key 和数据 key 在同一个 slot**：数据 key 带 hash tag 时，租约 key 是 `cachex-lease:` 加数据 key（hash tag 仍是第一个）；不带时是 `cachex-lease:{数据 key}`。含 `}` 却没有 hash tag 的 key 推不出来，`Cache` 拒绝它（[ADR 0019](../adr/0019-core-rejects-keys-without-a-redis-slot-for-their-lease.md)）。`cachex-lease:` 开头的 key 留给租约：`New` 拒绝这样开头的 `KeyPrefix`；同一个 Redis 里别的程序、或者不带前缀的 key，也不要用它开头，否则数据 key 会和某个租约 key 撞成同一个 Redis key。
+- **租约 key 和数据 key 在同一个 slot**：数据 key 带 hash tag 时，租约 key 是 `cachex-lease:` 加数据 key（hash tag 仍是第一个）；不带时是 `cachex-lease:{数据 key}`。含 `}` 却没有 hash tag 的 key 推不出来，`Cache` 拒绝它（[ADR 0019](../adr/0019-core-rejects-keys-without-a-redis-slot-for-their-lease.md)）。`cachex-lease:` 开头的 key 留给租约：`New` 拒绝这样开头的 `KeyPrefix`；前缀为空（或是它的开头，比如 `cachex-`）时，拼上前缀之后落进这个命名空间的 key 不存：读成未命中，写入报 `ErrUnsupportedKey`，删除什么也不做，也不给它领租约，否则数据 key 会和某个租约 key 撞成同一个 Redis key。同一个 Redis 里别的程序也不要用它开头。开了租约时，`New` 还拒绝含 `}` 却没有 hash tag 的 `KeyPrefix`：它下面的每个 key 都推不出租约 key。
+- **领租约读回令牌**：`SET NX PX` 之后在同一个 pipeline 里 `GET` 租约 key。go-redis 遇到网络错误会重试整个 pipeline：第一次的 `SET NX` 已经生效、只是回复丢了时，重试的 `SET NX` 失败，但 `GET` 读到的是这次调用的令牌，仍然算领到。否则这个 key 会被自己的孤儿租约挡住一个回源超时（默认 60 秒）：谁都不回填共享层，后台刷新也全部跳过。
 - **领**：`SET 租约key 令牌 NX PX 有效期`，按 `ChunkSize` 走 pipeline。令牌是 128 位随机数。
 - **回填、释放**：Lua 脚本，「租约仍是这个令牌」的核对和写入（或删除、释放）在一个原子操作里。pipeline 里用 `EVALSHA`；节点上没有脚本（重启、`SCRIPT FLUSH`）报 `NOSCRIPT` 的 key，再用 `EVAL` 发一次，顺带把脚本装上。
 - **写入**：同一个 pipeline 里**先删租约 key、再写数据**。顺序反过来的话，写完数据、还没删租约的那一刻，持有旧令牌的回填仍能把旧值写进去。有测试截获 pipeline 检查这个顺序。

@@ -28,7 +28,10 @@ type Config[T any] struct {
 	Client redis.UniversalClient
 	// KeyPrefix is prepended to every key, so that one Redis can hold several
 	// caches. It must not start with "cachex-lease:", which the keys of leases
-	// (see Leases) start with. Change it when the value type changes incompatibly: JSON
+	// (see Leases) start with, and a key that it makes start so is not
+	// stored (writes of it fail with cachex.ErrUnsupportedKey). With leases
+	// on, it must not have a "}" without a hash tag. Change it when the value
+	// type changes incompatibly: JSON
 	// decodes leniently, so a renamed field reads back as a zero value rather
 	// than failing.
 	KeyPrefix string
@@ -56,6 +59,9 @@ func New[T any](cfg Config[T]) cachex.Backend[T] {
 	if strings.HasPrefix(cfg.KeyPrefix, leasePrefix) {
 		panic("rediscachex: KeyPrefix must not start with " + leasePrefix + ", where the keys of leases are")
 	}
+	if _, ok := leaseKey(cfg.KeyPrefix); !ok && cfg.Leases {
+		panic("rediscachex: KeyPrefix has a \"}\" but no hash tag: no key under it can have a lease")
+	}
 	b := &byteBackend{client: cfg.Client, prefix: cfg.KeyPrefix, chunkSize: cfg.ChunkSize, leases: cfg.Leases}
 	if b.chunkSize <= 0 {
 		b.chunkSize = DefaultChunkSize
@@ -79,9 +85,21 @@ var (
 // as go-redis takes a negative TTL as "keep the current one".
 func ttl(expiresAt time.Time) time.Duration { return max(time.Until(expiresAt), time.Millisecond) }
 
+// leaseSpace reports whether the Redis key of key starts with leasePrefix,
+// where the keys of leases are (possible when KeyPrefix is a start of it, ""
+// say): such a key could be another key's lease, so it is never stored: it
+// reads as a miss, a write of it fails with cachex.ErrUnsupportedKey, and a
+// delete does nothing.
+func (b *byteBackend) leaseSpace(key string) bool {
+	return strings.HasPrefix(leasePrefix, b.prefix) && strings.HasPrefix(key, leasePrefix[len(b.prefix):])
+}
+
 // Get reads with GET; Bytes() shares the reply's memory rather than copying
 // it, and the command is discarded afterwards.
 func (b *byteBackend) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	if b.leaseSpace(key) {
+		return nil, false, nil
+	}
 	data, err := b.client.Get(ctx, b.prefix+key).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, false, nil
@@ -99,10 +117,18 @@ func (b *byteBackend) GetMany(ctx context.Context, keys []string) (map[string][]
 		pipe := b.client.Pipeline()
 		cmds := make([]*redis.StringCmd, len(chunk))
 		for i, key := range chunk {
-			cmds[i] = pipe.Get(ctx, b.prefix+key)
+			if !b.leaseSpace(key) {
+				cmds[i] = pipe.Get(ctx, b.prefix+key)
+			}
+		}
+		if pipe.Len() == 0 {
+			continue
 		}
 		execPipe(ctx, pipe)
 		for i, key := range chunk {
+			if cmds[i] == nil {
+				continue
+			}
 			switch data, err := cmds[i].Bytes(); {
 			case errors.Is(err, redis.Nil):
 			case err != nil:
@@ -142,6 +168,12 @@ func (b *byteBackend) write(ctx context.Context, keys []string, entries map[stri
 		cmds := make([][2]redis.Cmder, len(chunk))
 		for i, key := range chunk {
 			e, set := entries[key]
+			if b.leaseSpace(key) {
+				if set {
+					errs[key] = fmt.Errorf("rediscachex: key %q is where leases are: %w", key, cachex.ErrUnsupportedKey)
+				}
+				continue
+			}
 			end, err := b.endLease(ctx, pipe, key)
 			if err != nil && set {
 				errs[key] = err

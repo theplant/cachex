@@ -154,15 +154,14 @@ func TestLeaser[T any](t *testing.T, newBackend func(t *testing.T) cachex.Backen
 		tokens := lease(t, l, keys...)
 		assert.Len(t, tokens, 5, "every key but the one leased already")
 		assert.NotContains(t, tokens, "taken")
-		require.NoError(t, b.Set(ctx, "k0", entry)) // ends k0's lease
+		require.NoError(t, b.Del(ctx, "k0")) // ends k0's lease
 		entries := map[string]cachex.Entry[T]{}
 		for _, k := range keys {
 			entries[k] = entry
 		}
 		delete(entries, "k4") // k4 is deleted
 		require.NoError(t, l.PutLeased(ctx, tokens, entries))
-		require.NoError(t, b.Del(ctx, "k0"))
-		absent(t, b, "k0", "its lease ended")
+		absent(t, b, "k0", "its lease ended: not written")
 		for _, k := range []string{"k1", "k2", "k3"} {
 			present(t, b, k, k)
 		}

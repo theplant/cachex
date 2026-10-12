@@ -50,7 +50,7 @@ type leaser struct{ b *byteBackend }
 
 var _ cachex.ByteLeaser = leaser{}
 
-func newToken() string {
+var newToken = func() string {
 	var buf [16]byte
 	for i := range 2 {
 		u := rand.Uint64()
@@ -61,7 +61,10 @@ func newToken() string {
 	return hex.EncodeToString(buf[:])
 }
 
-// Lease sets each lease key with SET NX PX, in pipelines of ChunkSize keys.
+// Lease sets each lease key with SET NX PX, in pipelines of ChunkSize keys,
+// and reads it back in the same pipeline: go-redis retries a pipeline whose
+// replies were lost, and a SET NX that landed the first time fails the
+// second, but the key then holds this call's token.
 func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (map[string]string, error) {
 	out := map[string]string{}
 	errs := map[string]error{}
@@ -69,8 +72,12 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 	for chunk := range slices.Chunk(keys, l.b.chunkSize) {
 		pipe := l.b.client.Pipeline()
 		cmds := make([]*redis.BoolCmd, len(chunk))
+		gets := make([]*redis.StringCmd, len(chunk))
 		tokens := make([]string, len(chunk))
 		for i, key := range chunk {
+			if l.b.leaseSpace(key) {
+				continue // never stored: nothing to lease
+			}
 			lk, ok := leaseKey(l.b.prefix + key)
 			if !ok {
 				errs[key] = errNoLeaseKey(key)
@@ -78,6 +85,7 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 			}
 			tokens[i] = newToken()
 			cmds[i] = pipe.SetNX(ctx, lk, tokens[i], ttl)
+			gets[i] = pipe.Get(ctx, lk)
 		}
 		if pipe.Len() == 0 {
 			continue
@@ -90,7 +98,7 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 			switch taken, err := cmds[i].Result(); {
 			case err != nil:
 				errs[key] = fmt.Errorf("rediscachex: lease %q: %w", key, err)
-			case taken:
+			case taken || gets[i].Val() == tokens[i]:
 				out[key] = tokens[i]
 			}
 		}

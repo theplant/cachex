@@ -224,3 +224,54 @@ func TestItIsNotLocal(t *testing.T) {
 	_, ok := New[string](Config[string]{Client: client}).(cachex.LocalBackend)
 	assert.False(t, ok, "a Redis is shared: a broadcast never clears it")
 }
+
+func TestAKeyInTheLeasesNamespaceIsNotStored(t *testing.T) {
+	// with an empty prefix (or one that "cachex-lease:" starts with), a data
+	// key could be the key of another key's lease
+	ctx := context.Background()
+	for _, prefix := range []string{"", "cachex-"} {
+		_, client := newRedis(t)
+		b := New[string](Config[string]{Client: client, KeyPrefix: prefix, Leases: true})
+		l := b.(cachex.Leasing[string]).Leaser()
+		tokens, err := l.Lease(ctx, []string{"x"}, time.Minute)
+		require.NoError(t, err)
+		require.Contains(t, tokens, "x")
+
+		clash := strings.TrimPrefix("cachex-lease:{x}", prefix)
+		e := cachex.Entry[string]{Value: "v", FreshUntil: time.Now().Add(time.Hour), ExpiresAt: time.Now().Add(time.Hour)}
+		require.ErrorIs(t, b.Set(ctx, clash, e), cachex.ErrUnsupportedKey)
+		var be *cachex.BatchError
+		require.ErrorAs(t, b.SetMany(ctx, map[string]cachex.Entry[string]{clash: e}), &be)
+		require.ErrorIs(t, be.Errors[clash], cachex.ErrUnsupportedKey)
+		_, ok, err := b.Get(ctx, clash)
+		require.NoError(t, err)
+		assert.False(t, ok, "%q is not stored", clash)
+		require.NoError(t, b.Del(ctx, clash))
+		require.NoError(t, l.PutLeased(ctx, tokens, map[string]cachex.Entry[string]{"x": e}))
+		got, ok, err := b.Get(ctx, "x")
+		require.NoError(t, err)
+		require.True(t, ok, "x's lease survived the writes of %q", clash)
+		assert.Equal(t, "v", got.Value)
+	}
+}
+
+func TestALeaseWhoseReplyWasLostIsStillHeld(t *testing.T) {
+	// go-redis retries a pipeline on a network error: if the first SET NX
+	// landed and its reply was lost, the retry finds the lease taken, by the
+	// same token
+	ctx := context.Background()
+	mr, client := newRedis(t)
+	defer func(f func() string) { newToken = f }(newToken)
+	newToken = func() string { return "mine" }
+	require.NoError(t, mr.Set("cachex-lease:{p:k}", "mine")) // the first try's
+	tokens, err := New[string](Config[string]{Client: client, KeyPrefix: "p:", Leases: true}).(cachex.Leasing[string]).Leaser().Lease(ctx, []string{"k"}, time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"k": "mine"}, tokens)
+}
+
+func TestAKeyPrefixWithAStrayBraceIsRejectedWithLeases(t *testing.T) {
+	_, client := newRedis(t)
+	assert.Panics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "p}", Leases: true}) })
+	assert.NotPanics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "p}"}) })
+	assert.NotPanics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "{tenant}:", Leases: true}) })
+}
