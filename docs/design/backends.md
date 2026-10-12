@@ -143,7 +143,7 @@ type row struct {
 }
 ```
 
-`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用；key 列最长 255 个字符，**包括前缀**，而且必须是合法的 UTF-8、不含 NUL。别的 key 不进 SQL：读成未命中，写入只让它自己失败（回填失败只记 WARN，这个 key 就每次都未命中），删除什么也不做。数据库拒收一个 key 时会让整条语句失败，所以要先拦下，否则同一条语句里的其他 key 跟着失败（PostgreSQL 连读取都会失败）。`New` 返回 `*gormcachex.Backend[T]`，它嵌入 `cachex.Backend[T]`，另有 `Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要自己定期删除（清理任务在 [todo](../todo.md) 里）。
+`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用；key 列最长 255 个字符，**包括前缀**，而且必须是合法的 UTF-8、不含 NUL。别的 key 不进 SQL：读成未命中，写入只让它自己失败（回填失败只记 WARN，这个 key 就每次都未命中），删除什么也不做。数据库拒收一个 key 时会让整条语句失败，所以要先拦下，否则同一条语句里的其他 key 跟着失败（PostgreSQL 连读取都会失败）。`New` 返回 `*gormcachex.Backend[T]`，它嵌入 `cachex.Backend[T]`，另有 `Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要定期调用 `DeleteExpired` 删掉（见下文「清理腐烂的行」）。
 
 ### key 必须精确比较
 
@@ -184,6 +184,15 @@ key 列一律以 `clause.Column` 传给 GORM（条件用 `clause.IN`，PostgreSQ
 ### 事务
 
 gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立提交，行锁不跨语句持有。写入要是留在事务里，行锁会跨 `Cache` 调用持有，和分片锁形成数据库检测不到的死锁，见 [ADR 0017](../adr/0017-gorm-never-joins-a-caller-transaction.md)。正确的用法是在事务里改数据源，提交之后再 `Set`/`Del`。
+
+### 清理腐烂的行（`DeleteExpired`）
+
+表只增不减，`(*Backend).DeleteExpired(ctx)` 删掉已经腐烂的行（`expires_at` 按真实时钟已过），返回删了多少。它只是 gormcachex 的方法，不在 `Backend` 接口里：Redis、otter 自己让条目过期，BigCache 有 `LifeWindow`，核心包也从不需要它。
+
+- **每批两条语句，各自提交**：先读出至多 `ChunkSize` 个腐烂的 key（不加锁，走 `expires_at` 索引），再删除它们；删除时再核对一次仍然腐烂，两步之间刚被写入、变新鲜的行不会被误删。删除的加锁顺序和写入一致（PostgreSQL 上先按字节序锁行），不会和写入死锁。没有用事务加 `SKIP LOCKED`：MySQL 不允许在 `DELETE` 的子查询里用 `LIMIT`、也不能读写同一张表，硬做就要一个跨两条语句持锁的事务。
+- **打开了租约时，不删还有有效租约的行**：那个 key 正在回源，持有者马上会回填它；删了的话回填找不到行，白回源一次。没开租约的表可能没有租约那两列，所以只在打开租约时加这个条件。
+- **谁来跑、多久跑一次交给应用**：同时跑几个是安全的，只是浪费。PostgreSQL 上可以用 `quecachex.StartCleanup` 让一个实例定时跑它（见下文）。
+- `ctx` 结束就停在批与批之间，返回已经删掉的数量。
 
 ### 租约（`Leases`）
 

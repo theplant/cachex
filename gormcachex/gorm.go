@@ -9,8 +9,7 @@
 // row locks while the Cache waits for a stripe another write holds, which
 // itself waits for those rows, a deadlock the database cannot see. Change the
 // source in a transaction, then write the Cache after it commits. Expired
-// rows are not removed: delete rows whose expires_at has passed from time to
-// time.
+// rows are not removed on their own: call DeleteExpired from time to time.
 package gormcachex
 
 import (

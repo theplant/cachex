@@ -110,6 +110,12 @@ func TestOnRealDatabases(t *testing.T) {
 				})
 			})
 
+			t.Run("DeleteExpired", func(t *testing.T) {
+				testDeleteExpired(t, func(t *testing.T, chunkSize int) *Backend[string] {
+					return New[string](Config[string]{DB: db, TableName: newB(t).bytes.table, KeyPrefix: "p:", Leases: true, ChunkSize: chunkSize})
+				})
+			})
+
 			t.Run("a key it cannot store fails alone", func(t *testing.T) {
 				testUnstorableKeys(t, newB(t))
 			})
