@@ -3,6 +3,7 @@ package rediscachex
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -304,4 +305,17 @@ func TestTheEmptyKeyHasNoLeaseWithoutAPrefix(t *testing.T) {
 	b := New[string](Config[string]{Client: client, Leases: true})
 	err := b.Set(context.Background(), "", cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)})
 	assert.ErrorIs(t, err, cachex.ErrUnsupportedKey)
+}
+
+func TestALeasedEntryThatDoesNotEncodeEndsItsLease(t *testing.T) {
+	ctx := context.Background()
+	_, client := newRedis(t)
+	l := New[float64](Config[float64]{Client: client, KeyPrefix: "p:", Leases: true}).(cachex.Leasing[float64]).Leaser()
+	tokens, err := l.Lease(ctx, []string{"k"}, time.Minute)
+	require.NoError(t, err)
+	err = l.PutLeased(ctx, tokens, map[string]cachex.Entry[float64]{"k": {Value: math.NaN(), ExpiresAt: time.Now().Add(time.Hour)}}) // JSON has no NaN
+	require.Error(t, err)
+	again, err := l.Lease(ctx, []string{"k"}, time.Minute)
+	require.NoError(t, err)
+	assert.NotEmpty(t, again["k"], "the lease ended, not left until its TTL")
 }

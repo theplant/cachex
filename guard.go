@@ -53,11 +53,18 @@ func (c *Cache[T]) endWrite(s *stripe.Stripe, keys ...string) {
 // backfill that took its generation before is skipped, and a read from now on
 // fetches anew instead of joining a fetch that may have read the layers before
 // the write.
+//
+// The flights go first: a fetch that registers its call to the source in
+// between took its generation before the count, so its backfill is skipped
+// (and it asked the source after the caller changed it). The other way
+// round, a fetch registering after the count but before the drop would have
+// its call dropped while its backfill still lands, and a read after the
+// write would ask the source again at the same time (see ADR 0022).
 func (c *Cache[T]) countWrite(s *stripe.Stripe, keys ...string) {
-	s.AddWrite()
 	for _, key := range keys {
 		c.dropFlights(key)
 	}
+	s.AddWrite()
 }
 
 // lockWrites is lockWrite for many keys; unlock ends the write of them all. It

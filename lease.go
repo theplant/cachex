@@ -99,15 +99,8 @@ func (l encodedLeaser[T]) PutLeased(ctx context.Context, tokens map[string]strin
 		}
 		live[key] = ByteEntry{Data: data, ExpiresAt: entry.ExpiresAt}
 	}
-	if len(errs) > 0 { // an entry that does not encode leaves its key alone
-		kept := make(map[string]string, len(tokens))
-		for key, token := range tokens {
-			if errs[key] == nil {
-				kept[key] = token
-			}
-		}
-		tokens = kept
-	}
+	// an entry that does not encode has none in live: its key is deleted
+	// under the lease, which ends it, rather than left leased until the TTL
 	err := l.b.PutLeased(ctx, tokens, live)
 	for key := range tokens {
 		if kerr := errForKey(err, key); kerr != nil {
