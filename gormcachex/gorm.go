@@ -35,7 +35,8 @@ import (
 const DefaultChunkSize = 1000
 
 // maxChunkSize keeps every statement under the databases' bound parameter
-// limits: an upsert binds 4 parameters per row, and SQLite allows 32766.
+// limits: an upsert binds 4 parameters per row (6 with leases, whose chunks
+// are bounded by maxLeaseChunk instead), and SQLite allows 32766.
 const maxChunkSize = 8000
 
 // deadlockAttempts is how many times a write chosen as a deadlock victim is
@@ -324,7 +325,11 @@ func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.Byt
 	// one row order for every writer, or overlapping batches lock rows in
 	// opposite orders and deadlock
 	slices.SortFunc(rows, func(a, b pending) int { return strings.Compare(a.row.Key, b.row.Key) })
-	for chunk := range slices.Chunk(rows, b.chunkSize) {
+	size := b.chunkSize
+	if b.leases {
+		size = min(size, maxLeaseChunk) // a leased row binds 6 parameters
+	}
+	for chunk := range slices.Chunk(rows, size) {
 		batch := make([]row, len(chunk))
 		for i, p := range chunk {
 			batch[i] = p.row

@@ -95,3 +95,15 @@ func TestItIsNotLocal(t *testing.T) {
 	_, ok := b.(cachex.LocalBackend)
 	assert.False(t, ok, "a table is shared: a broadcast never clears it")
 }
+
+func TestTheLargestChunkWritesWithLeasesOn(t *testing.T) {
+	// a leased row binds 6 parameters, not 4: 8000 of them pass SQLite's
+	// 32766
+	ctx := context.Background()
+	b := newBackend(t, Config[string]{Leases: true, ChunkSize: maxChunkSize})
+	entries := map[string]cachex.Entry[string]{}
+	for i := range maxChunkSize {
+		entries[fmt.Sprint("k", i)] = cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}
+	}
+	require.NoError(t, b.SetMany(ctx, entries))
+}
