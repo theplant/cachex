@@ -115,12 +115,12 @@ Not within one process. Backfills of a key land one at a time, a copy of an entr
 
 ### With several instances deployed, is the write order still guaranteed?
 
-No. The striped lock works within one process only:
+The striped lock works within one process only. Across instances there are two problems, each solved by an option:
 
-- other instances' memory layers do not see your write and keep serving the old value until it turns rotten;
-- another instance can backfill an old value into the shared Redis.
+- **Another instance can backfill an old value into a shared layer** (Redis or a table): turn leases on for it (`Leases`); only a fetch that still holds its lease backfills, and a write ends the lease.
+- **Other instances' memory layers do not see your write**: turn on the invalidation broadcast (`WithBroadcast`); a write sends its keys to the other instances, which drop them from their memory layers, and clear those layers when a message may have been lost.
 
-TTLs are the backstop for now, so set every layer's TTLs to how long you can accept old data. Redis leases and invalidation broadcasts are in the [to-do list](todo.md) (Chinese). See [design/consistency.md](design/consistency.md) (Chinese).
+With neither, TTLs are the only backstop: set every layer's TTLs to how long you can accept old data. See [design/consistency.md](design/consistency.md) (Chinese).
 
 ## Batch reads
 
