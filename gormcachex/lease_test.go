@@ -3,6 +3,8 @@ package gormcachex
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,4 +108,31 @@ func TestTheLargestChunkWritesWithLeasesOn(t *testing.T) {
 		entries[fmt.Sprint("k", i)] = cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}
 	}
 	require.NoError(t, b.SetMany(ctx, entries))
+}
+
+func TestAKeyTooLongToLeaseIsStillRefreshed(t *testing.T) {
+	// it can never be leased (nor stored): that is not another instance
+	// holding its lease, so a stale hit still refreshes it
+	ctx := context.Background()
+	key := strings.Repeat("k", 300)
+	var mu sync.Mutex
+	data := "v1"
+	src := cachex.SourceFunc[string](func(context.Context, string) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return data, nil
+	})
+	clock := cachextest.NewClock(time.Now())
+	c := cachex.New(src, []cachex.Layer[string]{
+		cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Second, time.Hour), cachex.Jitter(0)),
+		cachex.NewLayer[string](newBackend(t, Config[string]{Leases: true}), cachex.TTL(time.Second, time.Hour), cachex.Jitter(0)),
+	}, cachex.WithNow(clock.Now))
+	defer func() { _ = c.Close() }()
+	_, err := c.Get(ctx, key)
+	require.NoError(t, err)
+	mu.Lock()
+	data = "v2"
+	mu.Unlock()
+	clock.Advance(2 * time.Second)
+	assert.Eventually(t, func() bool { v, err := c.Get(ctx, key); return err == nil && v == "v2" }, 5*time.Second, 5*time.Millisecond)
 }

@@ -83,6 +83,11 @@ func (l leaser) chunks(keys []string) [][2][]string {
 func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (map[string]string, error) {
 	out := map[string]string{}
 	errs := map[string]error{}
+	for _, key := range keys { // left out by chunks: not another instance's
+		if !storable(l.b.prefix + key) {
+			errs[key] = fmt.Errorf("gormcachex: lease %q: the key column cannot hold it: %w", key, cachex.ErrUnsupportedKey)
+		}
+	}
 	db := l.b.db.WithContext(ctx)
 	for _, c := range l.chunks(keys) {
 		chunk, prefixed := c[0], c[1]

@@ -84,8 +84,9 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 		gets := make([]*redis.StringCmd, len(chunk))
 		tokens := make([]string, len(chunk))
 		for i, key := range chunk {
-			if l.b.leaseSpace(key) {
-				continue // never stored: nothing to lease
+			if l.b.leaseSpace(key) { // never stored: nothing to lease, and nobody holds it
+				errs[key] = fmt.Errorf("rediscachex: key %q is where leases are: %w", key, cachex.ErrUnsupportedKey)
+				continue
 			}
 			lk, ok := leaseKey(l.b.prefix + key)
 			if !ok {

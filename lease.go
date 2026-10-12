@@ -21,7 +21,8 @@ import (
 type Leaser[T any] interface {
 	// Lease takes a lease, for ttl, on each of keys that nobody leases, and
 	// returns a token for each lease it took. A key leased by someone else is
-	// left out, as is a key that failed.
+	// left out; a key that failed, or that the backend cannot lease (one it
+	// cannot store, say), is left out and reported in the error.
 	Lease(ctx context.Context, keys []string, ttl time.Duration) (map[string]string, error)
 	// PutLeased writes, for each key of tokens whose lease still holds its
 	// token, the key's entry in entries, or deletes the key if it has none, and
@@ -121,7 +122,9 @@ var errLeased = errors.New("cachex: another instance holds the lease")
 // lease takes, for the flights idxs that missed layer li, a lease there, if
 // the layer leases, before the fetch reads further down. A lease lasts as
 // long as a fetch may (WithFetchTimeout). A key it cannot lease (another
-// instance holds it, or the call failed) is not backfilled into the layer.
+// instance holds it, or the call failed) is not backfilled into the layer;
+// only one another instance holds is refused (see skipLeased), since a key
+// that failed (one the layer cannot store, say) has no holder to refresh it.
 func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int) {
 	if c.leasers == nil || c.leasers[li] == nil || len(idxs) == 0 {
 		return
@@ -130,9 +133,7 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 	lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	tokens, err := l.Lease(lctx, keysAt(p.keys, idxs), c.opts.fetchTimeout)
 	cancel()
-	if err != nil {
-		c.opts.logger.WarnContext(ctx, "cachex: lease failed", "layer", li, "error", err)
-	}
+	warn := false
 	for _, i := range idxs {
 		k := &p.ks[i]
 		if k.leases == nil {
@@ -140,9 +141,14 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 		}
 		if token, ok := tokens[p.keys[i]]; ok {
 			k.leases.tokens[li] = token
-		} else {
-			k.leases.refused = true
+		} else if kerr := errForKey(err, p.keys[i]); kerr == nil {
+			k.leases.refused = true // another instance holds it; a key that failed is not refused
+		} else if !errors.Is(kerr, ErrUnsupportedKey) { // a key the layer cannot store just misses there
+			warn = true
 		}
+	}
+	if warn {
+		c.opts.logger.WarnContext(ctx, "cachex: lease failed", "layer", li, "error", err)
 	}
 }
 
