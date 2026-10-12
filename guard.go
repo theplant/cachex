@@ -37,7 +37,7 @@ func (c *Cache[T]) lockWrite(ctx context.Context, key string) error {
 	if s.TryLock() { // the closures below cost allocations, so only when waiting
 		return nil
 	}
-	return c.lockStripe(ctx, s, c.lateWrite(ctx, s, []string{key}))
+	return c.lockStripe(ctx, s, c.lateWrite(ctx, s, []string{key}, false))
 }
 
 // unlockWrite ends a write of key.
@@ -63,9 +63,10 @@ func (c *Cache[T]) countWrite(s *stripe.Stripe, keys ...string) {
 // lockWrites is lockWrite for many keys; unlock ends the write of them all. It
 // takes the stripes in increasing order, so writes never deadlock. If ctx ends
 // while waiting, the keys of the stripes it holds or can take at once are
-// dropped from every layer in one call per layer, and those of the others once
-// each is free.
-func (c *Cache[T]) lockWrites(ctx context.Context, keys []string) (unlock func(), err error) {
+// dropped (see drop) in one call per layer, and those of the others once each
+// is free. local is for a broadcast's invalidation: it drops from the local
+// layers only.
+func (c *Cache[T]) lockWrites(ctx context.Context, keys []string, local bool) (unlock func(), err error) {
 	byStripe := map[int][]string{}
 	for _, key := range keys {
 		i := c.stripes.Index(key)
@@ -87,12 +88,12 @@ func (c *Cache[T]) lockWrites(ctx context.Context, keys []string) (unlock func()
 		if s.TryLock() {
 			continue
 		}
-		if err := c.lockStripe(ctx, s, c.lateWrite(ctx, s, byStripe[i])); err != nil {
+		if err := c.lockStripe(ctx, s, c.lateWrite(ctx, s, byStripe[i], local)); err != nil {
 			held := order[:n:n]
 			for _, j := range order[n+1:] {
 				r := c.stripes.At(j)
 				// ctx is done: this does not wait
-				if r.TryLock() || c.lockStripe(ctx, r, c.lateWrite(ctx, r, byStripe[j])) == nil {
+				if r.TryLock() || c.lockStripe(ctx, r, c.lateWrite(ctx, r, byStripe[j], local)) == nil {
 					held = append(held, j)
 				}
 			}
@@ -101,7 +102,7 @@ func (c *Cache[T]) lockWrites(ctx context.Context, keys []string) (unlock func()
 				dropped = append(dropped, byStripe[j]...)
 			}
 			if len(dropped) > 0 {
-				c.invalidate(ctx, dropped, len(c.layers)-1)
+				c.drop(ctx, dropped, local)
 			}
 			end(held)
 			return nil, err
@@ -110,11 +111,36 @@ func (c *Cache[T]) lockWrites(ctx context.Context, keys []string) (unlock func()
 	return func() { end(order) }, nil
 }
 
-// lateWrite is what a write that gave up waiting for s does once it holds s.
-func (c *Cache[T]) lateWrite(ctx context.Context, s *stripe.Stripe, keys []string) func() {
+// lateWrite is what a write that gave up waiting for s does once it holds s:
+// it drops keys and counts a write. A write's drop (not local) is published
+// again after it: the message the write sent when it gave up may have reached
+// an instance that then copied the old value from a shared layer before the
+// drop.
+func (c *Cache[T]) lateWrite(ctx context.Context, s *stripe.Stripe, keys []string, local bool) func() {
 	return func() {
-		c.invalidate(ctx, keys, len(c.layers)-1)
+		c.drop(ctx, keys, local)
 		c.countWrite(s, keys...)
+		if !local {
+			c.publish(ctx, keys)
+		}
+	}
+}
+
+// drop drops keys after a write gave up waiting: from every layer (the caller
+// may have changed the source already), or, for a broadcast's invalidation
+// (local), from the local layers only, since the shared ones hold what the
+// writer wrote.
+func (c *Cache[T]) drop(ctx context.Context, keys []string, local bool) {
+	if !local {
+		c.invalidate(ctx, keys, len(c.layers)-1)
+		return
+	}
+	dctx, cancel := context.WithTimeout(sharedCtx(ctx), c.opts.fetchTimeout)
+	defer cancel()
+	for _, j := range c.local {
+		if err := c.layers[j].backend.DelMany(dctx, keys); err != nil {
+			c.opts.logger.WarnContext(dctx, "cachex: broadcast invalidation failed", "layer", j, "error", err)
+		}
 	}
 }
 
@@ -199,7 +225,7 @@ func (c *Cache[T]) beginFills(fills []fill[T]) (ok []int, end func()) {
 // layers as a write of them would: holding their stripes, and counting a
 // write, so that a fetch of them that started before does not backfill its
 // answer after. If the stripes stay busy past the fetch timeout, the keys are
-// dropped from every layer once each is free (see lockWrites).
+// dropped from the local layers once each is free (see lockWrites).
 func (c *Cache[T]) invalidateLocal(keys []string) {
 	keys = slices.DeleteFunc(uniqueKeys(keys), func(key string) bool { return !supportedKey(key) })
 	if len(keys) == 0 {
@@ -207,17 +233,13 @@ func (c *Cache[T]) invalidateLocal(keys []string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.opts.fetchTimeout)
 	defer cancel()
-	unlock, err := c.lockWrites(ctx, keys)
+	unlock, err := c.lockWrites(ctx, keys, true)
 	if err != nil {
 		c.opts.logger.WarnContext(ctx, "cachex: broadcast invalidation waited too long", "error", err)
 		return
 	}
 	defer unlock()
-	for _, j := range c.local {
-		if err := c.layers[j].backend.DelMany(ctx, keys); err != nil {
-			c.opts.logger.WarnContext(ctx, "cachex: broadcast invalidation failed", "layer", j, "error", err)
-		}
-	}
+	c.drop(ctx, keys, true)
 }
 
 // clearLocal clears the local layers, holding every stripe meanwhile and

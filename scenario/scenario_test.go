@@ -148,7 +148,9 @@ type source struct {
 	delay func() time.Duration
 }
 
-func newSource(data map[string]int) *source { return &source{data: data, delay: func() time.Duration { return 0 }} }
+func newSource(data map[string]int) *source {
+	return &source{data: data, delay: func() time.Duration { return 0 }}
+}
 
 func (s *source) Get(_ context.Context, key string) (int, error) {
 	s.calls.Add(1)

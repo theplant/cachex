@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -173,4 +175,114 @@ func TestAMessageThatDoesNotDecodeIsIgnored(t *testing.T) {
 	v, err := a.c.Get(ctx, "k")
 	require.NoError(t, err, "the listener goes on")
 	assert.Equal(t, "v", v)
+}
+
+func TestABroadcastInvalidationThatGaveUpLeavesTheSharedLayersAlone(t *testing.T) {
+	// a's write of k holds k's stripe while b's message about k arrives; a's
+	// invalidation gives up waiting, and drops k once the stripe is free: from
+	// the local layers only, never from the shared one a's write just wrote
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v1"})
+	shared := cachextest.NewLeasingMap[string]() // not a LocalBackend
+	bl := newBlocker("k")
+	var logs syncBuffer
+	bus := cachextest.NewBus()
+	a := newInstance(t, src, bl.wrap(shared), bus, cachex.WithFetchTimeout(20*time.Millisecond),
+		cachex.WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	b := newInstance(t, src, shared, bus)
+
+	done := make(chan error)
+	go func() { done <- a.c.Set(ctx, "k", "a") }()
+	<-bl.entered
+	require.NoError(t, b.c.Del(ctx, "k"))
+	require.Eventually(t, func() bool { return strings.Contains(logs.String(), "waited too long") }, 5*time.Second, time.Millisecond)
+	close(bl.release)
+	require.NoError(t, <-done)
+	cachex.Settle(a.c) // the late invalidation ran
+	e, ok := stored(t, shared, "k")
+	require.True(t, ok, "a's write, the last one, stands in the shared layer")
+	assert.Equal(t, "a", e.Value)
+	_, ok = stored(t, a.local, "k")
+	assert.False(t, ok, "a dropped k from its memory layer")
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger and a test to share.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// localHooked is a hooked Map that is still a LocalBackend.
+type localHooked struct {
+	cachex.Backend[string]
+	m *cachextest.Map[string]
+}
+
+func (l localHooked) Clear(ctx context.Context) error { return l.m.Clear(ctx) }
+
+func TestAWriteThatGaveUpPublishesAgainAfterItsDrop(t *testing.T) {
+	// a's write gives up while a's backfill of the old value holds the stripe,
+	// and publishes; b copies the old value from the shared layer before a's
+	// late drop: the drop is published too, so b does not keep it
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v0"})
+	shared := cachextest.NewLeasingMap[string]()
+	bus := cachextest.NewBus()
+
+	// a: its memory layer holds the backfill of k (after the shared layer
+	// got it), so the backfill keeps k's stripe read-locked
+	aMap := cachextest.NewMap[string]()
+	bl := newBlocker("k")
+	sub := bus.Subscribed()
+	a := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](localHooked{bl.wrap(aMap), aMap}, cachex.TTL(time.Hour, 0)),
+		cachex.NewLayer[string](shared, cachex.TTL(time.Hour, 0)),
+	}, cachex.WithBroadcast(bus.Broadcast()))
+	t.Cleanup(func() { _ = a.Close() })
+	require.Eventually(t, func() bool { return bus.Subscribed() > sub }, 5*time.Second, time.Millisecond)
+	b := newInstance(t, src, shared, bus)
+
+	v, err := a.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v0", v)
+	<-bl.entered // backfill: shared has v0, a's memory layer write is held
+
+	// b holds something for k locally, so we can see it handle the message
+	require.NoError(t, b.local.Set(ctx, "k", cachex.Entry[string]{Value: "marker", CachedAt: epoch, FreshUntil: time.Now().Add(time.Hour), ExpiresAt: time.Now().Add(time.Hour)}))
+
+	src.set("k", "v2")
+	wctx, cancel := context.WithCancel(ctx)
+	errc := make(chan error)
+	go func() { errc <- a.Set(wctx, "k", "v2") }()
+	cancel()
+	require.Error(t, <-errc, "gave up waiting for the backfill; drops k once the stripe is free")
+
+	eventuallyGone(t, b.local, "k", "b handled a's message")
+	v, err = b.c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v0", v, "b copied the old value before a's late drop")
+	cachex.Settle(b.c)
+
+	close(bl.release)
+	cachex.Settle(a) // a's late drop is done
+	_, ok := stored(t, shared, "k")
+	require.False(t, ok, "a dropped k from the shared layer")
+
+	v, err = a.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "v2", v, "a reads the new value")
+	assert.Eventually(t, func() bool { v, err := b.c.Get(ctx, "k"); return err == nil && v == "v2" }, 5*time.Second, time.Millisecond,
+		"b too, once a's drop reached it")
 }

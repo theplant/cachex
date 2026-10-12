@@ -22,7 +22,7 @@ import (
 // Set waits while another write of a key in the same stripe is in progress;
 // if ctx ends first it returns ctx's error, writes nothing, and drops the key
 // from every layer once the stripe is free, since the caller may have changed
-// the source already.
+// the source already (with a broadcast, it publishes the key again then).
 func (c *Cache[T]) Set(ctx context.Context, key string, value T) error {
 	err := c.writeOne(ctx, key, &value)
 	if c.opts.broadcast != nil {
@@ -116,7 +116,7 @@ func (c *Cache[T]) write(ctx context.Context, values map[string]T, dels []string
 		}
 	}
 	keys := slices.AppendSeq(make([]string, 0, len(values)+len(dels)), maps.Keys(values))
-	unlock, err := c.lockWrites(ctx, append(keys, dels...))
+	unlock, err := c.lockWrites(ctx, append(keys, dels...), false)
 	if err != nil {
 		return err
 	}

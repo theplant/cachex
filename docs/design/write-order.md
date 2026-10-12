@@ -66,7 +66,7 @@ sequenceDiagram
 | `SetMany`/`DelMany` 等某个分片时 ctx 结束 | 同上，返回的不是 `*BatchError`，什么都不写。已经拿到的分片和当场能拿到的分片上的 key，每层一次 `DelMany` 当场删掉；其余分片上的 key 各自等分片空出来后删掉 |
 | 回填某一层失败 | 只记 WARN `cachex: backfill failed`，其他层照写，结果照常返回给调用方 |
 
-一句话：**任何失败的写入，都不会在失败的那一层及其上面留下这个 key 的条目**。返回错误不代表什么都没写进去。失效用的是共享 ctx（去掉取消和调用方的事务），整次失效受一个 `WithFetchTimeout` 限制（见 [singleflight.md](singleflight.md#回源用的-ctx)），因为写入失败往往正是 ctx 结束导致的。失效失败只记 WARN `cachex: invalidation failed`：一层既然删不掉，紧接着的失效同样删不掉。分片空出来之后才做的失效，如果在 `Close` 之前安排，`Close` 会等它完成。
+一句话：**任何失败的写入，都不会在失败的那一层及其上面留下这个 key 的条目**。返回错误不代表什么都没写进去。失效用的是共享 ctx（去掉取消和调用方的事务），整次失效受一个 `WithFetchTimeout` 限制（见 [singleflight.md](singleflight.md#回源用的-ctx)），因为写入失败往往正是 ctx 结束导致的。失效失败只记 WARN `cachex: invalidation failed`：一层既然删不掉，紧接着的失效同样删不掉。分片空出来之后才做的失效，如果在 `Close` 之前安排，`Close` 会等它完成。开了失效广播时，放弃等待的写入在返回时广播一次，分片空出来、删完各层之后**再广播一次**：第一条消息到达别的实例时，共享层可能还留着旧值，它会被复制进那个实例的内存层，只有第二条消息能把它删掉。
 
 ## 要解决的竞态：旧值回填盖过新写入
 
