@@ -646,10 +646,8 @@ func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], idxs []int
 // skipped, at the cost of a spare miss. Backfills of a key land one at a time,
 // and a copy of an entry from a lower layer does not replace one the layer
 // holds from a later answer of the source (a later CachedAt): held up, it
-// would otherwise undo a refresh. An answer of the source needs no such check
-// (the source is asked once at a time, see askSource, so no other answer is
-// newer), nor does a layer that leases (only the holder of its lease writes
-// it). It publishes each fill's flight, holding the fill lock (see
+// would otherwise undo a refresh (see land, which also covers layers that
+// lease). It publishes each fill's flight, holding the fill lock (see
 // publishesEarly), or at once if the fill is skipped.
 func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	ok, end := c.beginFills(fills)
