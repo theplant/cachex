@@ -95,17 +95,25 @@ func TestTheChainResumesAfterARestart(t *testing.T) {
 	runsReach(t, c, before+2, "a new instance picks the job up")
 }
 
-func TestABrokenChainIsSeededAgain(t *testing.T) {
-	// a job expired by go-que (retries exhausted) breaks the chain: the
-	// instances seed it again
+func TestTheJobIsRetriedForever(t *testing.T) {
+	// go-que expires a job whose retries ran out, which would break the
+	// chain: a failed rescheduling is retried for as long as it takes
+	j := &job{name: "cachex-cleanup:x"}
+	_, more := j.plan(time.Now()).RetryPolicy.NextInterval(1_000_000)
+	assert.True(t, more)
+}
+
+func TestADeletedJobComesBackWithAnInstance(t *testing.T) {
 	db := newDB(t)
 	c := &cleaner{}
-	start(t, db, c, "cache")
+	cl := start(t, db, c, "cache")
 	runsReach(t, c, 2, "running")
-	_, err := db.Exec("DELETE FROM goque_jobs")
+	require.NoError(t, cl.Stop(context.Background()))
+	_, err := db.Exec("DELETE FROM goque_jobs") // by hand, say
 	require.NoError(t, err)
 	before := c.runs.Load()
-	runsReach(t, c, before+2, "seeded again")
+	start(t, db, c, "cache")
+	runsReach(t, c, before+2, "the starting instance enqueues it again")
 }
 
 func TestTwoTablesHaveTheirOwnJobs(t *testing.T) {

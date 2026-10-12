@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/qor5/go-bus/quex"
@@ -48,9 +47,6 @@ type CleanupConfig struct {
 // Cleanup is a running cleanup; Stop it on shutdown.
 type Cleanup struct {
 	worker quex.WorkerController
-	cancel context.CancelFunc
-	seeded chan struct{}
-	once   sync.Once
 }
 
 // StartCleanup starts running cfg.Cleaner every cfg.Interval as a go-que
@@ -58,9 +54,10 @@ type Cleanup struct {
 // on every instance. The job reschedules itself: each run destroys it and
 // enqueues the next in one transaction, and a job's UniqueID keeps one job
 // in the queue, so one instance runs it at a time. A failed run is logged and
-// tried again within a minute (or the interval, if shorter); were the chain
-// broken anyway (go-que expires a job whose rescheduling kept failing), each
-// instance enqueues it again every interval, and on start.
+// tried again within a minute (or the interval, if shorter). A failed
+// rescheduling is retried by go-que for as long as it takes: go-que expires
+// a job whose retries ran out, which would end the chain. Each instance also
+// enqueues the job on start, so one deleted by hand comes back.
 func StartCleanup(ctx context.Context, cfg CleanupConfig) (*Cleanup, error) {
 	switch {
 	case cfg.DB == nil:
@@ -96,37 +93,12 @@ func StartCleanup(ctx context.Context, cfg CleanupConfig) (*Cleanup, error) {
 	if err != nil {
 		return nil, fmt.Errorf("goquecachex: StartCleanup: %w", err)
 	}
-	sctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	c := &Cleanup{worker: worker, cancel: cancel, seeded: make(chan struct{})}
-	go func() { // mend a broken chain
-		defer close(c.seeded)
-		tick := time.NewTicker(cfg.Interval)
-		defer tick.Stop()
-		for {
-			select {
-			case <-sctx.Done():
-				return
-			case <-tick.C:
-				if err := j.seed(sctx); err != nil && sctx.Err() == nil {
-					cfg.Logger.WarnContext(sctx, "goquecachex: seeding the cleanup failed", "name", cfg.Name, "error", err)
-				}
-			}
-		}
-	}()
-	return c, nil
+	return &Cleanup{worker: worker}, nil
 }
 
 // Stop stops the instance's worker; a run in progress finishes first, unless
 // ctx ends. The job stays queued for the other instances.
-func (c *Cleanup) Stop(ctx context.Context) error {
-	var err error
-	c.once.Do(func() {
-		c.cancel()
-		<-c.seeded
-		err = c.worker.Stop(ctx)
-	})
-	return err
-}
+func (c *Cleanup) Stop(ctx context.Context) error { return c.worker.Stop(ctx) }
 
 type job struct {
 	cfg   CleanupConfig
@@ -139,7 +111,7 @@ func (j *job) plan(runAt time.Time) que.Plan {
 		Queue:           j.name,
 		Args:            que.Args(),
 		RunAt:           runAt,
-		RetryPolicy:     que.RetryPolicy{InitialInterval: time.Second, MaxInterval: time.Minute, NextIntervalMultiplier: 2, IntervalRandomPercent: 20, MaxRetryCount: 10},
+		RetryPolicy:     que.RetryPolicy{InitialInterval: time.Second, MaxInterval: time.Minute, NextIntervalMultiplier: 2, IntervalRandomPercent: 20, MaxRetryCount: -1}, // forever: see StartCleanup
 		UniqueID:        &j.name,
 		UniqueLifecycle: que.Lockable,
 	}
