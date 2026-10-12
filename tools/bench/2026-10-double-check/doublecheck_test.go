@@ -39,6 +39,12 @@ func (s *slowBackend) Get(ctx context.Context, key string) (cachex.Entry[string]
 // run sends 20 requests per ms for 400 ms; hot uses one key that expires
 // every 20 ms, otherwise every request asks for a new (cold) key.
 func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (sourceCalls int64, readsPerGet float64) {
+	return runShared(mode, delay, hot, 1)
+}
+
+// runShared is run with the requests spread over instances Caches sharing the
+// one layer (round robin).
+func runShared(mode cachex.DoubleCheckMode, delay time.Duration, hot bool, instances int) (sourceCalls int64, readsPerGet float64) {
 	ctx := context.Background()
 	backend := &slowBackend{Map: cachextest.NewMap[string](), delay: delay}
 	var calls atomic.Int64
@@ -47,9 +53,12 @@ func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (sourceCall
 		time.Sleep(5 * time.Millisecond)
 		return "v", nil
 	})
-	c := cachex.New[string](src, []cachex.Layer[string]{
-		cachex.NewLayer[string](backend, cachex.TTL(20*time.Millisecond, 0), cachex.Jitter(0)),
-	}, cachex.WithDoubleCheck(mode))
+	cs := make([]*cachex.Cache[string], instances)
+	for i := range cs {
+		cs[i] = cachex.New[string](src, []cachex.Layer[string]{
+			cachex.NewLayer[string](backend, cachex.TTL(20*time.Millisecond, 0), cachex.Jitter(0)),
+		}, cachex.WithDoubleCheck(mode))
+	}
 
 	var n atomic.Int64
 	var wg sync.WaitGroup
@@ -59,6 +68,7 @@ func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (sourceCall
 			if !hot {
 				key = fmt.Sprintf("cold-%d-%d", ms, j)
 			}
+			c := cs[j%instances]
 			wg.Go(func() {
 				_, _ = c.Get(ctx, key)
 				n.Add(1)
@@ -67,7 +77,9 @@ func run(mode cachex.DoubleCheckMode, delay time.Duration, hot bool) (sourceCall
 		time.Sleep(time.Millisecond)
 	}
 	wg.Wait()
-	_ = c.Close()
+	for _, c := range cs {
+		_ = c.Close()
+	}
 	return calls.Load(), float64(backend.reads.Load()) / float64(n.Load())
 }
 
@@ -119,4 +131,31 @@ func TestDoubleCheckValue(t *testing.T) {
 	assert.Greater(t, readsMid["cold/1ms/enabled"], 1.9)
 	assert.Less(t, readsMid["cold/1ms/auto"], 1.05)
 	assert.InDelta(t, 1.0, readsMid["cold/1ms/disabled"], 0.001)
+}
+
+// TestDoubleCheckOnASharedLayer spreads the same load over several instances
+// sharing a 1ms first layer: each instance fetches the hot key once per
+// expiry whatever the mode, since all of them miss at the same moment.
+func TestDoubleCheckOnASharedLayer(t *testing.T) {
+	const rounds = 5
+	for _, inst := range []int{1, 2, 4, 10} {
+		mid := map[string]int64{}
+		for _, m := range []struct {
+			name string
+			mode cachex.DoubleCheckMode
+		}{{"enabled", cachex.DoubleCheckEnabled}, {"auto", cachex.DoubleCheckAuto}} {
+			calls, reads := make([]int64, rounds), make([]float64, rounds)
+			for i := range rounds {
+				calls[i], _ = runShared(m.mode, time.Millisecond, true, inst)
+				_, reads[i] = runShared(m.mode, time.Millisecond, false, inst)
+			}
+			cLo, cMid, cHi := spread(calls)
+			_, rMid, _ := spread(reads)
+			mid[m.name] = cMid
+			t.Logf("instances=%-2d %-8s hot key source calls %3d [%d..%d]   cold keys: backend reads per Get %.3f",
+				inst, m.name, cMid, cLo, cHi, rMid)
+		}
+		// always re-reading saves about one call per instance, the same as on one instance
+		assert.LessOrEqual(t, mid["auto"]-mid["enabled"], int64(2*inst))
+	}
 }
