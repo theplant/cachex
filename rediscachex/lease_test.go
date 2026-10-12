@@ -64,10 +64,10 @@ func TestLeasesAreOffByDefault(t *testing.T) {
 func TestTheLeaseKeySharesTheDataKeysSlot(t *testing.T) {
 	for prefixed, want := range map[string]string{
 		"p:user:1":         "cachex-lease:{p:user:1}",
-		"p:{user:1}:posts": "cachex-lease:p:{user:1}:posts",
-		"{app}:x":          "cachex-lease:{app}:x",
+		"p:{user:1}:posts": "cachex-lease:t:p:{user:1}:posts",
+		"{app}:x":          "cachex-lease:t:{app}:x",
 		"p:a{b":            "cachex-lease:{p:a{b}",
-		"p:{a}b}":          "cachex-lease:p:{a}b}",
+		"p:{a}b}":          "cachex-lease:t:p:{a}b}",
 	} {
 		got, ok := leaseKey(prefixed)
 		require.True(t, ok, prefixed)
@@ -274,4 +274,23 @@ func TestAKeyPrefixWithAStrayBraceIsRejectedWithLeases(t *testing.T) {
 	assert.Panics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "p}", Leases: true}) })
 	assert.NotPanics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "p}"}) })
 	assert.NotPanics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "{tenant}:", Leases: true}) })
+}
+
+func TestAKeyAndItsBracedSelfHaveTheirOwnLeases(t *testing.T) {
+	ctx := context.Background()
+	_, client := newRedis(t)
+	l := New[string](Config[string]{Client: client, Leases: true}).(cachex.Leasing[string]).Leaser()
+	for _, key := range []string{"X", "{X}"} {
+		tokens, err := l.Lease(ctx, []string{key}, time.Minute)
+		require.NoError(t, err)
+		assert.NotEmpty(t, tokens[key], "%s is leased on its own", key)
+	}
+}
+
+func TestAKeyPrefixWithAnUnclosedBraceIsRejectedWithLeases(t *testing.T) {
+	// "a{" before "}b{c}" (which the Cache accepts) makes "a{}b{c}": no slot
+	_, client := newRedis(t)
+	for _, prefix := range []string{"a{", "{}", "a{b"} {
+		assert.Panics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: prefix, Leases: true}) }, prefix)
+	}
 }

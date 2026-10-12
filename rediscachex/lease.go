@@ -21,17 +21,25 @@ const leasePrefix = "cachex-lease:"
 
 // leaseKey returns the key of the lease of the data key prefixed, in its
 // Redis Cluster slot, so that one script can touch both: with a hash tag in
-// prefixed it is leasePrefix+prefixed (the tag still comes first), without
-// one prefixed is wrapped in braces. A key with a "}" but no hash tag has no
-// such key; cachex.Cache rejects it (see cachex.ErrUnsupportedKey).
+// prefixed it is leasePrefix+"t:"+prefixed (the tag still comes first),
+// without one prefixed is wrapped in braces; the "t:" keeps "X" and "{X}"
+// apart. A key with a "}" but no hash tag has no such key; cachex.Cache
+// rejects it (see cachex.ErrUnsupportedKey).
 func leaseKey(prefixed string) (string, bool) {
-	if open := strings.IndexByte(prefixed, '{'); open >= 0 && strings.IndexByte(prefixed[open+1:], '}') > 0 {
-		return leasePrefix + prefixed, true
+	if hasHashTag(prefixed) {
+		return leasePrefix + "t:" + prefixed, true
 	}
 	if strings.IndexByte(prefixed, '}') >= 0 {
 		return "", false
 	}
 	return leasePrefix + "{" + prefixed + "}", true
+}
+
+// hasHashTag reports whether s has a Redis hash tag: a "{" followed later by
+// a "}" with something in between.
+func hasHashTag(s string) bool {
+	open := strings.IndexByte(s, '{')
+	return open >= 0 && strings.IndexByte(s[open+1:], '}') > 0
 }
 
 func errNoLeaseKey(key string) error {

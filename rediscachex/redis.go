@@ -30,7 +30,7 @@ type Config[T any] struct {
 	// caches. It must not start with "cachex-lease:", which the keys of leases
 	// (see Leases) start with, and a key that it makes start so is not
 	// stored (writes of it fail with cachex.ErrUnsupportedKey). With leases
-	// on, it must not have a "}" without a hash tag. Change it when the value
+	// on, a brace in it must be part of a hash tag. Change it when the value
 	// type changes incompatibly: JSON
 	// decodes leniently, so a renamed field reads back as a zero value rather
 	// than failing.
@@ -59,8 +59,8 @@ func New[T any](cfg Config[T]) cachex.Backend[T] {
 	if strings.HasPrefix(cfg.KeyPrefix, leasePrefix) {
 		panic("rediscachex: KeyPrefix must not start with " + leasePrefix + ", where the keys of leases are")
 	}
-	if _, ok := leaseKey(cfg.KeyPrefix); !ok && cfg.Leases {
-		panic("rediscachex: KeyPrefix has a \"}\" but no hash tag: no key under it can have a lease")
+	if cfg.Leases && strings.ContainsAny(cfg.KeyPrefix, "{}") && !hasHashTag(cfg.KeyPrefix) {
+		panic("rediscachex: KeyPrefix has a brace but no hash tag: the keys under it may have no Cluster slot for their leases")
 	}
 	b := &byteBackend{client: cfg.Client, prefix: cfg.KeyPrefix, chunkSize: cfg.ChunkSize, leases: cfg.Leases}
 	if b.chunkSize <= 0 {
