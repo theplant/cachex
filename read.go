@@ -448,6 +448,32 @@ func (c *Cache[T]) publishFill(f *fill[T]) {
 	c.flights.Publish(f.k.flight, value, err)
 }
 
+// answerAsFirst sets the answer of the read fills, whose backfills a write
+// skipped after the first layer was touched (the stripe epoch moved since the
+// read missed it), to the usable entry the first layer holds now, if any:
+// not landed, the fetched answer may be newer than what the first layer
+// serves to the next read (a refresh landed meanwhile), which would then go
+// back (ADR 0022). If the key itself was written, the first layer holds the
+// write. A failed read leaves the answers as they are.
+//
+//go:noinline
+func (c *Cache[T]) answerAsFirst(ctx context.Context, fills []*fill[T]) {
+	keys := make([]string, len(fills))
+	for i, f := range fills {
+		keys[i] = f.key
+	}
+	es, err := c.layers[0].backend.GetMany(ctx, keys)
+	if err != nil && !errors.As(err, new(*BatchError)) {
+		return
+	}
+	now := c.opts.now()
+	for _, f := range fills {
+		if e, ok := es[f.key]; ok && e.state(now) != rotten {
+			f.entry = e
+		}
+	}
+}
+
 // publishesEarly reports whether f's answer is published before it lands,
 // holding its fill lock: only if no backfill or write touched the first layer
 // for its stripe since the read that missed it. Then the first layer still
@@ -653,6 +679,7 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	ok, end := c.beginFills(fills)
 	defer end()
 	var late []int
+	var skipped []*fill[T]
 	for i, j := 0, 0; i < len(fills); i++ {
 		if j < len(ok) && ok[j] == i {
 			j++
@@ -660,8 +687,17 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 				late = append(late, i)
 				continue
 			}
+		} else if f := &fills[i]; f.own != nil && epoch(c.stripes, f.key) != f.k.seen {
+			skipped = append(skipped, f) // published below, see answerAsFirst
+			continue
 		}
 		c.publishFill(&fills[i])
+	}
+	if len(skipped) > 0 {
+		c.answerAsFirst(ctx, skipped)
+		for _, f := range skipped {
+			c.publishFill(f)
+		}
 	}
 	if len(ok) == 0 {
 		return
@@ -686,6 +722,9 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 // backfillOne is backfill for one answer, without the bookkeeping of many.
 func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 	if !c.beginFill(f.key, f.gen) {
+		if f.own != nil && epoch(c.stripes, f.key) != f.k.seen {
+			c.answerAsFirst(ctx, []*fill[T]{&f})
+		}
 		c.publishFill(&f)
 		return
 	}

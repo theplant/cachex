@@ -293,3 +293,62 @@ func churn(t *testing.T, version *atomic.Int64, c *cachex.Cache[int64]) {
 	close(stop)
 	bumps.Wait()
 }
+
+func TestASkippedBackfillPublishesNoAnswerNewerThanTheFirstLayer(t *testing.T) {
+	// A refresh lands v1 in both layers while a read of the same key, which
+	// missed, is between reading L1 (a miss) and asking the source. A write
+	// of another key on the same stripe then counts a write; the read asks
+	// the source (v2), its backfill is skipped (the stripe's generation
+	// moved), and it returns v2 without landing it. The next read hits L0's
+	// v1: older than what the read before it returned, with no write of the
+	// key anywhere. So a skipped read publishes what the first layer holds.
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v1"})
+	clock, now := newClock()
+	m0 := cachextest.NewMap[string]()
+	l1 := &pausedAfterRead[string]{Backend: cachextest.NewMap[string](), read: make(chan struct{}), resume: make(chan struct{})}
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+		cachex.NewLayer[string](l1, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+	}, now)
+	defer func() { _ = c.Close() }()
+	other := ""
+	for i := 0; other == ""; i++ {
+		if k := fmt.Sprint("o", i); cachex.StripeIndex(c, k) == cachex.StripeIndex(c, "k") {
+			other = k
+		}
+	}
+	// L0: v0, stale from now on; L1: nothing
+	require.NoError(t, m0.Set(ctx, "k", cachex.Entry[string]{Value: "v0", CachedAt: epoch, FreshUntil: epoch, ExpiresAt: epoch.Add(time.Minute)}))
+
+	src.gate = make(chan struct{})
+	asked := make(chan struct{}, 1)
+	src.onGet = func(context.Context, string) { asked <- struct{}{} }
+	v, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v0", v, "stale; the refresh asks the source and waits")
+	<-asked
+	src.onGet = nil
+
+	clock.Advance(2 * time.Minute) // L0's v0 rots
+	l1.armed.Store(true)
+	got := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k") // misses L0 and L1
+		assert.NoError(t, err)
+		got <- v
+	}()
+	<-l1.read
+
+	close(src.gate) // the refresh lands v1 in L1 and L0
+	require.Eventually(t, func() bool { e, ok := stored(t, m0, "k"); return ok && e.Value == "v1" }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, 5*time.Second, time.Millisecond)
+
+	require.NoError(t, c.Set(ctx, other, "x")) // a write of another key on k's stripe
+	src.set("k", "v2")
+	l1.resume <- struct{}{}
+	first := <-got
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, first, v, "a read after one that returned %q went back", first)
+}
