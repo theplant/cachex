@@ -40,9 +40,9 @@ sequenceDiagram
     K->>L0: 回填 k4
     K->>S: GetMany(k3, k5)（每段一次）
     S-->>K: k3 = v，k5 不在 map 里
-    K->>G: 发布 k3、k5（k4 已在读第二层后发布）
     K->>L1: 回填：k3 写值，k5 按不存在记录处理
     K->>L0: 回填
+    K->>G: 发布 k3、k5（拿到回填锁后，通常在写各层之前；k4 已在读第二层后发布）
     K->>G: 回填完成，注销在途回源
     K-->>C: {k1, k2, k3}（k4、k5 不存在，所以不在 map 里）
 ```
@@ -54,9 +54,9 @@ sequenceDiagram
 3. **分段**：未命中的 key 按 `WithGetManyChunkSize` 切成若干段（默认 0，全部算一段）。下面 4–8 步每一段各走一遍，段与段并发；一段只在数据源请求的并发名额（`WithGetManyConcurrency`）够用时才开始。
 4. **合并回源**：一段开始时，当场认领它的 key。别人正在回源的 key 直接等结果，自己领头的 key 交给一个回源 goroutine。**还没开始的段，它的 key 没有被认领**：别的请求读到其中的 key 会自己回源，不用等这次 `GetMany` 轮到它；调用方的 ctx 结束后，不再开始新的段。见 [singleflight.md](singleflight.md#批量认领)。
 5. **二次检查**：只对需要的 key 再读一次第一层（只检查读取之后本 `Cache` 写过其分片的 key；前面的段的回填也算，所以分段时后面的段更常做二次检查，也正好能接住别的请求刚查到的结果）。
-6. **读下面各层**：这一段每层一次调用（只剩一个 key 时用 `Get`）。可用的 key 立刻发布，再回填它上面的层，其余的继续往下。
+6. **读下面各层**：这一段每层一次调用（只剩一个 key 时用 `Get`）。可用的 key 回填它上面的层并发布（拿到回填锁后发布；第一层可能已有更旧的条目时写完再发布，见 [singleflight.md](singleflight.md#发布与注销)），其余的继续往下。
 7. **问数据源**：见下一节。
-8. **发布并回填**：每次数据源调用返回后，马上发布它这些 key，再回填，最后注销（见 [singleflight.md](singleflight.md#发布与注销)）。
+8. **发布并回填**：每次数据源调用返回后，回填它这些 key 并发布（同上），最后注销（见 [singleflight.md](singleflight.md#发布与注销)）。
 
 ## 回源怎么发
 
@@ -80,7 +80,7 @@ sequenceDiagram
 
 **分段的好处**：
 - 数据源限制了单次批量大小时（比如某个 RPC 一次最多接受 100 个 id），由库负责切分；
-- 每一段返回时立即发布、立即回填，并且只锁这一段 key 的分片（见 [write-order.md](write-order.md#慢操作会拖慢多大范围)）；
+- 每一段返回时立即回填并发布，并且只锁这一段 key 的分片（见 [write-order.md](write-order.md#慢操作会拖慢多大范围)）；
 - 某一段 panic 或调用 Goexit，只影响这一段还没拿到结果的 key。
 
 **等待方的取消**：`GetMany` 的 ctx 一结束，还没拿到结果的 key 都按 `context done while fetching` 失败；回源照常进行，结果照样回填。
