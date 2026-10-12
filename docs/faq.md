@@ -109,6 +109,10 @@ No. A read's backfill holds the stripe for reading only, and is skipped (a spare
 
 For batches well over 1,000 keys, `WithGetManyChunkSize` makes each chunk backfill on its own and hold only its own stripes; chunks run concurrently, so to limit the stripes held at once, also lower `WithGetManyConcurrency`. A smaller backend `ChunkSize` does not help. See [design/write-order.md](design/write-order.md) (Chinese).
 
+### If the source changes without going through the Cache, can a read go back to an older value?
+
+Not within one process. Backfills of a key land one at a time, a copy of an entry from a lower layer never replaces one that came from a later answer of the source, and a key is asked of the source once at a time (a read that misses while a refresh asks the source takes the refresh's answer). Without these, a stale copy from Redis held up for a moment, or two overlapping requests to the source, could put an older value back into the memory layer after a newer one was read. Writes from other instances reach this instance's memory layers through the shared layer without this order. See [ADR 0022](adr/0022-reads-never-go-back.md).
+
 ### With several instances deployed, is the write order still guaranteed?
 
 No. The striped lock works within one process only:

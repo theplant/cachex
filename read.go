@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime/debug"
 	"slices"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/theplant/cachex/v2/internal/flight"
 )
@@ -119,6 +122,13 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 	return out, batchError(errs)
 }
 
+// sourceCall is a fetch asking the source for a key; another fetch of the
+// key takes its answer instead of asking again (see askSource).
+type sourceCall[T any] struct {
+	flight  *flight.Flight[T]
+	waiters atomic.Int32 // fetches waiting for it, for tests
+}
+
 // result is what a fetch answered for a key, as its flight holds it (see
 // claimed).
 type result[T any] struct {
@@ -223,10 +233,12 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (
 }
 
 // dropFlights unregisters both fetches of key, the read's and the refresh's,
-// without interrupting them: their waiters still get their results, and the
-// next read starts a new fetch.
+// and its call to the source, without interrupting them: their waiters still
+// get their results, and the next read starts a new fetch, which asks the
+// source anew.
 func (c *Cache[T]) dropFlights(key string) {
 	c.flights.Drop(flightKey{key: key}, flightKey{key: key, refresh: true})
+	c.sourcing.Delete(key) // a fetch after the write asks the source anew
 }
 
 // claimed are the flights one request leads, and what their fetch knows of
@@ -250,9 +262,10 @@ type claimed[T any] struct {
 type claimedKey[T any] struct {
 	fk     flightKey
 	flight *flight.Flight[T]
-	seen   uint64     // stripe epoch from before the caller read the first layer
-	gen    uint64     // write generation from before the fetch read below it
-	leases *keyLeases // nil: none taken or refused (see Leaser)
+	seen   uint64         // stripe epoch from before the caller read the first layer
+	gen    uint64         // write generation from before the fetch read below it
+	leases *keyLeases     // nil: none taken or refused (see Leaser)
+	source *sourceCall[T] // set while the fetch asks the source for the key (see askSource)
 }
 
 func (c *Cache[T]) claim(refresh bool) *claimed[T] { return &claimed[T]{c: c, refresh: refresh} }
@@ -264,7 +277,14 @@ func (p *claimed[T]) add(key string, fk flightKey, f *flight.Flight[T], seen uin
 }
 
 // forget unregisters the flight i.
-func (p *claimed[T]) forget(i int) { p.c.flights.Forget(p.ks[i].fk, p.ks[i].flight) }
+func (p *claimed[T]) forget(i int) {
+	k := &p.ks[i]
+	p.c.flights.Forget(k.fk, k.flight)
+	if k.source != nil {
+		p.c.sourcing.CompareAndDelete(p.keys[i], k.source)
+		k.source = nil
+	}
+}
 
 // publish answers flight i with value or err, which is not backfilled.
 func (p *claimed[T]) publish(i int, value T, err error) {
@@ -459,7 +479,72 @@ func (c *Cache[T]) readBelow(ctx context.Context, p *claimed[T], idxs []int) []i
 // BatchSource, key by key otherwise, up to conc calls at once. Each call's
 // answers are settled as soon as it returns, and its backfill shares its
 // timeout.
+//
+// A key is asked of the source once at a time: a key another fetch (a read's
+// or a refresh's) is asking for already takes that fetch's answer, once this
+// fetch's own calls are done. Two overlapping answers cannot be ordered, and
+// the older could land last. The other fetch unregisters its call only after
+// its backfill, so a later call of the key starts after the layers hold the
+// earlier answer; a write unregisters it at once (see dropFlights).
 func (c *Cache[T]) askSource(ctx context.Context, p *claimed[T], idxs []int, conc int) {
+	if len(idxs) != 1 {
+		c.askSourceMany(ctx, p, idxs, conc)
+		return
+	}
+	// the common single-key miss, with a small frame: a bigger one grows the
+	// fetch goroutine's stack, and copying it doubles the cost of a miss
+	if call := c.claimSource(p, idxs[0]); call != nil {
+		c.joinSource(p, idxs[0], call)
+		return
+	}
+	c.askSourceOne(ctx, p, idxs[0])
+}
+
+// askSourceMany is askSource for several keys.
+func (c *Cache[T]) askSourceMany(ctx context.Context, p *claimed[T], idxs []int, conc int) {
+	var joined []int
+	var calls []*sourceCall[T]
+	own := idxs[:0:0]
+	for _, i := range idxs {
+		if call := c.claimSource(p, i); call != nil {
+			joined, calls = append(joined, i), append(calls, call)
+		} else {
+			own = append(own, i)
+		}
+	}
+	c.askSourceOwn(ctx, p, own, conc)
+	for j, i := range joined {
+		c.joinSource(p, i, calls[j])
+	}
+}
+
+// claimSource registers flight i as asking the source for its key, or
+// returns the call of the fetch that already is.
+//
+//go:noinline
+func (c *Cache[T]) claimSource(p *claimed[T], i int) *sourceCall[T] {
+	call := &sourceCall[T]{flight: p.ks[i].flight}
+	if v, loaded := c.sourcing.LoadOrStore(p.keys[i], call); loaded {
+		return v.(*sourceCall[T])
+	}
+	p.ks[i].source = call
+	return nil
+}
+
+// joinSource answers flight i with the answer of call, another fetch's
+// request to the source; that fetch backfills it.
+//
+//go:noinline
+func (c *Cache[T]) joinSource(p *claimed[T], i int, call *sourceCall[T]) {
+	call.waiters.Add(1)
+	<-call.flight.Done() // published within its own fetch, whatever happens to it
+	call.waiters.Add(-1)
+	value, err := call.flight.Result()
+	p.publish(i, value, err)
+}
+
+// askSourceOwn is askSource for keys no other fetch is asking for.
+func (c *Cache[T]) askSourceOwn(ctx context.Context, p *claimed[T], idxs []int, conc int) {
 	switch {
 	case len(idxs) == 0:
 		return
@@ -528,7 +613,13 @@ func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], idxs []int
 // backfill writes answers found at layer origin into the layers above it,
 // bottom up, under the write-order guard (see beginFills): a fill whose key
 // was written since its generation was taken, or is being written, is
-// skipped, at the cost of a spare miss.
+// skipped, at the cost of a spare miss. Backfills of a key land one at a time,
+// and a copy of an entry from a lower layer does not replace one the layer
+// holds from a later answer of the source (a later CachedAt): held up, it
+// would otherwise undo a refresh. An answer of the source needs no such check
+// (the source is asked once at a time, see askSource, so no other answer is
+// newer), nor does a layer that leases (only the holder of its lease writes
+// it).
 func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	ok, end := c.beginFills(fills)
 	defer end()
@@ -545,7 +636,11 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 			c.putLeased(ctx, j, fills, ok, now)
 			continue
 		}
-		if failed := c.layers[j].putMany(ctx, answers, nil, nil, now); len(failed) > 0 {
+		var newer map[string]error
+		if origin < len(c.layers) {
+			newer = c.newerIn(ctx, j, answers)
+		}
+		if failed := c.layers[j].putMany(ctx, answers, nil, newer, now); len(failed) > 0 {
 			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", batchError(failed))
 		}
 	}
@@ -563,10 +658,39 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 			c.putLeasedOne(ctx, j, &f, now)
 			continue
 		}
+		if origin < len(c.layers) && c.newerInOne(ctx, j, f.key, f.entry.CachedAt) {
+			continue
+		}
 		if err := c.layers[j].put(ctx, f.key, f.entry, now); err != nil {
 			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 		}
 	}
+}
+
+// newerIn returns the keys of answers whose entry in layer j comes from a
+// later answer of the source: a backfill leaves them alone. A key the layer
+// fails to read is written as before.
+func (c *Cache[T]) newerIn(ctx context.Context, j int, answers map[string]Entry[T]) map[string]error {
+	es, _ := c.layers[j].backend.GetMany(ctx, slices.Collect(maps.Keys(answers)))
+	var newer map[string]error
+	for key, e := range es {
+		if e.CachedAt.After(answers[key].CachedAt) {
+			if newer == nil {
+				newer = map[string]error{}
+			}
+			newer[key] = nil
+		}
+	}
+	return newer
+}
+
+// newerInOne is newerIn for one key, out of backfillOne so that its frame
+// does not grow the fetch goroutine's stack.
+//
+//go:noinline
+func (c *Cache[T]) newerInOne(ctx context.Context, j int, key string, cachedAt time.Time) bool {
+	e, ok, err := c.layers[j].backend.Get(ctx, key)
+	return err == nil && ok && e.CachedAt.After(cachedAt)
 }
 
 // refresh refetches keys in the background (stale entries below the first

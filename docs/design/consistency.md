@@ -95,6 +95,8 @@ sequenceDiagram
 - **别的实例持有租约时**：普通读取照样回源、返回结果，只是不回填那一层；后台刷新跳过数据源，交给持有者，下一次陈旧命中会再试。
 - **多个共享层**：各自领租约，各自校验自己那一层的回填。
 
+同一个进程里，读到的值不会倒退：回填不用更旧的答案覆盖更新的，同一个 key 同时只问一次数据源（见 [write-order.md](write-order.md#回填之间旧答案不盖新答案)）。其他实例的写入经共享层到达这个实例的内存层时，没有这个顺序保证。
+
 租约只挡住旧值回填。其他实例的内存层看不到写入，仍然只靠内存层的 TTL（或者以后的失效广播）。但旧值回填影响所有实例、活整个共享层的 TTL，挡住它以后，能看到旧值的最长时间只剩内存层的 TTL。
 
 在 Redis Cluster 上，租约 key 要和数据 key 落在同一个 slot，所以 `Cache` 拒绝含 `}` 却没有 hash tag 的 key（`ErrUnsupportedKey`），见 [ADR 0019](../adr/0019-core-rejects-keys-without-a-redis-slot-for-their-lease.md)。

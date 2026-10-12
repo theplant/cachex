@@ -3,6 +3,7 @@ package cachex
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/theplant/cachex/v2/internal/stripe"
@@ -12,8 +13,10 @@ import (
 // keys' stripes for writing and, when it ends, counts itself and drops the
 // keys' flights; a backfill holds its key's stripe for reading and lands only
 // if no write counted since it took the generation. So a backfill either
-// lands before a write or not at all, and a read never waits on a write. See
-// docs/design/write-order.md and ADR 0003.
+// lands before a write or not at all, and a read never waits on a write.
+// Backfills of a stripe also take its fill lock, so that they land one at a
+// time and each sees what the one before wrote (see Cache.backfill). See
+// docs/design/write-order.md, ADR 0003 and ADR 0022.
 
 // epoch is key's stripe epoch: take it before reading the first layer, and a
 // double check is due only if it changed (see shouldDoubleCheck). It is not a
@@ -132,8 +135,8 @@ func (c *Cache[T]) lockStripe(ctx context.Context, s *stripe.Stripe, late func()
 }
 
 // beginFill takes key's stripe for a backfill, if no write holds it and none
-// counted since gen; end the backfill with endFill. It reports false, holding
-// nothing, if the backfill must be skipped.
+// counted since gen, and then its fill lock; end the backfill with endFill. It
+// reports false, holding nothing, if the backfill must be skipped.
 func (c *Cache[T]) beginFill(key string, gen uint64) bool {
 	s := c.stripes.For(key)
 	if !s.TryRLock() {
@@ -143,40 +146,50 @@ func (c *Cache[T]) beginFill(key string, gen uint64) bool {
 		s.RUnlock()
 		return false
 	}
+	s.LockFill()
 	return true
 }
 
-// endFill ends a backfill of key that wrote the layers.
+// endFill ends a backfill of key.
 func (c *Cache[T]) endFill(key string) {
 	s := c.stripes.For(key)
 	s.AddFill() // see stripe.Stripe.Epoch
+	s.UnlockFill()
 	s.RUnlock()
 }
 
 // beginFills is beginFill for many keys: it returns the indexes of the fills
-// that may land, and end, which ends them all.
+// that may land, and end, which ends them all. It takes the fill locks in
+// increasing stripe order, so batch backfills never deadlock.
 func (c *Cache[T]) beginFills(fills []fill[T]) (ok []int, end func()) {
-	held := map[*stripe.Stripe]bool{}
-	filled := map[*stripe.Stripe]struct{}{}
+	held := map[int]bool{}
+	filled := map[int]struct{}{}
 	for i, f := range fills {
-		s := c.stripes.For(f.key)
-		h, seen := held[s]
+		si := c.stripes.Index(f.key)
+		s := c.stripes.At(si)
+		h, seen := held[si]
 		if !seen {
 			h = s.TryRLock()
-			held[s] = h
+			held[si] = h
 		}
 		if h && s.Generation() == f.gen {
 			ok = append(ok, i)
-			filled[s] = struct{}{}
+			filled[si] = struct{}{}
 		}
 	}
+	order := slices.Sorted(maps.Keys(filled))
+	for _, si := range order {
+		c.stripes.At(si).LockFill()
+	}
 	return ok, func() {
-		for s := range filled {
+		for _, si := range order {
+			s := c.stripes.At(si)
 			s.AddFill()
+			s.UnlockFill()
 		}
-		for s, h := range held {
+		for si, h := range held {
 			if h {
-				s.RUnlock()
+				c.stripes.At(si).RUnlock()
 			}
 		}
 	}

@@ -18,7 +18,7 @@ Go 泛型多层读穿缓存（module `github.com/theplant/cachex/v2`）：一个
 - 根目录是核心包 `cachex`，只依赖标准库：`cache.go`（`Cache`、`New`、选项、`Close`）、`layer.go`（层、`Layer.place` 决定一层为一个回答存什么、`Cache.answer`）、`read.go`（`Get`/`GetMany`、回源、回填、后台刷新；`fetchChunks` 按段认领，一段开始时才认领，见 ADR 0018；在途回源的结果里，不存在就是 `ErrNotFound` 本身、失败一律包过一层，所以按同一性判断不存在，数据源的错误只在 `askSource*` 分类一次；`claimed.settle` 按「发布、回填、注销」收尾，`claimed.run` 管 panic 和 Goexit）、`write.go`（`Set`/`Del`/`SetMany`/`DelMany`、失败后的失效）、`guard.go`（写入顺序守卫：对分片的全部用法，读写路径不直接碰分片）、`types.go`（接口、`ErrNotFound`、`ErrUnsupportedKey`、`BatchError`、`NewBatchError`、`Batched`）、`codec.go`（`Codec` 和内置的编解码器）、`bytes.go`（`ByteBackend`、`ByteEntry`、`Encoded`，以及只有 `Encoded` 用的私有条目编码）、`lease.go`（租约：`Leaser`/`Leasing` 及字节版、`Encoded` 的转发，以及读路径里领、用、释放租约的部分）。
 - 后端子包：`ottercachex`、`bigcachex`、`rediscachex`、`gormcachex`；字节后端（`bigcachex`、`rediscachex`、`gormcachex`）只实现私有的 `ByteBackend`，`New` 返回 `cachex.Encoded` 包好的后端（`gormcachex` 外面再包一层带 `Migrate` 的 `*Backend[T]`）。`cachextest` 是测试用的内存后端（`NewLeasingMap` 是打开了租约的版本，几个 `Cache` 共用它就是多个实例）、时钟和契约测试 `TestBackend`、`TestByteBackend`、`TestLeaser`，每个后端都要过前两个，支持租约的还要过 `TestLeaser`。
 - `internal/flight`（合并回源的登记表：`Claim`、只生效一次的 `Publish`、`Forget`、`Drop`）、`internal/stripe`（分片锁）：通用部件，暂不公开。
-- 核心的测试是外部测试包 `cachex_test`，只通过公开接口测；`export_test.go` 只暴露两样：分片编号（`StripeIndex`，给基准测试）和 `Settle`（等后台工作结束，给读完马上查后端的测试）。测试替身用 `helpers_test.go` 的 `hooked`（单 key 和批量调用共用一个钩子），不要再为每个测试单写一个包装后端。`gormcachex` 的容器测试用 testcontainers 在 MySQL 和 PostgreSQL 上跑，没有 Docker 时自动跳过。
+- 核心的测试是外部测试包 `cachex_test`，只通过公开接口测；`export_test.go` 只暴露三样：分片编号（`StripeIndex`，给基准测试）、`Settle`（等后台工作结束，给读完马上查后端的测试）和 `SourceWaiters`（有几个回源在等别人问数据源）。测试替身用 `helpers_test.go` 的 `hooked`（单 key 和批量调用共用一个钩子），不要再为每个测试单写一个包装后端。`gormcachex` 的容器测试用 testcontainers 在 MySQL 和 PostgreSQL 上跑，没有 Docker 时自动跳过。
 - `tools/bench/<日期-主题>/`：实测的复跑脚本，带 `bench` build tag，平时的 `go test ./...` 不会运行。
 
 ## 常用命令
@@ -59,6 +59,7 @@ gormcachex 的容器测试偶尔启动失败（`port "3306/tcp" not found`，或
 
 - **写入先写下层、再写上层，从不写数据源；某一层失败，就删掉它和它上面各层的条目。** 不要改成从上往下写。见 [ADR 0002](docs/adr/0002-bottom-up-writes.md)。
 - **回填必须持分片读锁、核对写入代数，写入之后还要摘除在途回源。** 少任何一步，旧值都可能盖过写入。这些都在 `guard.go`（写入顺序守卫）里，不要在读写路径里绕过它直接用分片。回源按「发布、回填、注销」的顺序收尾，只在 `claimed.settle` 一处，见 [singleflight.md](docs/design/singleflight.md#发布与注销)、[ADR 0003](docs/adr/0003-striped-backfill-guard.md)。
+- **读到的值不倒退**：回填之间按分片排队（回填锁，只在回填之间互斥），从下层复制的条目不覆盖目标层里 `CachedAt` 更晚的；同一个 key 同时只问一次数据源（`sourcing`），登记在回填之后才注销，写入摘除它。不要为了省一次读把复制前的比较去掉，也不要让两次问数据源重叠。见 [ADR 0022](docs/adr/0022-reads-never-go-back.md)。
 - **每个在途回源恰好发布一次结果**，panic 和 Goexit 也不例外：`flight.Group.Publish` 只生效一次，`claimed.run` 在 panic 或 Goexit 时给还没发布的发布错误。不要让等待方去等一个永远不会来的结果。见 [ADR 0006](docs/adr/0006-goexit-publishes-an-error.md)。
 - **刷新从不加入普通回源**，普通读取也不加入刷新（`flightKey.refresh`）；写入两种都摘除。一个 key 同时只有一次刷新，靠 `refreshing` 去重（查重不加锁，别换成认领，陈旧命中会慢）；刷新先 `track` 再认领，由这个被登记的 goroutine 回源（分段时的子 goroutine 也由它等完再注销），不能另起一个自己去登记的 goroutine，否则 `Close` 可能不等它的回填。见 [ADR 0016](docs/adr/0016-refresh-has-its-own-flights.md)。
 - **租约在一层未命中之后、往下读之前领，回填只写还持有令牌的层**；开了租约的后端，每个写入都要结束 key 的租约，`PutLeased` 的「核对令牌、写入」必须是一个原子操作。没有任何层开租约时 `c.leasers` 是 nil，读路径只做 nil 检查：不要在回源 goroutine 的栈上多放东西，栈一扩容未命中就慢一倍（`putLeasedOne` 单独成函数就是为此）。见 [ADR 0020](docs/adr/0020-leases-on-shared-layers.md)。

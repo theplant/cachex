@@ -14,13 +14,15 @@ import (
 //
 // Keys share stripes by hash, so two keys in one stripe serialize their
 // writes and a write to one can skip the other's backfill (a spare cache
-// miss, never a stale value). 4096 stripes of 40 bytes cost 160 KB per Set.
+// miss, never a stale value). 4096 stripes of 48 bytes cost 192 KB per Set.
 const Count = 4096
 
 // Stripe orders the writes and backfills of the keys that hash to it: a write
-// holds it for writing, a backfill for reading.
+// holds it for writing, a backfill for reading and, among backfills, its fill
+// lock, so that backfills of a key land one at a time.
 type Stripe struct {
 	mu    sync.RWMutex
+	fill  sync.Mutex
 	gen   atomic.Uint64 // writes so far
 	fills atomic.Uint64 // backfills so far
 }
@@ -79,6 +81,14 @@ func (s *Stripe) TryRLock() bool { return s.mu.TryRLock() }
 
 // RUnlock releases a TryRLock.
 func (s *Stripe) RUnlock() { s.mu.RUnlock() }
+
+// LockFill takes the fill lock, holding the stripe for reading: a backfill
+// waits only for other backfills, never for a write. Take several in
+// increasing index order.
+func (s *Stripe) LockFill() { s.fill.Lock() }
+
+// UnlockFill releases LockFill.
+func (s *Stripe) UnlockFill() { s.fill.Unlock() }
 
 // Set is Count stripes and the seed that maps keys to them. Each Set has its
 // own random seed, so a key's stripe differs between Sets and processes.
