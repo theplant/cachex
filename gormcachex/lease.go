@@ -120,6 +120,16 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 			for _, key := range chunk {
 				errs[key] = fmt.Errorf("gormcachex: lease %q: %w", key, err)
 			}
+			// the rows the first statement inserted (or the second took) hold
+			// tokens the caller never gets: end them, or nobody could lease
+			// the keys until the TTL (best effort; ctx may be what ended)
+			ours := make(map[string]string, len(chunk))
+			for i, key := range chunk {
+				ours[key] = tokens[i]
+			}
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			_ = l.Release(rctx, ours)
+			cancel()
 			continue
 		}
 		mine := make(map[string]string, len(chunk))

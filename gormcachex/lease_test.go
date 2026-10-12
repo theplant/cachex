@@ -2,14 +2,17 @@ package gormcachex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/theplant/cachex/v2"
 	"github.com/theplant/cachex/v2/cachextest"
@@ -160,4 +163,26 @@ func TestALeasedBatchOfAThousandKeysBackfillsOnSQLite(t *testing.T) {
 	tokens, err = l.Lease(ctx, keys, time.Minute)
 	require.NoError(t, err)
 	require.NoError(t, l.Release(ctx, tokens))
+}
+
+func TestAFailedLeaseLeavesNoLeaseBehind(t *testing.T) {
+	// the first statement inserts lease-only rows with this call's tokens;
+	// if a later one fails, the caller gets no token, so nobody could end them
+	ctx := context.Background()
+	db := newSQLite(t)
+	var fail atomic.Bool
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("test:fail", func(tx *gorm.DB) {
+		if fail.Load() {
+			_ = tx.AddError(errors.New("lock wait timeout"))
+		}
+	}))
+	l := newBackend(t, Config[string]{DB: db, Leases: true}).Leaser()
+	fail.Store(true)
+	tokens, err := l.Lease(ctx, []string{"k"}, time.Minute)
+	require.Error(t, err)
+	require.Empty(t, tokens)
+	fail.Store(false)
+	tokens, err = l.Lease(ctx, []string{"k"}, time.Minute)
+	require.NoError(t, err)
+	assert.NotEmpty(t, tokens["k"], "nobody holds k's lease")
 }
