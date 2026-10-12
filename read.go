@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"runtime/debug"
 	"slices"
 	"sync"
@@ -680,23 +679,9 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	for _, i := range ok {
 		answers[fills[i].key] = fills[i].entry
 	}
-	now := c.opts.now()
-	for j := origin - 1; j >= 0; j-- {
-		if c.leasers != nil && c.leasers[j] != nil {
-			c.putLeased(ctx, j, fills, ok, now)
-			continue
-		}
-		var newer map[string]error
-		if origin < len(c.layers) {
-			newer = c.newerIn(ctx, j, answers, now)
-		}
-		if failed := c.layers[j].putMany(ctx, answers, nil, newer, now); len(failed) > 0 {
-			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", batchError(failed))
-		}
-	}
+	c.land(ctx, origin, fills, ok, answers, c.opts.now())
 	for _, i := range late {
-		fills[i].entry = answers[fills[i].key] // a newer entry it found (see newerIn)
-		c.publishFill(&fills[i])
+		c.publishFill(&fills[i]) // with a newer entry land may have taken
 	}
 }
 
@@ -714,16 +699,13 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 	c.supersede(&f)
 	defer c.supersede(&f) // before endFill: see supersede
 	now := c.opts.now()
-	for j := origin - 1; j >= 0; j-- {
-		if c.leasers != nil && c.leasers[j] != nil {
-			c.putLeasedOne(ctx, j, &f, now)
-			continue
-		}
-		if origin < len(c.layers) && c.newerInOne(ctx, j, &f, now) {
-			continue
-		}
-		if err := c.layers[j].put(ctx, f.key, f.entry, now); err != nil {
-			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
+	if origin < len(c.layers) || c.leasers != nil {
+		c.landOne(ctx, origin, &f, now)
+	} else { // a source's answer, no layer leases: nothing to read first (see land)
+		for j := origin - 1; j >= 0; j-- {
+			if err := c.layers[j].put(ctx, f.key, f.entry, now); err != nil {
+				c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
+			}
 		}
 	}
 	if !early {
@@ -743,41 +725,108 @@ func (c *Cache[T]) supersede(f *fill[T]) {
 	c.flights.DropOther(flightKey{key: f.key}, f.own)
 }
 
-// newerIn returns the keys of answers whose entry in layer j comes from a
-// later answer of the source: a backfill leaves them alone, and replaces its
-// answer with such an entry, unless rotten at now, for the layers above and
-// for its flight, which may publish after it lands (see publishesEarly). A key
-// the layer fails to read is written as before.
-func (c *Cache[T]) newerIn(ctx context.Context, j int, answers map[string]Entry[T], now time.Time) map[string]error {
-	es, _ := c.layers[j].backend.GetMany(ctx, slices.Collect(maps.Keys(answers)))
-	var newer map[string]error
-	for key, e := range es {
-		if e.CachedAt.After(answers[key].CachedAt) {
-			if newer == nil {
-				newer = map[string]error{}
+// land writes answers (by key) for the fills idxs into the layers above
+// origin, bottom up, holding their fill locks, so that no layer is left with
+// an entry older than an answer this process returned (ADR 0022). First it
+// reads the layers where something may have landed meanwhile:
+//
+//   - a copy from below (origin under the source) reads every layer it would
+//     write, takes the newest unrotten entry it finds (a refresh may have
+//     landed a later answer) for all of them and for its flight, which may
+//     publish after it lands (see publishesEarly), and leaves a layer that
+//     holds a newer one alone (one holding the same is written again: its
+//     place there may be fresher now);
+//   - a fill that holds no lease on a layer that leases (another fetch has it,
+//     maybe this process's refresh, which may land an older answer) may not
+//     write there, so it deletes an older entry it finds there: a delete
+//     never brings back an old value.
+//
+// An answer of the source needs no read otherwise: the source is asked once
+// at a time (see askSource), so no newer answer landed, and only the holder
+// of a lease writes a layer that leases. A key a layer fails to read is
+// written as if absent.
+func (c *Cache[T]) land(ctx context.Context, origin int, fills []fill[T], idxs []int, answers map[string]Entry[T], now time.Time) {
+	copied := origin < len(c.layers)
+	leasing := func(j int) bool { return c.leasers != nil && c.leasers[j] != nil }
+	held := func(i, j int) bool { l := fills[i].leases; return l != nil && l.tokens[j] != "" }
+	found := make([]map[string]Entry[T], origin)
+	var keys []string
+	for j := origin - 1; j >= 0; j-- {
+		read := copied
+		if !read && leasing(j) {
+			for _, i := range idxs {
+				read = read || !held(i, j)
 			}
-			newer[key] = nil
-			if e.state(now) != rotten {
-				answers[key] = e
+		}
+		if !read {
+			continue
+		}
+		if keys == nil {
+			keys = make([]string, len(idxs))
+			for n, i := range idxs {
+				keys[n] = fills[i].key
+			}
+		}
+		found[j], _ = c.layers[j].backend.GetMany(ctx, keys)
+		if copied {
+			for key, e := range found[j] {
+				if e.CachedAt.After(answers[key].CachedAt) && e.state(now) != rotten {
+					answers[key] = e
+				}
 			}
 		}
 	}
-	return newer
+	for _, i := range idxs {
+		fills[i].entry = answers[fills[i].key]
+	}
+	for j := origin - 1; j >= 0; j-- {
+		var skip map[string]error
+		var stale []string
+		for _, i := range idxs {
+			key := fills[i].key
+			e, ok := found[j][key]
+			if !ok {
+				continue
+			}
+			a := answers[key]
+			switch {
+			case e.CachedAt.After(a.CachedAt):
+				if skip == nil {
+					skip = map[string]error{}
+				}
+				skip[key] = nil // it holds a newer answer; a lease held is released after the fetch
+			case leasing(j) && !held(i, j) && (!copied || e.CachedAt.Before(a.CachedAt)):
+				stale = append(stale, key) // older (for a source's answer, another one of the same instant too)
+			}
+		}
+		if len(stale) > 0 {
+			if err := c.layers[j].backend.DelMany(ctx, stale); err != nil {
+				c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
+			}
+		}
+		if leasing(j) {
+			put := idxs
+			if skip != nil {
+				put = slices.DeleteFunc(slices.Clone(idxs), func(i int) bool { _, s := skip[fills[i].key]; return s })
+			}
+			c.putLeased(ctx, j, fills, put, now)
+			continue
+		}
+		if failed := c.layers[j].putMany(ctx, answers, nil, skip, now); len(failed) > 0 {
+			c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", batchError(failed))
+		}
+	}
 }
 
-// newerInOne is newerIn for one fill, out of backfillOne so that its frame
-// does not grow the fetch goroutine's stack.
+// landOne is land for one fill, out of backfillOne so that its frame does not
+// grow the fetch goroutine's stack in the common case (see backfillOne). An
+// entry it takes becomes f's.
 //
 //go:noinline
-func (c *Cache[T]) newerInOne(ctx context.Context, j int, f *fill[T], now time.Time) bool {
-	e, ok, err := c.layers[j].backend.Get(ctx, f.key)
-	if err != nil || !ok || !e.CachedAt.After(f.entry.CachedAt) {
-		return false
-	}
-	if e.state(now) != rotten {
-		f.entry = e // see newerIn
-	}
-	return true
+func (c *Cache[T]) landOne(ctx context.Context, origin int, f *fill[T], now time.Time) {
+	fills := []fill[T]{*f}
+	c.land(ctx, origin, fills, []int{0}, map[string]Entry[T]{f.key: f.entry}, now)
+	f.entry = fills[0].entry
 }
 
 // refresh refetches keys in the background (stale entries below the first

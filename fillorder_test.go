@@ -2,6 +2,7 @@ package cachex_test
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"slices"
 	"sync"
@@ -227,17 +228,32 @@ func TestReadsNeverGoBackUnderChurn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("load")
 	}
-	ctx := context.Background()
 	var version atomic.Int64
 	src := cachex.SourceFunc[int64](func(context.Context, string) (int64, error) {
 		v := version.Load()
 		runtime.Gosched() // answers travel back while the source moves on
 		return v, nil
 	})
-	layer := func() cachex.Layer[int64] {
-		return cachex.NewLayer[int64](cachextest.NewMap[int64](), cachex.TTL(time.Millisecond, 3*time.Millisecond))
+	layer := func(b cachex.Backend[int64]) cachex.Layer[int64] {
+		return cachex.NewLayer(b, cachex.TTL(time.Millisecond, 3*time.Millisecond))
 	}
-	c := cachex.New[int64](src, []cachex.Layer[int64]{layer(), layer(), layer()})
+	for _, leased := range []bool{false, true} {
+		t.Run(fmt.Sprint("leased middle layer=", leased), func(t *testing.T) {
+			var middle cachex.Backend[int64] = cachextest.NewMap[int64]()
+			if leased { // a read refused its lease (by a refresh) must not leave an older answer there
+				middle = cachextest.NewLeasingMap[int64]()
+			}
+			churn(t, &version, cachex.New[int64](src, []cachex.Layer[int64]{
+				layer(cachextest.NewMap[int64]()), layer(middle), layer(cachextest.NewMap[int64]()),
+			}))
+		})
+	}
+}
+
+// churn bumps version while 8 readers read k from c for 300ms, failing t if
+// a read returns older than what a read before it returned.
+func churn(t *testing.T, version *atomic.Int64, c *cachex.Cache[int64]) {
+	ctx := context.Background()
 	defer func() { _ = c.Close() }()
 
 	stop := make(chan struct{})

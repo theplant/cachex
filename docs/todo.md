@@ -27,3 +27,8 @@
 
 - **问题：** gobuscachex 每次 `Listen` 用一个随机名字的队列，正常退出时退订（软删除，加 auto-drain）。但实例崩溃（SIGKILL、OOM、节点丢了）时没人退订：订阅在 TTL 内继续收消息，过期后 go-bus 既不软删除它，也不清它的队列，所以每次崩溃最多留下一个 TTL 的消息（默认 1 分钟乘以写入速率）和两条订阅行。另外，`Destroy` 失败过一次的任务带着 `retry_count > 0`，go-bus 的 auto-drain（`retry_count = 0` 才删）跳过它，队列退订后它就永远留下（数据库主从切换时最容易出现）。这些都只是行变多，不影响正确性：失效是幂等的。
 - **做法：** 上游修：go-bus 回收过期订阅（软删除并清队列），drain 也删重试过的、没人在跑的任务。cachex 这边不直接写 go-bus 的表（耦合它的内部结构）。上游合并发版之前，可以定期执行 `DELETE FROM goque_jobs WHERE queue LIKE 'cachex-%' AND queue NOT LIKE 'cachex-cleanup:%' AND queue NOT IN (SELECT queue FROM gobus_subscriptions WHERE deleted_at IS NULL AND (expires_at IS NULL OR expires_at > NOW()))` 兜底（`cachex-cleanup:` 是 goquecachex 的清理任务，不能删；先确认这个语句在当时的 go-bus 版本上仍然成立）。
+
+## 6. 两次淘汰夹住一次复制时，读到的值可能短暂倒退
+
+- **问题：** 没有租约层时：一次读从第三层拿着陈旧的 v1 准备复制；刷新把 v2 写进三层；第二层随后淘汰了 v2；复制在第二层找不到更新的条目，把 v1 写了进去（它采纳了第一层的 v2 作为结果）；第一层再淘汰 v2 时，下一次读拿到第二层的 v1。这次复制顺手触发的刷新很快会修好第二层。要两次淘汰卡在很窄的窗口里，而且会自愈，违反的是 ADR 0022 的保证。
+- **做法：** 复制在分片纪元变过时（说明期间有别的回填落下）不写下层、只发布采纳的结果；或者拿着回填锁重读一次来源层。先写出确定性的测试（审查时有过一个，靠暂停读和手动删条目复现）。

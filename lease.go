@@ -239,11 +239,3 @@ func (c *Cache[T]) putLeased(ctx context.Context, j int, fills []fill[T], idxs [
 		c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 	}
 }
-
-// putLeasedOne is putLeased for one fill, out of backfillOne so that its
-// frame does not grow the fetch goroutine's stack when no layer leases.
-//
-//go:noinline
-func (c *Cache[T]) putLeasedOne(ctx context.Context, j int, f *fill[T], now time.Time) {
-	c.putLeased(ctx, j, []fill[T]{*f}, []int{0}, now)
-}
