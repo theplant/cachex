@@ -61,7 +61,7 @@ With a shared layer (Redis or a table), hardly: the restarted instance's misses 
 
 ### Do I need to call `Close`?
 
-Call it at shutdown, before closing the backends. It waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting, all of which still write the backends; it starts no more refreshes. It does not close the backends. A `Cache` that is never closed leaks nothing once its last fetch ends.
+Call it at shutdown, before closing the backends. It waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting, all of which still write the backends; it starts no more refreshes. With a broadcast, it also stops listening to it. It does not close the backends. A `Cache` without a broadcast that is never closed leaks nothing once its last fetch ends; with one, it keeps its subscription (a Redis connection, or a go-bus queue and its heartbeats) until `Close`.
 
 ### What happens to cached data from v1 after upgrading?
 

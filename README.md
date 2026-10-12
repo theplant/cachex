@@ -155,7 +155,7 @@ It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `g
 | `ottercachex` | values in memory | `MaximumSize` (entries) or `MaximumWeight` with `Weigher` is required; each entry expires at its own time |
 | `bigcachex` | encoded entries in memory | For millions of entries, when the garbage collector shows in profiles; every read decodes |
 | `rediscachex` | encoded entries in Redis or Redis Cluster | Native expiry per entry; batch calls are pipelines of `ChunkSize` keys; `Leases` for a Redis several instances share; `NewBroadcast` for the invalidation broadcast |
-| `gormcachex` | encoded entries in a table | Call `Migrate`; MySQL 8.0.17+ only; see Pitfalls for keys, isolation and expired rows; `Leases` for a table several instances share |
+| `gormcachex` | encoded entries in a table | Call `Migrate`; on MySQL, 8.0.17+ only; see Pitfalls for keys, isolation and expired rows; `Leases` for a table several instances share |
 | `goquecachex` | nothing: `gormcachex`'s cleanup as a go-que job | PostgreSQL for the queue (the table may be elsewhere); `StartCleanup` on every instance runs `DeleteExpired` on one of them at a time |
 | `gobuscachex` | nothing: the invalidation broadcast over go-bus | PostgreSQL only; for deployments with PostgreSQL and no Redis; each instance subscribes a queue of its own, kept alive by heartbeats |
 | `cachextest` | values in memory, unbounded | For tests only, with `Clock`, `NewLeasingMap` (a shared map with leases, for Caches standing for instances), `NewBus` (an in-memory broadcast that can lose messages), and `TestBackend`, `TestByteBackend`, `TestLeaser` and `TestBroadcast`, contract tests for your own backends and transports |
@@ -184,7 +184,7 @@ Each item: the mistake, what happens, what to do.
 - **Values that expire on their own (tokens, signed URLs) cached for the layer TTL.** Use `WithMaxAge` so an entry never outlives the value.
 - **Expecting a broken layer to be skipped.** If a layer cannot be read, the read fails rather than sending every request to the source.
 - **Checking a backend right after `Get` returns.** The answer is returned before it is written into the layers. Call `Close` first in tests.
-- **A key with a `}` but no hash tag** (such as `a}b`). Such keys are not supported: reads and writes fail with `ErrUnsupportedKey`. Give it a hash tag (`{user:1}:profile`) or drop the `}`.
+- **A key with a `}` but no hash tag** (such as `a}b`). Such keys are not supported: `Get`, `GetMany`, `Set` and `SetMany` fail with `ErrUnsupportedKey` for them; `Del` and `DelMany` do nothing (nothing was stored). Give it a hash tag (`{user:1}:profile`) or drop the `}`.
 
 **Writes**
 
@@ -207,7 +207,7 @@ Each item: the mistake, what happens, what to do.
 
 **Lifecycle**
 
-- **Closing the backends while the `Cache` still works.** Call `Close` first: it waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.
+- **Closing the backends while the `Cache` still works.** Call `Close` first: it stops listening to the broadcast, if any, and waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.
 - **Exiting right after a read** (a command-line tool, a cron job). A read returns before its answer is written into the layers, so the process can end before Redis or the table is filled, and the next run fetches again. Call `Close` before exiting.
 
 ## Documentation

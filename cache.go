@@ -217,8 +217,10 @@ func sharedCtx(ctx context.Context) context.Context {
 // Close stops listening to the broadcast, if any, and waits for the fetches
 // and background refreshes in progress (and their backfills) and for the
 // invalidations of writes that gave up waiting, so that the backends can be
-// closed after it, and starts no more background refreshes. It does not close the backends. The Cache
-// still serves reads and writes.
+// closed after it, and starts no more background refreshes. It does not
+// close the backends. The Cache still serves reads and writes, but no longer
+// hears of other instances' writes: its local layers may serve what they
+// overwrote until it rots.
 func (c *Cache[T]) Close() error {
 	if c.stopListen != nil {
 		c.stopListen()

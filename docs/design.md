@@ -111,6 +111,7 @@ flowchart LR
 | `WithGetManyConcurrency(n)` | `DefaultGetManyConcurrency` = 16 | 一次 `GetMany` 同时向数据源发出的请求数：数据源不是批量数据源时是 `Get` 调用，否则是每段一次的调用；名额不够时下一段等着 | [batch.md](design/batch.md#回源怎么发) |
 | `WithGetManyChunkSize(n)` | 0（全部一段） | 一次 `GetMany`（以及多个 key 的后台刷新）每段多少个 key：一段开始时才认领，每层一次调用、问数据源、各自回填；还没开始的段不认领，并发的 `Get` 不用等它 | [batch.md](design/batch.md#回源怎么发) |
 | `WithMaxAge(func(T) time.Duration)` | 不限 | 按值给条目定寿命上限，在回源拿到值时调用一次，`Set`/`SetMany` 写入值时也调用；返回 0 或负数表示不缓存；`T` 必须和 `Cache` 的一致，否则 `New` panic | [read-path.md](design/read-path.md#条目的寿命) |
+| `WithBroadcast(b)` | 不开 | 失效广播：写入后把 key 发给其他实例，它们从本地层删掉；每次订阅成功清空本地层 | [consistency.md](design/consistency.md#失效广播) |
 | `WithNow(f)` | `time.Now` | `Cache` 计算和判断条目所用的时钟；后端的原生过期仍按真实时钟 | [backends.md](design/backends.md#过期按真实时钟) |
 | `WithLogger(l)` | `slog.Default()` | 不让调用失败的失败（回填、失效、后台刷新失败），以及回源里的 panic | — |
 
@@ -124,10 +125,10 @@ flowchart LR
 
 下面这些都会 panic：
 
-- `New`：数据源为 nil；超时、回源数、并发数不大于 0；分段为负；日志或时钟为 nil；`WithMaxAge` 的参数类型不是 `Cache` 的 `T`；某一层不是用 `NewLayer` 建的（零值的 `Layer`）。
+- `New`：数据源为 nil；超时、并发数不大于 0；分段为负；日志或时钟为 nil；`WithMaxAge` 的参数类型不是 `Cache` 的 `T`；某一层不是用 `NewLayer` 建的（零值的 `Layer`）；有 `WithBroadcast` 却没有一层是本地层（`LocalBackend`）。
 - `NewLayer`：后端为 nil；没有 `TTL` 或新鲜期不大于 0；TTL 为负；`NotFoundTTL` 只有陈旧期没有新鲜期；抖动不在 `[0, 1)`。
 
-`Close()` 等待它之前启动的后台工作结束：正在进行的回源和它们的回填、后台刷新、放弃等待的写入在分片空出后补做的失效；之后不再发起后台刷新。它不关闭后端，关闭之后读写照常可用。所以关闭后端之前先调用 `Close`。设计文档里只在这里完整列出 `Close` 等什么，分篇只提一句或链接到这里；godoc、README、MIGRATION、FAQ 面向使用者各写一份，改的时候一起改。
+`Close()` 先停止监听失效广播（如果开了），再等待它之前启动的后台工作结束：正在进行的回源和它们的回填、后台刷新、放弃等待的写入在分片空出后补做的失效；之后不再发起后台刷新。它不关闭后端，关闭之后读写照常可用，但收不到其他实例的写入了，本地层可能一直返回被覆盖的值，直到腐烂。所以关闭后端之前先调用 `Close`。设计文档里只在这里完整列出 `Close` 等什么，分篇只提一句或链接到这里；godoc、README、MIGRATION、FAQ 面向使用者各写一份，改的时候一起改。
 
 ## 分篇
 

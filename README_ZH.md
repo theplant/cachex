@@ -183,7 +183,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 - **自带过期时间的值（token、签名 URL）按层的 TTL 缓存。** 用 `WithMaxAge`，让条目不会比值本身活得更久。
 - **以为读不了的层会被跳过。** 某一层读失败时，这次读取直接失败，而不是把所有请求都打到数据源。
 - **`Get` 刚返回就检查后端。** 结果是先返回、再写进各层的。测试里先调用 `Close`。
-- **key 里有 `}` 却没有 hash tag**（比如 `a}b`）。这种 key 不支持：读写返回 `ErrUnsupportedKey`。带 hash tag（`{user:1}:profile`）或者不用 `}`。
+- **key 里有 `}` 却没有 hash tag**（比如 `a}b`）。这种 key 不支持：`Get`、`GetMany`、`Set`、`SetMany` 对它返回 `ErrUnsupportedKey`；`Del`、`DelMany` 什么也不做（本来就没存）。带 hash tag（`{user:1}:profile`）或者不用 `}`。
 
 **写入**
 
@@ -206,7 +206,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 
 **生命周期**
 
-- **`Cache` 还在工作时就关闭后端。** 先调用 `Close`：它会等正在进行的回源和它们的回填、后台刷新，以及放弃等待的写入要补做的失效。
+- **`Cache` 还在工作时就关闭后端。** 先调用 `Close`：开了失效广播的，它停止监听广播；它会等正在进行的回源和它们的回填、后台刷新，以及放弃等待的写入要补做的失效。
 - **读完马上退出进程**（命令行工具、定时任务）。读取在结果写进各层之前就返回了，进程可能在 Redis 或数据表写好之前就结束，下次运行又得回源。退出前调用 `Close`。
 
 ## 文档
