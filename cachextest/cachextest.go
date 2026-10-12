@@ -22,16 +22,51 @@ type Map[T any] struct {
 
 var (
 	_ cachex.Backend[any] = (*Map[any])(nil)
-	_ cachex.Leasing[any] = (*Map[any])(nil)
+	_ cachex.LocalBackend = (*Map[any])(nil)
+	_ cachex.Backend[any] = (*LeasingMap[any])(nil)
+	_ cachex.Leasing[any] = (*LeasingMap[any])(nil)
 )
 
 // NewMap returns an empty Map.
 func NewMap[T any]() *Map[T] { return &Map[T]{} }
 
-// NewLeasingMap returns an empty Map whose leases are on (see cachex.Leaser),
-// to stand for a layer that several instances share: build each instance's
-// Cache over the same Map.
-func NewLeasingMap[T any]() *Map[T] { return &Map[T]{leases: &leases{held: map[string]heldLease{}}} }
+// LeasingMap is a Map whose leases are on (see cachex.Leaser), standing for a
+// layer that several instances share: build each instance's Cache over the
+// same LeasingMap. Unlike a Map it is not a cachex.LocalBackend.
+type LeasingMap[T any] struct{ m *Map[T] }
+
+// NewLeasingMap returns an empty LeasingMap.
+func NewLeasingMap[T any]() *LeasingMap[T] {
+	return &LeasingMap[T]{&Map[T]{leases: &leases{held: map[string]heldLease{}}}}
+}
+
+func (l *LeasingMap[T]) Get(ctx context.Context, key string) (cachex.Entry[T], bool, error) {
+	return l.m.Get(ctx, key)
+}
+
+func (l *LeasingMap[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[T], error) {
+	return l.m.GetMany(ctx, keys)
+}
+
+func (l *LeasingMap[T]) Set(ctx context.Context, key string, e cachex.Entry[T]) error {
+	return l.m.Set(ctx, key, e)
+}
+
+func (l *LeasingMap[T]) SetMany(ctx context.Context, entries map[string]cachex.Entry[T]) error {
+	return l.m.SetMany(ctx, entries)
+}
+
+func (l *LeasingMap[T]) Del(ctx context.Context, key string) error { return l.m.Del(ctx, key) }
+
+func (l *LeasingMap[T]) DelMany(ctx context.Context, keys []string) error {
+	return l.m.DelMany(ctx, keys)
+}
+
+// Len is the number of stored entries, expired ones included.
+func (l *LeasingMap[T]) Len() int { return l.m.Len() }
+
+// Leaser returns the map's Leaser.
+func (l *LeasingMap[T]) Leaser() cachex.Leaser[T] { return mapLeaser[T]{l.m} }
 
 type leases struct {
 	mu   sync.Mutex // held by every write too, so that a write and PutLeased do not interleave
@@ -42,14 +77,6 @@ type leases struct {
 type heldLease struct {
 	token string
 	until time.Time
-}
-
-// Leaser returns the Map's Leaser, nil unless it was built by NewLeasingMap.
-func (m *Map[T]) Leaser() cachex.Leaser[T] {
-	if m.leases == nil {
-		return nil
-	}
-	return mapLeaser[T]{m}
 }
 
 // lock locks the leases, if they are on; unlock unlocks them.
@@ -177,6 +204,13 @@ func (m *Map[T]) DelMany(_ context.Context, keys []string) error {
 		m.entries.Delete(key)
 		m.end(key)
 	}
+	return nil
+}
+
+// Clear drops every entry: a Map is local to the process (see
+// cachex.LocalBackend).
+func (m *Map[T]) Clear(context.Context) error {
+	m.entries.Clear()
 	return nil
 }
 

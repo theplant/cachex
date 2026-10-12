@@ -33,7 +33,10 @@ type Backend[T any] struct {
 	cache *otter.Cache[string, cachex.Entry[T]]
 }
 
-var _ cachex.Backend[any] = (*Backend[any])(nil)
+var (
+	_ cachex.Backend[any] = (*Backend[any])(nil)
+	_ cachex.LocalBackend = (*Backend[any])(nil)
+)
 
 // New returns an empty Backend.
 func New[T any](cfg Config[T]) (*Backend[T], error) {
@@ -99,3 +102,10 @@ func (b *Backend[T]) DelMany(_ context.Context, keys []string) error {
 // Len is the number of entries, possibly including expired ones not yet
 // removed.
 func (b *Backend[T]) Len() int { return b.cache.EstimatedSize() }
+
+// Clear drops every entry: the backend is local to the process (see
+// cachex.LocalBackend).
+func (b *Backend[T]) Clear(context.Context) error {
+	b.cache.InvalidateAll()
+	return nil
+}

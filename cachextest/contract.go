@@ -205,6 +205,22 @@ func TestBackend[T any](t *testing.T, newBackend func(t *testing.T) cachex.Backe
 		require.NoError(t, b.SetMany(ctx, nil))
 		require.NoError(t, b.DelMany(ctx, nil))
 	})
+
+	if _, local := newBackend(t).(cachex.LocalBackend); local {
+		t.Run("Clear drops every entry", func(t *testing.T) {
+			b := newBackend(t)
+			require.NoError(t, b.SetMany(ctx, map[string]cachex.Entry[T]{"a": entry(0), "b": notFound}))
+			require.NoError(t, b.(cachex.LocalBackend).Clear(ctx))
+			for _, key := range []string{"a", "b"} {
+				_, ok := get(t, b, key)
+				assert.False(t, ok, key)
+			}
+			require.NoError(t, b.Set(ctx, "a", entry(1)), "still usable")
+			e, ok := get(t, b, "a")
+			require.True(t, ok)
+			same(t, entry(1), e)
+		})
+	}
 }
 
 // TestByteBackend checks that a ByteBackend keeps the contract cachex.Encoded

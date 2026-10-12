@@ -51,3 +51,8 @@ type item struct {
 	ID   int
 	Tags []string
 }
+
+func TestItIsLocal(t *testing.T) {
+	_, ok := New[string](Config[string]{Cache: newBigCache(t)}).(cachex.LocalBackend)
+	assert.True(t, ok)
+}

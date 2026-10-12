@@ -38,7 +38,7 @@ func (s *gatedSource) Get(ctx context.Context, key string) (string, error) {
 
 // instances returns two Caches over one shared leasing layer, as two
 // processes would have.
-func instances(src cachex.Source[string], opts ...cachex.LayerOption) (a, b *cachex.Cache[string], shared *cachextest.Map[string]) {
+func instances(src cachex.Source[string], opts ...cachex.LayerOption) (a, b *cachex.Cache[string], shared *cachextest.LeasingMap[string]) {
 	shared = cachextest.NewLeasingMap[string]()
 	layer := func() []cachex.Layer[string] {
 		return []cachex.Layer[string]{cachex.NewLayer(shared, append([]cachex.LayerOption{cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)}, opts...)...)}
@@ -168,7 +168,7 @@ func TestLeasesAcrossLayers(t *testing.T) {
 	// misses, and a key found below fills the layers above under the lease
 	ctx := context.Background()
 	src := newGatedSource(map[string]string{"k": "v1"})
-	newC := func(shared *cachextest.Map[string]) (*cachex.Cache[string], *cachextest.Map[string]) {
+	newC := func(shared *cachextest.LeasingMap[string]) (*cachex.Cache[string], *cachextest.Map[string]) {
 		mem := cachextest.NewMap[string]()
 		return cachex.New[string](src, []cachex.Layer[string]{
 			cachex.NewLayer(mem, cachex.TTL(time.Minute, 0)),

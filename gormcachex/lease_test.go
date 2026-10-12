@@ -89,3 +89,9 @@ func TestATableWithoutLeaseColumnsWorksWithLeasesOff(t *testing.T) {
 	require.NoError(t, b.Migrate(ctx))
 	assert.True(t, db.Table("old").Migrator().HasColumn(&leasedRow{}, "lease_token"), "Migrate adds the lease columns")
 }
+
+func TestItIsNotLocal(t *testing.T) {
+	var b any = newBackend(t, Config[string]{})
+	_, ok := b.(cachex.LocalBackend)
+	assert.False(t, ok, "a table is shared: a broadcast never clears it")
+}

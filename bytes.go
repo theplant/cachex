@@ -40,6 +40,7 @@ type ByteEntry struct {
 // key, and reports it absent. An entry already past its ExpiresAt is not
 // written: its key is deleted instead. That is judged by the wall clock
 // (time.Now), as backends expire entries by it, whatever clock the Cache uses.
+// It forwards ByteLeasing (as Leasing) and ByteLocalBackend (as LocalBackend).
 func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[T] {
 	if codec == nil {
 		codec = DefaultCodec[T]()
@@ -47,7 +48,11 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &encoded[T]{b: b, codec: codec, logger: logger}
+	e := &encoded[T]{b: b, codec: codec, logger: logger}
+	if _, local := b.(ByteLocalBackend); local {
+		return encodedLocal[T]{e}
+	}
+	return e
 }
 
 type encoded[T any] struct {

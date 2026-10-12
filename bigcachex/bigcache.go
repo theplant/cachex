@@ -43,7 +43,10 @@ func New[T any](cfg Config[T]) cachex.Backend[T] {
 
 type byteBackend struct{ cache *bigcache.BigCache }
 
-var _ cachex.ByteBackend = byteBackend{}
+var (
+	_ cachex.ByteBackend      = byteBackend{}
+	_ cachex.ByteLocalBackend = byteBackend{}
+)
 
 func (b byteBackend) Get(_ context.Context, key string) ([]byte, bool, error) {
 	data, err := b.cache.Get(key)
@@ -105,3 +108,7 @@ func (b byteBackend) DelMany(ctx context.Context, keys []string) error {
 	}
 	return cachex.NewBatchError(errs)
 }
+
+// Clear drops every entry: the backend is local to the process (see
+// cachex.LocalBackend).
+func (b byteBackend) Clear(context.Context) error { return b.cache.Reset() }

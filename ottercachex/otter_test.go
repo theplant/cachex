@@ -94,3 +94,9 @@ func TestConfigNeedsABound(t *testing.T) {
 	_, err := ottercachex.New[string](ottercachex.Config[string]{})
 	assert.Error(t, err)
 }
+
+func TestItIsLocal(t *testing.T) {
+	b, err := ottercachex.New[string](ottercachex.Config[string]{MaximumSize: 10})
+	require.NoError(t, err)
+	var _ cachex.LocalBackend = b
+}

@@ -218,3 +218,9 @@ func TestAKeyPrefixInTheLeasesNamespaceIsRejected(t *testing.T) {
 	assert.Panics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "cachex-lease:x:"}) })
 	assert.NotPanics(t, func() { New[string](Config[string]{Client: client, KeyPrefix: "app:cachex-lease:"}) })
 }
+
+func TestItIsNotLocal(t *testing.T) {
+	_, client := newRedis(t)
+	_, ok := New[string](Config[string]{Client: client}).(cachex.LocalBackend)
+	assert.False(t, ok, "a Redis is shared: a broadcast never clears it")
+}
