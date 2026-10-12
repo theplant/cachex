@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"github.com/theplant/cachex/v2"
 	"github.com/theplant/cachex/v2/cachextest"
@@ -177,6 +179,59 @@ func TestOnRealDatabases(t *testing.T) {
 				wg.Wait()
 			})
 
+			t.Run("concurrent leases and writes do not fail", func(t *testing.T) {
+				// the lease statements lock rows too: in byte order, like SetMany
+				deadlocks := &deadlockCounter{Interface: db.Logger}
+				lb := New[string](Config[string]{DB: db.Session(&gorm.Session{Logger: deadlocks}), TableName: newB(t).bytes.table, Leases: true})
+				if name == "postgres" { // MySQL's gap locks deadlock now and then (see ADR 0010)
+					t.Cleanup(func() { assert.Zero(t, deadlocks.n.Load(), "rows are locked in one order") })
+				}
+				l := lb.Leaser()
+				keys := make([]string, 400)
+				for i := range keys {
+					keys[i] = fmt.Sprintf("%c%03d", "aBcD"[i%4], i)
+				}
+				var wg sync.WaitGroup
+				for w := range 8 {
+					wg.Go(func() {
+						for round := range 20 {
+							r := rand.New(rand.NewPCG(uint64(w), uint64(round)))
+							pick := r.Perm(len(keys))[:100]
+							sub := make([]string, len(pick))
+							entries := map[string]cachex.Entry[string]{}
+							for i, j := range pick {
+								sub[i] = keys[j]
+								entries[keys[j]] = entry("v")
+							}
+							switch round % 4 {
+							case 0:
+								assert.NoError(t, lb.DelMany(ctx, sub))
+							case 1:
+								assert.NoError(t, lb.SetMany(ctx, entries))
+							case 2: // lease, then backfill half and release the rest
+								tokens, err := l.Lease(ctx, sub, time.Minute)
+								assert.NoError(t, err)
+								put, rest := map[string]string{}, map[string]string{}
+								for k, tok := range tokens {
+									if len(put) < len(tokens)/2 {
+										put[k] = tok
+									} else {
+										rest[k] = tok
+									}
+								}
+								assert.NoError(t, l.PutLeased(ctx, put, entries))
+								assert.NoError(t, l.Release(ctx, rest))
+							case 3: // lease, then backfill deletes
+								tokens, err := l.Lease(ctx, sub, time.Minute)
+								assert.NoError(t, err)
+								assert.NoError(t, l.PutLeased(ctx, tokens, nil))
+							}
+						}
+					})
+				}
+				wg.Wait()
+			})
+
 			t.Run("a Cache over it", func(t *testing.T) {
 				b := newB(t)
 				c := cachex.New(cachex.SourceFunc[string](func(_ context.Context, key string) (string, error) {
@@ -201,4 +256,17 @@ func TestOnRealDatabases(t *testing.T) {
 			})
 		})
 	}
+}
+
+// deadlockCounter counts the statements aborted as deadlock victims.
+type deadlockCounter struct {
+	logger.Interface
+	n atomic.Int64
+}
+
+func (c *deadlockCounter) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
+	if isDeadlock(err) {
+		c.n.Add(1)
+	}
+	c.Interface.Trace(ctx, begin, fc, err)
 }
