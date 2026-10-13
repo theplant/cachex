@@ -130,34 +130,19 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 		return
 	}
 	l := c.leasers[li]
-	ownBefore := make([]bool, len(idxs)) // see byOwn below
-	for n, i := range idxs {
-		if !p.refresh {
-			ownBefore[n] = c.ownLease(p.keys[i])
-		}
-		c.holdLease(p.keys[i], 1) // counted while asked for, so another fetch of this process refused meanwhile sees it
-	}
 	lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	tokens, err := l.Lease(lctx, keysAt(p.keys, idxs), c.opts.fetchTimeout)
 	cancel()
 	warn := false
-	for n, i := range idxs {
+	for _, i := range idxs {
 		k := &p.ks[i]
 		if k.leases == nil {
 			k.leases = &keyLeases{tokens: make([]string, len(c.layers))}
 		}
 		if token, ok := tokens[p.keys[i]]; ok {
-			k.leases.tokens[li] = token // stays counted until used or released
-			continue
-		}
-		c.holdLease(p.keys[i], -1)
-		if kerr := errForKey(err, p.keys[i]); kerr == nil {
+			k.leases.tokens[li] = token
+		} else if kerr := errForKey(err, p.keys[i]); kerr == nil {
 			k.leases.refused = true // another instance holds it; a key that failed is not refused
-			if !p.refresh {
-				// this process may hold it, before the call or after (one
-				// that landed during it was there before)
-				k.leases.byOwn = k.leases.byOwn || ownBefore[n] || c.ownLease(p.keys[i])
-			}
 		} else if !errors.Is(kerr, ErrUnsupportedKey) { // a key the layer cannot store just misses there
 			warn = true
 		}
@@ -167,28 +152,6 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 	}
 }
 
-// holdLease counts n leases (negative: ended) this process's fetches hold, or
-// are asking for, on key, in any layer.
-func (c *Cache[T]) holdLease(key string, n int) {
-	c.leasesMu.Lock()
-	defer c.leasesMu.Unlock()
-	if c.leasesHeld[key] += n; c.leasesHeld[key] <= 0 {
-		delete(c.leasesHeld, key)
-	}
-}
-
-// ownLease reports whether this process may hold a lease on key: a fetch of
-// it holds or is asking for one, or it refreshes key (a refresh registers
-// before it leases). A fetch refused a lease uses it (see byOwn, land).
-func (c *Cache[T]) ownLease(key string) bool {
-	if _, ok := c.refreshing.Load(key); ok {
-		return true
-	}
-	c.leasesMu.Lock()
-	defer c.leasesMu.Unlock()
-	return c.leasesHeld[key] > 0
-}
-
 // keyLeases are the leases a fetch holds for a key, by layer ("": none), and
 // whether a layer it missed refused it one. Taken only from a layer that
 // leases: a fetch through layers that do not keeps a nil pointer, so
@@ -196,7 +159,6 @@ func (c *Cache[T]) ownLease(key string) bool {
 type keyLeases struct {
 	tokens  []string
 	refused bool
-	byOwn   bool // refused while this process refreshes the key: its refresh may hold the lease (see land)
 }
 
 // skipLeased answers, for a refresh, the flights idxs that another instance
@@ -230,7 +192,6 @@ func (p *claimed[T]) release(ctx context.Context, idxs []int) {
 				}
 				tokens[p.keys[i]] = l.tokens[li]
 				l.tokens[li] = ""
-				p.c.holdLease(p.keys[i], -1)
 			}
 		}
 		if tokens == nil {
@@ -267,7 +228,6 @@ func (c *Cache[T]) putLeased(ctx context.Context, j int, fills []fill[T], idxs [
 		}
 		tokens[f.key] = f.leases.tokens[j]
 		f.leases.tokens[j] = ""
-		c.holdLease(f.key, -1)
 		if e, ok := c.layers[j].place(f.entry, now); ok {
 			entries[f.key] = e
 		}
@@ -278,4 +238,12 @@ func (c *Cache[T]) putLeased(ctx context.Context, j int, fills []fill[T], idxs [
 	if err := c.leasers[j].PutLeased(ctx, tokens, entries); err != nil {
 		c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 	}
+}
+
+// putLeasedOne is putLeased for one fill, out of backfillOne so that its
+// frame does not grow the fetch goroutine's stack when no layer leases.
+//
+//go:noinline
+func (c *Cache[T]) putLeasedOne(ctx context.Context, j int, f *fill[T], now time.Time) {
+	c.putLeased(ctx, j, []fill[T]{*f}, []int{0}, now)
 }

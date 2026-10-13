@@ -209,7 +209,7 @@ Each item: the mistake, what happens, what to do.
 **Lifecycle**
 
 - **Closing the backends while the `Cache` still works.** Call `Close` first: it stops listening to the broadcast, if any, and waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.
-- **Exiting right after a read** (a command-line tool, a cron job). A read may return before its answer is written into the layers, so the process can end before Redis or the table is filled, and the next run fetches again. Call `Close` before exiting.
+- **Exiting right after a read** (a command-line tool, a cron job). A read returns before its answer is written into the layers, so the process can end before Redis or the table is filled, and the next run fetches again. Call `Close` before exiting.
 
 ## Documentation
 

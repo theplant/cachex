@@ -75,6 +75,6 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 
 **`Close` stops listening to the broadcast, if any, and waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.** *What to do:* call it before closing the backends.
 
-**A read may return before its backfill.** A fetch usually answers its callers first and writes the layers above afterwards; a read that comes meanwhile gets the same answer without fetching again. (When the first layer may hold an older answer by then, it writes the layers first.) So right after `Get` returns, a layer may not hold the value yet. *What to do:* nothing, unless a test looks at a backend right after a read, or the process exits right after a read (a command-line tool): call `Close` first.
+**A read returns before its backfill.** A fetch answers its callers first and writes the layers above afterwards; a read that comes meanwhile gets the same answer without fetching again. So right after `Get` returns, a layer may not hold the value yet. *What to do:* nothing, unless a test looks at a backend right after a read, or the process exits right after a read (a command-line tool): call `Close` first.
 
 **The benchmark numbers changed.** v1's `BENCHMARK.md` measured a simulation dominated by sleeps; see the new [BENCHMARK.md](BENCHMARK.md).

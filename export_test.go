@@ -15,10 +15,3 @@ func SourceWaiters[T any](c *Cache[T], key string) int {
 	}
 	return 0
 }
-
-// Sourcing reports whether a fetch of key is registered as asking the source
-// (until its backfill is done), for tests that wait for that.
-func Sourcing[T any](c *Cache[T], key string) bool {
-	_, ok := c.sourcing.Load(key)
-	return ok
-}
