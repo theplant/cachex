@@ -369,3 +369,176 @@ func TestALeaseEndedByAnotherFetchLeavesNoOlderAnswer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "v3", v, "a read after one that returned v3 went back")
 }
+
+type hookedLeasingLeasing struct {
+	*cachextest.LeasingMap[string]
+	putArmed, leaseArmed atomic.Bool
+	paused               chan map[string]string
+	resume               chan struct{}
+}
+
+func (h *hookedLeasingLeasing) Leaser() cachex.Leaser[string] {
+	return hookedLeasingLeaser{h.LeasingMap.Leaser(), h}
+}
+
+type hookedLeasingLeaser struct {
+	cachex.Leaser[string]
+	h *hookedLeasingLeasing
+}
+
+func (l hookedLeasingLeaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (map[string]string, error) {
+	tokens, err := l.Leaser.Lease(ctx, keys, ttl)
+	if l.h.leaseArmed.CompareAndSwap(true, false) {
+		l.h.paused <- tokens
+		<-l.h.resume
+	}
+	return tokens, err
+}
+
+func (l hookedLeasingLeaser) PutLeased(ctx context.Context, tokens map[string]string, entries map[string]cachex.Entry[string]) error {
+	if l.h.putArmed.CompareAndSwap(true, false) {
+		l.h.paused <- tokens
+		<-l.h.resume
+	}
+	return l.Leaser.PutLeased(ctx, tokens, entries)
+}
+
+func TestARefusalByASupersededReadOfThisProcessCounts(t *testing.T) {
+	// One leased layer. A refresh lands while a read R1 claims its flight:
+	// the refresh's second supersede drops R1's flight, though R1 has only
+	// leased so far. R2 claims a new flight and is refused the lease by R1,
+	// a read of this process (byOwn looks at refreshes only). R1 lands v2;
+	// R2 asks the source after it (v3), may not write the layer and does not
+	// delete v2 there: it returns v3, and the next read hits v2.
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v1"})
+	clock, now := newClock()
+	m0 := &hookedLeasingLeasing{LeasingMap: cachextest.NewLeasingMap[string](), paused: make(chan map[string]string), resume: make(chan struct{})}
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+	}, now)
+	defer func() { _ = c.Close() }()
+	require.NoError(t, c.Set(ctx, "k", "v1"))
+	clock.Advance(90 * time.Second) // stale
+
+	src.set("k", "v2")
+	m0.putArmed.Store(true)
+	v, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v1", v, "stale; the refresh fetches v2 and pauses in PutLeased, holding the fill lock")
+	<-m0.paused
+	require.NoError(t, m0.Del(ctx, "k")) // evicted: ends the refresh's lease
+
+	m0.leaseArmed.Store(true)
+	r1 := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k")
+		assert.NoError(t, err)
+		r1 <- v
+	}()
+	require.NotEmpty(t, <-m0.paused, "R1 leases k")
+
+	m0.resume <- struct{}{} // the refresh's PutLeased (refused) and its supersede, which drops R1's flight
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, time.Second, time.Millisecond)
+	time.Sleep(10 * time.Millisecond) // the refresh ends
+
+	m0.leaseArmed.Store(true)
+	r2 := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k")
+		assert.NoError(t, err)
+		r2 <- v
+	}()
+	require.Empty(t, <-m0.paused, "R2 has a flight of its own and is refused: R1 holds the lease")
+
+	m0.resume <- struct{}{} // R1 asks the source (v2) and lands it
+	require.Equal(t, "v2", <-r1)
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, time.Second, time.Millisecond)
+
+	src.set("k", "v3")
+	m0.resume <- struct{}{} // R2 asks the source (v3)
+	first := <-r2
+	require.Equal(t, "v3", first)
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, first, v, "a read after one that returned %q went back", first)
+}
+
+// pausingLeasingLeasing is a leasing map whose next Lease, once armed, signals
+// leased after taking (or being refused) the leases and waits for resume
+// before it returns.
+type pausingLeasingLeasing struct {
+	*cachextest.LeasingMap[string]
+	armed  atomic.Bool
+	leased chan map[string]string
+	resume chan struct{}
+}
+
+func (p *pausingLeasingLeasing) Leaser() cachex.Leaser[string] {
+	return pausingLeasingLeaser{p.LeasingMap.Leaser(), p}
+}
+
+type pausingLeasingLeaser struct {
+	cachex.Leaser[string]
+	p *pausingLeasingLeasing
+}
+
+func (l pausingLeasingLeaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (map[string]string, error) {
+	tokens, err := l.Leaser.Lease(ctx, keys, ttl)
+	if l.p.armed.CompareAndSwap(true, false) {
+		l.p.leased <- tokens
+		<-l.p.resume
+	}
+	return tokens, err
+}
+
+func TestARefusalByARefreshThatEndsDuringTheLeaseCounts(t *testing.T) {
+	// One leased layer. A refresh holds k's lease and waits in the source. A
+	// read misses (the stale entry rotted) and is refused the lease; before
+	// it looks at c.refreshing, the refresh lands v2 and unregisters. The
+	// read takes byOwn = false, so its fill neither writes the layer nor
+	// deletes v2 from it: it returns v3, and the next read hits v2.
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v1"})
+	clock, now := newClock()
+	m0 := &pausingLeasingLeasing{LeasingMap: cachextest.NewLeasingMap[string](), leased: make(chan map[string]string), resume: make(chan struct{})}
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+	}, now)
+	defer func() { _ = c.Close() }()
+	require.NoError(t, c.Set(ctx, "k", "v1"))
+	clock.Advance(90 * time.Second) // stale
+
+	src.set("k", "v2")
+	src.gate = make(chan struct{})
+	asked := make(chan struct{}, 1)
+	src.onGet = func(context.Context, string) { asked <- struct{}{} }
+	v, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v1", v, "stale; the refresh leases k and waits in the source")
+	<-asked
+	src.onGet = nil
+
+	clock.Advance(time.Minute) // v1 rots
+	m0.armed.Store(true)
+	got := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k")
+		assert.NoError(t, err)
+		got <- v
+	}()
+	require.Empty(t, <-m0.leased, "refused: the refresh holds the lease")
+
+	close(src.gate) // the refresh lands v2 and ends
+	require.Eventually(t, func() bool { e, ok := stored(t, m0, "k"); return ok && e.Value == "v2" }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, time.Second, time.Millisecond)
+	time.Sleep(10 * time.Millisecond) // and leaves c.refreshing
+
+	src.set("k", "v3")
+	m0.resume <- struct{}{}
+	first := <-got
+	require.Equal(t, "v3", first)
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, first, v, "a read after one that returned %q went back", first)
+}

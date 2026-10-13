@@ -35,7 +35,9 @@ type Cache[T any] struct {
 	flights    flight.Group[flightKey, T]
 	stripes    *stripe.Set
 	refreshing sync.Map // keys being refreshed in the background
-	sourcing   sync.Map // key -> *sourceCall[T]: the fetch asking the source for it (see askSource)
+	leasesMu   sync.Mutex
+	leasesHeld map[string]int // leases this process's fetches hold, by key (see ownLease)
+	sourcing   sync.Map       // key -> *sourceCall[T]: the fetch asking the source for it (see askSource)
 
 	mu     sync.Mutex // guards closed and adding to wg
 	closed bool
@@ -101,10 +103,11 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 		}
 	}
 	c := &Cache[T]{
-		source:  source,
-		layers:  layers,
-		opts:    o,
-		stripes: stripe.NewSet(),
+		source:     source,
+		layers:     layers,
+		opts:       o,
+		stripes:    stripe.NewSet(),
+		leasesHeld: map[string]int{},
 	}
 	c.batchSource, _ = source.(BatchSource[T])
 	for i, l := range layers {

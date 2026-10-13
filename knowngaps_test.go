@@ -4,6 +4,7 @@ package cachex_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,3 +107,96 @@ func TestKnownGapACopyBringsBackAKeyTheSourceNoLongerHas(t *testing.T) {
 	v, err = c.Get(ctx, "k")
 	assert.ErrorIs(t, err, cachex.ErrNotFound, "a read after one that returned not found got %q", v)
 }
+
+// stepSource answers from a map; call n (1-based) waits on before[n] before
+// reading the map and on after[n] after, if set. started gets n as each call
+// starts.
+type stepSource struct {
+	mu      sync.Mutex
+	data    map[string]string
+	n       int
+	before  map[int]chan struct{}
+	after   map[int]chan struct{}
+	started chan int
+}
+
+func (s *stepSource) Get(_ context.Context, key string) (string, error) {
+	s.mu.Lock()
+	s.n++
+	n := s.n
+	b, a := s.before[n], s.after[n]
+	s.mu.Unlock()
+	s.started <- n
+	if b != nil {
+		<-b
+	}
+	s.mu.Lock()
+	v := s.data[key]
+	s.mu.Unlock()
+	if a != nil {
+		<-a
+	}
+	return v, nil
+}
+
+func (s *stepSource) set(key, v string) { s.mu.Lock(); s.data[key] = v; s.mu.Unlock() }
+
+func TestKnownGapAPreWriteFetchPublishesNewerThanThePostWriteOne(t *testing.T) {
+	t.Skip("known gap, docs/todo.md #7")
+	// One layer. A read's fetch (call 1) is held before it reads the source.
+	// The source changes to v2 and Set(v2) runs: it drops the fetch's flight
+	// and call, so the next read, after v2 is evicted from L0, asks the source
+	// again (call 2), which reads v2 and is held. The source then moves on to
+	// v3 behind the Cache. Call 1 reads v3; its backfill is skipped (a write
+	// counted), answerAsFirst finds L0 empty, and it publishes v3: the first
+	// read returns v3. A read after that joins call 2's flight and returns v2.
+	ctx := context.Background()
+	src := &stepSource{data: map[string]string{"k": "v1"}, before: map[int]chan struct{}{1: make(chan struct{})},
+		after: map[int]chan struct{}{2: make(chan struct{})}, started: make(chan int, 10)}
+	m0 := cachextest.NewMap[string]()
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+	})
+	defer func() { _ = c.Close() }()
+
+	first := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k")
+		assert.NoError(t, err)
+		first <- v
+	}()
+	require.Equal(t, 1, <-src.started)
+
+	src.set("k", "v2")
+	require.NoError(t, c.Set(ctx, "k", "v2"))
+	require.NoError(t, m0.Del(ctx, "k")) // evicted (or a WithMaxAge of zero for v2)
+
+	second := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k")
+		assert.NoError(t, err)
+		second <- v
+	}()
+	require.Equal(t, 2, <-src.started)
+	require.Eventually(t, func() bool { return cachex.Sourcing(c, "k") }, time.Second, time.Millisecond)
+	time.Sleep(10 * time.Millisecond) // call 2 has read v2 (it holds in after[2])
+
+	src.set("k", "v3") // the source moves on behind the Cache
+	close(src.before[1])
+	v1 := <-first
+	require.Equal(t, "v3", v1, "the read that started before the write returns v3")
+
+	third := make(chan string, 1)
+	go func() { // starts after a read returned v3
+		v, err := c.Get(ctx, "k")
+		assert.NoError(t, err)
+		third <- v
+	}()
+	time.Sleep(10 * time.Millisecond) // joins call 2's flight
+	close(src.after[2])
+	assert.Equal(t, "v2", <-second)
+	assert.Equal(t, v1, <-third, "a read after one that returned %q went back", v1)
+}
+
+// zzHookLeasing is a leasing map whose next PutLeased (once putArmed) and
+// next Lease (once leaseArmed) signal and wait for resume.
