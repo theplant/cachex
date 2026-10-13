@@ -448,29 +448,39 @@ func (c *Cache[T]) publishFill(f *fill[T]) {
 	c.flights.Publish(f.k.flight, value, err)
 }
 
-// answerAsFirst sets the answer of the read fills, whose backfills a write
-// skipped after the first layer was touched (the stripe epoch moved since the
-// read missed it), to the usable entry the first layer holds now, if any:
-// not landed, the fetched answer may be newer than what the first layer
-// serves to the next read (a refresh landed meanwhile), which would then go
-// back (ADR 0022). If the key itself was written, the first layer holds the
-// write. A failed read leaves the answers as they are.
+// answerAsFirst sets the answer of the fills, whose backfills a write
+// skipped, to the first usable entry the layers above origin hold now, top
+// down, if any: what the next read gets. Not landed, the fetched answer may
+// be newer than that (a refresh landed meanwhile; or, for a refresh's fill,
+// the stale entry it was to replace is still served), and a read that got
+// it, by joining the flight or the call to the source, would be followed by
+// one that goes back (ADR 0022). It is called for a read's fill only if the
+// stripe epoch moved since the read missed the first layer, and always for a
+// refresh's. If the key itself was written, the layers hold the write. A
+// layer that fails to read is passed over.
 //
 //go:noinline
-func (c *Cache[T]) answerAsFirst(ctx context.Context, fills []*fill[T]) {
-	keys := make([]string, len(fills))
-	for i, f := range fills {
-		keys[i] = f.key
-	}
-	es, err := c.layers[0].backend.GetMany(ctx, keys)
-	if err != nil && !errors.As(err, new(*BatchError)) {
-		return
-	}
+func (c *Cache[T]) answerAsFirst(ctx context.Context, origin int, fills []*fill[T]) {
 	now := c.opts.now()
-	for _, f := range fills {
-		if e, ok := es[f.key]; ok && e.state(now) != rotten {
-			f.entry = e
+	left := fills
+	for j := 0; j < origin && len(left) > 0; j++ {
+		keys := make([]string, len(left))
+		for i, f := range left {
+			keys[i] = f.key
 		}
+		es, err := c.layers[j].backend.GetMany(ctx, keys)
+		if err != nil && !errors.As(err, new(*BatchError)) {
+			continue
+		}
+		var rest []*fill[T]
+		for _, f := range left {
+			if e, ok := es[f.key]; ok && e.state(now) != rotten {
+				f.entry = e
+			} else {
+				rest = append(rest, f)
+			}
+		}
+		left = rest
 	}
 }
 
@@ -687,14 +697,14 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 				late = append(late, i)
 				continue
 			}
-		} else if f := &fills[i]; f.own != nil && epoch(c.stripes, f.key) != f.k.seen {
+		} else if f := &fills[i]; f.own == nil || epoch(c.stripes, f.key) != f.k.seen {
 			skipped = append(skipped, f) // published below, see answerAsFirst
 			continue
 		}
 		c.publishFill(&fills[i])
 	}
 	if len(skipped) > 0 {
-		c.answerAsFirst(ctx, skipped)
+		c.answerAsFirst(ctx, origin, skipped)
 		for _, f := range skipped {
 			c.publishFill(f)
 		}
@@ -722,8 +732,8 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 // backfillOne is backfill for one answer, without the bookkeeping of many.
 func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 	if !c.beginFill(f.key, f.gen) {
-		if f.own != nil && epoch(c.stripes, f.key) != f.k.seen {
-			c.answerAsFirst(ctx, []*fill[T]{&f})
+		if f.own == nil || epoch(c.stripes, f.key) != f.k.seen {
+			c.answerAsFirst(ctx, origin, []*fill[T]{&f})
 		}
 		c.publishFill(&f)
 		return

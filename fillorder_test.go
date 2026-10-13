@@ -352,3 +352,143 @@ func TestASkippedBackfillPublishesNoAnswerNewerThanTheFirstLayer(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, first, v, "a read after one that returned %q went back", first)
 }
+
+func TestAReadJoiningASkippedRefreshDoesNotGoBack(t *testing.T) {
+	// A read joins a refresh's call to the source (askSource: one call per
+	// key at a time). A write of another key of the stripe skips the
+	// refresh's backfill, which publishes v2 without landing it (a refresh
+	// never takes answerAsFirst). The read returns v2; the next read hits
+	// the stale v1 the first layer still holds.
+	ctx := context.Background()
+	var mu sync.Mutex
+	data := map[string]string{"a": "x", "k": "v1"}
+	gates := map[string]chan struct{}{}
+	asked := make(chan string, 10)
+	src := cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		mu.Lock()
+		g := gates[key]
+		delete(gates, key)
+		mu.Unlock()
+		asked <- key
+		if g != nil {
+			<-g
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return data[key], nil
+	})
+	gate := func(key string) chan struct{} {
+		g := make(chan struct{})
+		mu.Lock()
+		gates[key] = g
+		mu.Unlock()
+		return g
+	}
+	clock, now := newClock()
+	m0 := cachextest.NewMap[string]()
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+	}, now, cachex.WithGetManyChunkSize(1), cachex.WithGetManyConcurrency(1))
+	defer func() { _ = c.Close() }()
+	other := ""
+	for i := 0; other == ""; i++ {
+		if o := fmt.Sprint("o", i); cachex.StripeIndex(c, o) == cachex.StripeIndex(c, "k") {
+			other = o
+		}
+	}
+
+	// a GetMany misses both keys; k's chunk waits for a's, held in the source
+	gateA := gate("a")
+	many := make(chan map[string]string, 1)
+	go func() {
+		m, err := c.GetMany(ctx, []string{"a", "k"})
+		assert.NoError(t, err)
+		many <- m
+	}()
+	require.Equal(t, "a", <-asked)
+
+	v, err := c.Get(ctx, "k") // lands v1
+	require.NoError(t, err)
+	require.Equal(t, "v1", v)
+	require.Equal(t, "k", <-asked)
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, 5*time.Second, time.Millisecond)
+
+	clock.Advance(90 * time.Second) // v1 is stale
+	mu.Lock()
+	data["k"] = "v2"
+	mu.Unlock()
+	gateK := gate("k")
+	v, err = c.Get(ctx, "k") // stale; the refresh asks the source and waits
+	require.NoError(t, err)
+	require.Equal(t, "v1", v)
+	require.Equal(t, "k", <-asked)
+
+	close(gateA) // k's chunk starts: its double check finds v1 stale, it joins the refresh's call
+	require.Eventually(t, func() bool { return cachex.SourceWaiters(c, "k") == 1 }, 5*time.Second, time.Millisecond)
+
+	require.NoError(t, c.Set(ctx, other, "x")) // a write of another key of k's stripe
+	close(gateK)
+	first := (<-many)["k"] // the refresh's answer, v2
+
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, first, v, "a read after one that returned %q went back", first)
+}
+
+func TestASkippedBackfillDoesNotGoBackOnceTheFirstLayerRots(t *testing.T) {
+	// As TestASkippedBackfillPublishesNoAnswerNewerThanTheFirstLayer, but
+	// the first layer's entry rots before the skipped read answers (the
+	// first layer's TTL is shorter than the second's). answerAsFirst reads
+	// only the first layer, finds nothing usable, and publishes the fetched
+	// v2; the second layer still holds the refresh's older v1, which the next
+	// read copies up.
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v1"})
+	clock, now := newClock()
+	m0 := cachextest.NewMap[string]()
+	l1 := &pausedAfterRead[string]{Backend: cachextest.NewMap[string](), read: make(chan struct{}), resume: make(chan struct{})}
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+		cachex.NewLayer[string](l1, cachex.TTL(time.Hour, time.Hour), cachex.Jitter(0)),
+	}, now)
+	defer func() { _ = c.Close() }()
+	other := ""
+	for i := 0; other == ""; i++ {
+		if k := fmt.Sprint("o", i); cachex.StripeIndex(c, k) == cachex.StripeIndex(c, "k") {
+			other = k
+		}
+	}
+	require.NoError(t, m0.Set(ctx, "k", cachex.Entry[string]{Value: "v0", CachedAt: epoch, FreshUntil: epoch, ExpiresAt: epoch.Add(time.Minute)}))
+
+	src.gate = make(chan struct{})
+	asked := make(chan struct{}, 1)
+	src.onGet = func(context.Context, string) { asked <- struct{}{} }
+	v, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v0", v, "stale; the refresh asks the source and waits")
+	<-asked
+	src.onGet = nil
+
+	clock.Advance(2 * time.Minute) // L0's v0 rots
+	l1.armed.Store(true)
+	got := make(chan string, 1)
+	go func() {
+		v, err := c.Get(ctx, "k") // misses L0 and L1
+		assert.NoError(t, err)
+		got <- v
+	}()
+	<-l1.read
+
+	close(src.gate) // the refresh lands v1 in L1 and L0
+	require.Eventually(t, func() bool { e, ok := stored(t, m0, "k"); return ok && e.Value == "v1" }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, 5*time.Second, time.Millisecond)
+
+	require.NoError(t, c.Set(ctx, other, "x")) // a write of another key on k's stripe
+	src.set("k", "v2")
+	clock.Advance(3 * time.Minute) // L0's v1 rots; L1's lives on
+	l1.resume <- struct{}{}
+	first := <-got
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, first, v, "a read after one that returned %q went back", first)
+}
