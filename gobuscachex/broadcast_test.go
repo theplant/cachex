@@ -26,10 +26,20 @@ func newBus(t *testing.T) (bus.Bus, *sql.DB) {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 	ctx := context.Background()
-	c, err := tcpostgres.Run(ctx, "postgres:16", tcpostgres.BasicWaitStrategies())
-	testcontainers.CleanupContainer(t, c)
-	require.NoError(t, err)
-	dsn, err := c.ConnectionString(ctx, "sslmode=disable")
+	var dsn string
+	var err error
+	for try := 1; try <= 3; try++ { // a loaded Docker sometimes fails a start: see gormcachex's startContainer
+		var c *tcpostgres.PostgresContainer
+		c, err = tcpostgres.Run(ctx, "postgres:16", tcpostgres.BasicWaitStrategies())
+		testcontainers.CleanupContainer(t, c)
+		if err == nil {
+			dsn, err = c.ConnectionString(ctx, "sslmode=disable")
+		}
+		if err == nil {
+			break
+		}
+		t.Logf("starting PostgreSQL, try %d: %v", try, err)
+	}
 	require.NoError(t, err)
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
