@@ -224,7 +224,7 @@ sequenceDiagram
     B->>G: Claim(k)：没有登记，新建回源
     B->>S: Get(k)
     S-->>B: 新的结果 ✓
-    A-->>A: A 自己拿到 v1（它开始得早），但回填被跳过
+    A-->>A: A 自己拿到 v1（它开始得早），但回填被跳过（换成 Set 的话，A 拿到第一层里写入的值，见 answerAsFirst）
 ```
 
 ## 写入顺序守卫

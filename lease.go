@@ -144,7 +144,8 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 		} else if kerr := errForKey(err, p.keys[i]); kerr == nil {
 			k.leases.refused = true // another instance holds it; a key that failed is not refused
 			if !p.refresh {
-				_, k.leases.byOwn = c.refreshing.Load(p.keys[i]) // a refresh registers before it leases
+				_, own := c.refreshing.Load(p.keys[i]) // a refresh registers before it leases
+				k.leases.byOwn = k.leases.byOwn || own
 			}
 		} else if !errors.Is(kerr, ErrUnsupportedKey) { // a key the layer cannot store just misses there
 			warn = true

@@ -290,3 +290,82 @@ func TestARefusedInstanceDeletingARottenEntryDoesNotEndTheHoldersLease(t *testin
 		require.NoError(t, x.Close())
 	}
 }
+
+type leasePaused struct {
+	*cachextest.LeasingMap[string]
+	armed  atomic.Bool
+	leased chan struct{}
+	resume chan struct{}
+}
+
+func (l *leasePaused) Leaser() cachex.Leaser[string] { return pausingLeaser{l, l.LeasingMap.Leaser()} }
+
+type pausingLeaser struct {
+	l *leasePaused
+	cachex.Leaser[string]
+}
+
+func (p pausingLeaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (map[string]string, error) {
+	toks, err := p.Leaser.Lease(ctx, keys, ttl)
+	if p.l.armed.CompareAndSwap(true, false) {
+		p.l.leased <- struct{}{}
+		<-p.l.resume
+	}
+	return toks, err
+}
+
+func TestALeaseEndedByAnotherFetchLeavesNoOlderAnswer(t *testing.T) {
+	// L0 local, L1 leasing. A refresh leases L1 and pauses before the source.
+	// A read refused L1's lease asks the source (v2) and deletes L1's older,
+	// rotten entry: a write, which ends the refresh's lease. A second read
+	// leases L1 and lands v2 there. The refresh then asks the source (v3):
+	// its PutLeased is refused silently, L0 gets v3, L1 keeps v2. Once L0's
+	// entry goes, a read returns v2 after one returned v3.
+	ctx := context.Background()
+	src := newSource(map[string]string{"k": "v2"})
+	clock, now := newClock()
+	m0 := cachextest.NewMap[string]()
+	l1 := &leasePaused{LeasingMap: cachextest.NewLeasingMap[string](), leased: make(chan struct{}), resume: make(chan struct{})}
+	c := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](m0, cachex.TTL(time.Minute, time.Minute), cachex.Jitter(0)),
+		cachex.NewLayer[string](l1, cachex.TTL(time.Minute, time.Hour), cachex.Jitter(0)),
+	}, now)
+	defer func() { _ = c.Close() }()
+	// L0: v1 stale from now on; L1: v1 already rotten
+	require.NoError(t, m0.Set(ctx, "k", cachex.Entry[string]{Value: "v1", CachedAt: epoch, FreshUntil: epoch, ExpiresAt: epoch.Add(time.Minute)}))
+	require.NoError(t, l1.Set(ctx, "k", cachex.Entry[string]{Value: "v1", CachedAt: epoch, FreshUntil: epoch, ExpiresAt: epoch}))
+
+	l1.armed.Store(true)
+	v, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v1", v, "stale; the refresh leases L1 and pauses")
+	<-l1.leased
+
+	clock.Advance(2 * time.Minute) // L0's v1 rots
+	v, err = c.Get(ctx, "k")       // refused L1's lease: source v2, deletes L1's older v1
+	require.NoError(t, err)
+	require.Equal(t, "v2", v)
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, 5*time.Second, time.Millisecond) // its backfill is done
+
+	clock.Advance(3 * time.Minute) // L0's v2 rots
+	v, err = c.Get(ctx, "k")       // leases L1: source v2 into L1 and L0
+	require.NoError(t, err)
+	require.Equal(t, "v2", v)
+	require.Eventually(t, func() bool { return !cachex.Sourcing(c, "k") }, 5*time.Second, time.Millisecond)
+
+	src.set("k", "v3")
+	clock.Advance(time.Second)
+	l1.resume <- struct{}{} // the refresh asks the source: v3
+	cachex.Settle(c)
+	e0, _ := stored(t, m0, "k")
+	e1, _ := stored(t, l1, "k")
+	t.Logf("L0 holds %q, L1 holds %q", e0.Value, e1.Value)
+
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	require.Equal(t, "v3", v)
+	clock.Advance(3 * time.Minute) // L0's v3 rots; L1's v2 is still usable
+	v, err = c.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "v3", v, "a read after one that returned v3 went back")
+}
