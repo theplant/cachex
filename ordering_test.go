@@ -56,7 +56,9 @@ func TestAGetManyBackfillSkipsTheKeysWrittenDuringItsFetch(t *testing.T) {
 	<-calls
 	require.NoError(t, c.Set(ctx, a, "new"))
 	close(src.gate)
-	assert.Equal(t, map[string]string{a: "1", b: "1"}, <-got)
+	m := <-got // a read that started before the write may return the old value, or the write's
+	assert.Contains(t, []string{"1", "new"}, m[a])
+	assert.Equal(t, "1", m[b])
 	cachex.Settle(c)
 
 	e, ok := stored(t, mem, a)

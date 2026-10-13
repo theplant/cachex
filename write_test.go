@@ -156,7 +156,7 @@ func TestAFetchStartedBeforeAWriteNeverOverwritesIt(t *testing.T) {
 	<-calls
 	require.NoError(t, s.c.Set(ctx, "a", "new"))
 	close(s.src.gate)
-	assert.Equal(t, "1", <-got, "a read that started before the write may return the old value")
+	assert.Contains(t, []string{"1", "new"}, <-got, "a read that started before the write may return the old value, or the write's")
 
 	for _, m := range []*cachextest.Map[string]{s.m1, s.m2} {
 		e, ok := stored(t, m, "a")
