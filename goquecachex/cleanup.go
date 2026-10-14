@@ -83,12 +83,13 @@ func StartCleanup(ctx context.Context, cfg CleanupConfig) (*Cleanup, error) {
 	}
 	worker, err := quex.StartWorker(ctx, que.WorkerOptions{
 		Queue:                     j.name,
+		Mutex:                     q.Mutex(),
 		Perform:                   j.perform,
 		MaxLockPerSecond:          2,
 		MaxBufferJobsCount:        1,
 		MaxPerformPerSecond:       2,
 		MaxConcurrentPerformCount: 1,
-	}, quex.WithMutexFactory(q.Mutex)) // a go-que mutex is done after one error (a dropped connection, say): each recreated worker gets a new one
+	})
 	if err != nil {
 		return nil, fmt.Errorf("goquecachex: StartCleanup: %w", err)
 	}
