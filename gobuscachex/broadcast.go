@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	bus "github.com/qor5/go-bus"
@@ -54,14 +53,9 @@ type BroadcastConfig struct {
 // briefly cut off; they are lost only once the subscription expired, which
 // the next heartbeat finds: Listen then subscribes again and calls ready.
 // The consumer polls the database, so a message arrives within about one
-// polling interval.
-//
-// Listen also checks that deliveries go on: with each heartbeat it publishes a
-// probe to a subject only its queue subscribes to, and if no probe arrived for
-// a TTL it subscribes again (and calls ready). A consumer can stall while the
-// heartbeats succeed: go-que's lock on the jobs lives on one connection, and
-// once that connection dropped (a database restart or failover) the consumer
-// fails for good.
+// polling interval. With each heartbeat, Listen also unsubscribes the expired
+// subscriptions of instances that died without unsubscribing, draining their
+// queues, a bounded batch at a time.
 func NewBroadcast(cfg BroadcastConfig) cachex.Broadcast {
 	if cfg.Bus == nil {
 		panic("gobuscachex: NewBroadcast: Bus is required")
@@ -117,38 +111,22 @@ func (b *broadcast) Listen(ctx context.Context, ready func(), deliver func(msg [
 }
 
 // subscribe subscribes a new queue, calls ready, and consumes it until ctx
-// ends, the subscription is found expired, or the probes stop arriving.
+// ends or the subscription is found expired. With each heartbeat it also
+// unsubscribes the expired subscriptions of instances that died without
+// unsubscribing (see expiredUnsubscriber).
 func (b *broadcast) subscribe(ctx context.Context, ready func(), handler bus.Handler) error {
 	var id [8]byte
 	_, _ = rand.Read(id[:])
-	name := hex.EncodeToString(id[:])
-	q := b.cfg.Bus.Queue("cachex-" + name)
-	probe := "cachex.probe." + name // short: go-bus bounds a subject's tokens and length
-	var subs []bus.Subscription
+	q := b.cfg.Bus.Queue("cachex-" + hex.EncodeToString(id[:]))
+	sub, err := q.Subscribe(ctx, b.cfg.Subject, bus.WithTTL(b.cfg.TTL), bus.WithAutoDrain(true))
+	if err != nil {
+		return fmt.Errorf("subscribe: %w", err)
+	}
 	defer func() { // not under ctx, which may be over
 		uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
-		for _, sub := range subs {
-			_ = sub.Unsubscribe(uctx)
-		}
+		_ = sub.Unsubscribe(uctx)
 	}()
-	for _, subject := range []string{b.cfg.Subject, probe} {
-		sub, err := q.Subscribe(ctx, subject, bus.WithTTL(b.cfg.TTL), bus.WithAutoDrain(true))
-		if err != nil {
-			return fmt.Errorf("subscribe: %w", err)
-		}
-		subs = append(subs, sub)
-	}
-	var probed atomic.Int64 // when a probe last arrived, or when this began
-	probed.Store(time.Now().UnixNano())
-	inner := handler
-	handler = func(ctx context.Context, in *bus.Inbound) error {
-		if in.Subject == probe {
-			probed.Store(time.Now().UnixNano())
-			return in.Destroy(ctx)
-		}
-		return inner(ctx, in)
-	}
 	ready()
 	var opts []bus.ConsumeOption
 	if b.cfg.WorkerConfig != nil {
@@ -172,21 +150,26 @@ func (b *broadcast) subscribe(ctx context.Context, ready func(), handler bus.Han
 		case <-consumer.Done():
 			return fmt.Errorf("consumer stopped: %w", consumer.Err())
 		case <-tick.C:
-			for _, sub := range subs {
-				err := sub.Heartbeat(ctx)
-				switch {
-				case errors.Is(err, bus.ErrSubscriptionNotFound):
-					return err // expired: messages may have been lost
-				case err != nil && ctx.Err() == nil: // the database may be down: try again on the next tick
-					b.cfg.Logger.WarnContext(ctx, "gobuscachex: heartbeat failed", "subject", b.cfg.Subject, "error", err)
+			err := sub.Heartbeat(ctx)
+			switch {
+			case errors.Is(err, bus.ErrSubscriptionNotFound):
+				return err // expired: messages may have been lost
+			case err != nil && ctx.Err() == nil: // the database may be down: try again on the next tick
+				b.cfg.Logger.WarnContext(ctx, "gobuscachex: heartbeat failed", "subject", b.cfg.Subject, "error", err)
+			}
+			if u, ok := b.cfg.Bus.(expiredUnsubscriber); ok {
+				if _, err := u.UnsubscribeExpired(ctx); err != nil && ctx.Err() == nil {
+					b.cfg.Logger.WarnContext(ctx, "gobuscachex: unsubscribing expired subscriptions failed", "error", err)
 				}
-			}
-			if time.Since(time.Unix(0, probed.Load())) > b.cfg.TTL {
-				return errors.New("deliveries stalled: no probe arrived for a TTL")
-			}
-			if _, err := b.cfg.Bus.Publish(ctx, &bus.Outbound{Message: bus.Message{Subject: probe}}); err != nil && ctx.Err() == nil {
-				b.cfg.Logger.WarnContext(ctx, "gobuscachex: probe failed", "subject", probe, "error", err)
 			}
 		}
 	}
+}
+
+// expiredUnsubscriber is a bus that unsubscribes, on their owners' behalf,
+// subscriptions whose TTL ran out (go-bus's BusImpl): an instance that died
+// without unsubscribing (SIGKILL, OOM) would leave its subscription and its
+// queue's messages behind for good. It handles a bounded batch a call.
+type expiredUnsubscriber interface {
+	UnsubscribeExpired(ctx context.Context) (int, error)
 }

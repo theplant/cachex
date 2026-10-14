@@ -197,8 +197,8 @@ github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 h1:o4JXh1EVt
 github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55/go.mod h1:OmDBASR4679mdNQnz2pUhc2G8CO2JrUAVFDRBDP/hJE=
 github.com/qor5/confx v0.0.0-20250426065316-0d28db5b4d54 h1:sO/saPkFgwfLaiCVTg+e9x6lAYBrqY91h1REu4NLMm0=
 github.com/qor5/confx v0.0.0-20250426065316-0d28db5b4d54/go.mod h1:03dPo1SHYn9sU57mH67Y1p9FIcglWaHr4i/xkeYmX4o=
-github.com/qor5/go-bus v0.1.3-0.20261012191021-fea608be7176 h1:pemN3USNfiypRfFGqrTYvLhVIZVXtgJxDyknpgXGLUA=
-github.com/qor5/go-bus v0.1.3-0.20261012191021-fea608be7176/go.mod h1:A9ie5S9JLGbO226dUiFwcs04YJRPK71AKinDJyqLuC4=
+github.com/qor5/go-bus v0.1.3-0.20261014093003-002a12d2bd6f h1:jk8IfPG6J9Z4Zj3u3PKymlyvxomYbLYVw7kHl2+sv7Y=
+github.com/qor5/go-bus v0.1.3-0.20261014093003-002a12d2bd6f/go.mod h1:A9ie5S9JLGbO226dUiFwcs04YJRPK71AKinDJyqLuC4=
 github.com/qor5/go-que v1.1.0 h1:jv7BYovZTXRwpshzvaolZezVILlny++AjeMdV/MV/Tc=
 github.com/qor5/go-que v1.1.0/go.mod h1:TSB15i8+bfrNCNYk6qcldIfPB9ubKbfFT7FwxgKvh4Q=
 github.com/qor5/x/v3 v3.2.1-0.20260602032452-ea2dcdcd625e h1:FfNoOxdlVt1L0MKYfbwGIyByS7HZgOWsxPOsNUveBoM=

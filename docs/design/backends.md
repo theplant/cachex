@@ -216,13 +216,14 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 - **主题**默认 `cachex.invalidate`；几份缓存共用一个 go-bus 时，各给各的（只能是小写、用点分隔）。
 - **每次 `Listen` 订阅一个自己的队列**（`cachex-` 加随机后缀），带 TTL（默认 1 分钟）和自动清空，订阅成功就调用 `ready`；`ctx` 结束时停掉消费者、退订（go-bus 的退订是软删除）。
 - **心跳**：go-bus 提供 `Heartbeat`，但要使用者自己定期调用，这里每 TTL 的三分之一调一次。订阅过期后 go-bus 不再往它的队列投递，`Heartbeat` 返回 `ErrSubscriptionNotFound`：这时可能漏了消息，就重新订阅，再调用一次 `ready`，`Cache` 清空本地层。数据库暂时连不上导致的心跳失败只记 WARN，下次再试，订阅在 TTL 内仍然有效。过期按数据库的 `NOW()` 判断，不受实例之间的时钟偏差影响。消费者自己停下（比如数据库出错）时也重新订阅。
-- **探测投递**：消费者可能停了却不报告。go-que 的 mutex 把锁住的任务挂在一条连接上，这条连接断过一次（数据库重启、主从切换），它之后每次都报 `que: bad mutex`，quex 用同一个 mutex 重建 worker，于是永远失败；心跳走连接池，照常成功。所以队列另外订阅一个只有它自己的主题（`cachex.probe.` 加队列后缀；不拼在配置的主题后面，因为 go-bus 限制主题最多 16 段、255 个字符），每次心跳时往里发一条探测；超过一个 TTL 没收到探测，就当订阅丢了，重新订阅（新的消费者带新的 mutex）并调用 `ready`。代价是每个实例每 TTL 三分之一一条消息。
+- **断线后恢复**：go-que 的 mutex 出一次错（比如连接断了）就作废，之后每次都报 `que: bad mutex`，这是它的设计，用法是重建 worker 时配一个新的 mutex。go-bus 的 quex 原来重建 worker 时复用同一个 mutex，数据库重启一次，消费者就永远停投，心跳却照常成功。这个修在 go-bus（qor5/go-bus#37：quex 为每个重建的 worker 取新 mutex），有测试切断所有连接后检查投递恢复。
+- **替死掉的同伴退订**：实例被杀掉（SIGKILL、OOM）时没人退订，它的订阅过期后不再收消息，但订阅行和队列里的积压永远留着。所以每次心跳之后调用 go-bus 的 `UnsubscribeExpired`（qor5/go-bus#38），替它们退订、清空队列（我们订阅时开了 `AutoDrain`）；它每次最多处理一小批，分批删任务，不给数据库压力。失败只记 WARN。
 - **消息不会因为断线而丢**：实例慢了或者短暂断开，消息留在它的队列里；只有订阅过期才会丢，上面已经兜住。
 - **延迟取决于轮询**：消费者按 `WorkerConfig.MaxLockPerSecond` 轮询数据库，消息大约在一个轮询间隔内到达。go-bus 并发执行处理函数，这里加锁，一次只交给 `Cache` 一条。
-- 载荷是 `[]byte`，go-bus 把它编成 base64 的 JSON 字符串；解不开的消息直接销毁，不重试。处理完的消息和探测也用 `Destroy` 删掉：go-que 的 `Done` 只给行打上完成时间，没有任何东西会再删它，`goque_jobs` 会一直长。崩溃（没有退订）的实例留下的订阅和队列，go-bus 目前不回收，见 [todo](../todo.md) #5；`Destroy` 失败后重试过的任务，退订时 go-bus 本来就有意保留。
+- 载荷是 `[]byte`，go-bus 把它编成 base64 的 JSON 字符串；解不开的消息直接销毁，不重试。处理完的消息也用 `Destroy` 删掉：go-que 的 `Done` 只给行打上完成时间，没有任何东西会再删它，`goque_jobs` 会一直长。`Destroy` 失败后重试过的任务，退订时 go-bus 本来就有意保留。
 - 在 PostgreSQL 16 容器上跑 `TestBroadcast`、订阅过期后续订、两个实例的端到端测试；没有 Docker 时跳过。
 
-依赖 go-bus 时要注意：go-bus v0.1.2 的 go.mod 要求被撤回的 `go-sqlite3 v2.0.3+incompatible`，Go 会按版本号选中它，把每个依赖 cachex、自己也用 go-sqlite3 的项目降级到 2020 年的版本。所以这里依赖的是修好之后的提交（qor5/go-bus#36），go-bus 发版后换成正式版本（见 [todo](../todo.md)）。
+依赖 go-bus 时要注意：go-bus v0.1.2 的 go.mod 要求被撤回的 `go-sqlite3 v2.0.3+incompatible`，Go 会按版本号选中它，把每个依赖 cachex、自己也用 go-sqlite3 的项目降级到 2020 年的版本。所以这里依赖的是 go-bus 的集成分支 `molon/cachex-deps` 上的提交，它合了 #36（go-sqlite3）、#37（mutex）、#38（`UnsubscribeExpired`）三个 PR；go-bus 发版后换成正式版本（见 [todo](../todo.md)）。
 
 ## goquecachex
 
@@ -232,7 +233,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 - **每次运行在同一个事务里 `Destroy` 自己、入队下一次**（`RunAt` 是现在加 `Interval`，默认 1 小时）。
 - **清理失败不算任务失败**：记 ERROR 日志，下一次提前到 `min(间隔, 1 分钟)` 之后。只有「`Destroy` 并入队下一次」这个事务失败（数据库暂时连不上）才返回错误，交给 go-que 重试。
 - **无限重试，链不会断**：go-que 在重试次数用完时会自动 `Expire` 任务，链就断了。所以任务的 `MaxRetryCount` 是 -1（一直退避重试，最长间隔 1 分钟）。每个实例启动时都入队一次，有人手动删掉任务，下次有实例启动就恢复。
-- **mutex 坏了就换一个**：go-que 的 mutex 把锁挂在一条连接上，连接断过一次就永远报 `que: bad mutex`，而 quex 重建 worker 时用的还是同一个 mutex，数据库重启一次清理就永久停了。所以传给 worker 的是一个包装：底下的 mutex 报 `ErrBadMutex` 后换成新的 `q.Mutex()`（它的锁已经随连接没了）。等 quex 自己为重建的 worker 换 mutex，这个包装就可以删掉（见 todo）。
+- **断线后恢复**：go-que 的 mutex 出一次错就作废（它的设计），所以启动 worker 时传 `quex.WithMutexFactory(q.Mutex)`，每次重建 worker 都取一个新的 mutex（qor5/go-bus#37）。否则数据库重启一次，清理就永久停了；有测试切断所有连接后检查清理恢复。
 - 每个 `Name` 一个队列，几张表各跑各的。`Stop` 停掉本实例的 worker，任务留在队列里给其他实例。
 - 在 PostgreSQL 16 容器上测过：4 个实例同时跑时从不重叠、清理失败会再试、重启后接上、任务被删掉后新启动的实例把它入队、两张表互不干扰；去掉唯一约束，对应的测试会失败；另有测试检查重试策略是无限的。
 

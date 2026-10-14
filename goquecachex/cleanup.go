@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
 	"time"
 
 	"github.com/qor5/go-bus/quex"
@@ -84,13 +83,12 @@ func StartCleanup(ctx context.Context, cfg CleanupConfig) (*Cleanup, error) {
 	}
 	worker, err := quex.StartWorker(ctx, que.WorkerOptions{
 		Queue:                     j.name,
-		Mutex:                     &renewingMutex{queue: q, m: q.Mutex()},
 		Perform:                   j.perform,
 		MaxLockPerSecond:          2,
 		MaxBufferJobsCount:        1,
 		MaxPerformPerSecond:       2,
 		MaxConcurrentPerformCount: 1,
-	})
+	}, quex.WithMutexFactory(q.Mutex)) // a go-que mutex is done after one error (a dropped connection, say): each recreated worker gets a new one
 	if err != nil {
 		return nil, fmt.Errorf("goquecachex: StartCleanup: %w", err)
 	}
@@ -156,50 +154,4 @@ func (j *job) perform(ctx context.Context, jb que.Job) error {
 		return fmt.Errorf("goquecachex: reschedule the cleanup %s: %w", j.cfg.Name, err)
 	}
 	return nil
-}
-
-// renewingMutex is a go-que mutex that replaces itself once broken. go-que's
-// mutex holds its locks on one connection; once that connection fails, it
-// answers every later call with que.ErrBadMutex, and quex recreates the worker
-// with the same mutex, so a dropped connection (a database restart or
-// failover) would stop the cleanup for good. ponytail: go-que or quex
-// should do this; drop it once quex builds a new mutex for each recreated
-// worker.
-type renewingMutex struct {
-	queue que.Queue
-	mu    sync.Mutex
-	m     que.Mutex
-}
-
-func (r *renewingMutex) current() que.Mutex {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.m
-}
-
-// renew replaces m, if it is still the current mutex and err says it broke.
-// The locks it held went with its connection.
-func (r *renewingMutex) renew(m que.Mutex, err error) {
-	if !errors.Is(err, que.ErrBadMutex) {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.m == m {
-		r.m = r.queue.Mutex()
-	}
-}
-
-func (r *renewingMutex) Lock(ctx context.Context, queue string, count int) ([]que.Job, error) {
-	m := r.current()
-	jobs, err := m.Lock(ctx, queue, count)
-	r.renew(m, err)
-	return jobs, err
-}
-
-func (r *renewingMutex) Unlock(ctx context.Context, ids []int64) error {
-	m := r.current()
-	err := m.Unlock(ctx, ids)
-	r.renew(m, err)
-	return err
 }

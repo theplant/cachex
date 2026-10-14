@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,8 +142,8 @@ func TestTwoInstancesShareTheirWrites(t *testing.T) {
 
 func TestDeliveriesResumeAfterADroppedConnection(t *testing.T) {
 	// a database restart or failover cuts every connection: go-que's mutex
-	// behind the consumer stays broken while the heartbeats succeed, so
-	// Listen notices that its own probes stop arriving, and subscribes again
+	// behind the consumer is done after that, and go-bus gives the recreated
+	// worker a new one
 	b, db := newBus(t)
 	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.drop", TTL: 3 * time.Second, WorkerConfig: fast}
 	br := NewBroadcast(cfg)
@@ -180,7 +179,7 @@ func TestDeliveriesResumeAfterADroppedConnection(t *testing.T) {
 
 func TestNothingIsLeftInTheQueueTable(t *testing.T) {
 	// go-que's Done keeps a job's row; nothing would ever remove the rows of
-	// messages and probes
+	// messages
 	b, db := newBus(t)
 	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.left", TTL: 600 * time.Millisecond, WorkerConfig: fast}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -196,28 +195,35 @@ func TestNothingIsLeftInTheQueueTable(t *testing.T) {
 		require.NoError(t, NewBroadcast(cfg).Publish(ctx, []byte("m")))
 		<-got
 	}
-	time.Sleep(time.Second) // ponytail: a few heartbeat ticks, each with a probe
+	time.Sleep(time.Second) // ponytail: a few heartbeat ticks
 	cancel()
 	<-done
 	var rows int
 	require.NoError(t, db.QueryRow("SELECT count(*) FROM goque_jobs").Scan(&rows))
-	assert.Zero(t, rows, "messages and probes are destroyed once handled, the rest drained")
+	assert.Zero(t, rows, "messages are destroyed once handled, the rest drained")
 }
 
-func TestALongSubjectStillSubscribes(t *testing.T) {
-	// go-bus allows 16 tokens and 255 characters: the probe's subject must not
-	// build on the configured one
-	b, _ := newBus(t)
-	for _, subject := range []string{
-		strings.TrimSuffix(strings.Repeat("a.", 16), "."),
-		strings.TrimSuffix(strings.Repeat(strings.Repeat("a", 59)+".", 4), "."),
-	} {
-		ctx, cancel := context.WithCancel(context.Background())
-		ready := make(chan struct{}, 1)
-		go func() {
-			_ = NewBroadcast(BroadcastConfig{Bus: b, Subject: subject, WorkerConfig: fast}).Listen(ctx, func() { ready <- struct{}{} }, func([]byte) {})
-		}()
-		waitFor(t, ready)
-		cancel()
-	}
+func TestADeadInstancesSubscriptionIsUnsubscribedByAPeer(t *testing.T) {
+	// an instance killed without unsubscribing leaves its subscription and
+	// its queue's messages; once it expired, a live instance's heartbeat
+	// unsubscribes it and drains the queue
+	b, db := newBus(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.dead", TTL: 600 * time.Millisecond, WorkerConfig: fast}
+	_, err := b.Queue("cachex-dead").Subscribe(ctx, cfg.Subject, bus.WithTTL(time.Minute), bus.WithAutoDrain(true))
+	require.NoError(t, err)
+	require.NoError(t, NewBroadcast(cfg).Publish(ctx, []byte("k")))
+	_, err = db.ExecContext(ctx, "UPDATE gobus_subscriptions SET expires_at = NOW() - INTERVAL '1 second' WHERE queue = 'cachex-dead'")
+	require.NoError(t, err)
+
+	ready := make(chan struct{}, 4)
+	go func() { _ = NewBroadcast(cfg).Listen(ctx, func() { ready <- struct{}{} }, func([]byte) {}) }()
+	waitFor(t, ready)
+	assert.Eventually(t, func() bool {
+		var subs, jobs int
+		require.NoError(t, db.QueryRow("SELECT count(*) FROM gobus_subscriptions WHERE queue = 'cachex-dead' AND deleted_at IS NULL").Scan(&subs))
+		require.NoError(t, db.QueryRow("SELECT count(*) FROM goque_jobs WHERE queue = 'cachex-dead'").Scan(&jobs))
+		return subs == 0 && jobs == 0
+	}, 20*time.Second, 50*time.Millisecond, "the dead instance's subscription is unsubscribed and its queue drained")
 }
