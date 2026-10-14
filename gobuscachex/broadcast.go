@@ -35,8 +35,7 @@ type BroadcastConfig struct {
 	// TTL is how long an instance's subscription lives without a heartbeat;
 	// it beats every third of it. Once it expired, what was published is
 	// lost: the instance subscribes again, and the Cache clears its local
-	// layers. It also bounds how long deliveries may stall unnoticed (see
-	// NewBroadcast). Default DefaultTTL.
+	// layers. Default DefaultTTL.
 	TTL time.Duration
 	// WorkerConfig tunes the consumer; its MaxLockPerSecond is how often it
 	// polls the database, which bounds how soon a message arrives. Default
@@ -53,7 +52,11 @@ type BroadcastConfig struct {
 // briefly cut off; they are lost only once the subscription expired, which
 // the next heartbeat finds: Listen then subscribes again and calls ready.
 // The consumer polls the database, so a message arrives within about one
-// polling interval. With each heartbeat, Listen also unsubscribes the expired
+// polling interval. While the database is unreachable nothing arrives; once it
+// is back, deliveries resume after the consumer's reconnect backoff, up to
+// about 45s with go-bus's default (30s at most, randomized), and the messages
+// published meanwhile arrive then. Local layers may serve values written
+// elsewhere during that time; only an expired subscription clears them. With each heartbeat, Listen also unsubscribes the expired
 // subscriptions of instances that died without unsubscribing, draining their
 // queues, a bounded batch at a time.
 func NewBroadcast(cfg BroadcastConfig) cachex.Broadcast {
