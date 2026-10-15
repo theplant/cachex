@@ -52,32 +52,37 @@ func TestOnRealDatabases(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 	ctx := context.Background()
 
-	dbs := map[string]func(t *testing.T) gorm.Dialector{
-		"mysql": func(t *testing.T) gorm.Dialector {
-			return mysql.Open(startContainer(t, func() (string, testcontainers.Container, error) {
+	type database struct {
+		start func(t *testing.T) string       // its DSN
+		open  func(dsn string) gorm.Dialector // one per *gorm.DB: a dialector keeps state
+	}
+	dbs := map[string]database{
+		"mysql": {open: mysql.Open, start: func(t *testing.T) string {
+			return startContainer(t, func() (string, testcontainers.Container, error) {
 				c, err := tcmysql.Run(ctx, "mysql:8.4")
 				if err != nil {
 					return "", c, err
 				}
 				dsn, err := c.ConnectionString(ctx, "parseTime=true")
 				return dsn, c, err
-			}))
-		},
-		"postgres": func(t *testing.T) gorm.Dialector {
-			return postgres.Open(startContainer(t, func() (string, testcontainers.Container, error) {
+			})
+		}},
+		"postgres": {open: postgres.Open, start: func(t *testing.T) string {
+			return startContainer(t, func() (string, testcontainers.Container, error) {
 				c, err := tcpostgres.Run(ctx, "postgres:16", tcpostgres.BasicWaitStrategies())
 				if err != nil {
 					return "", c, err
 				}
 				dsn, err := c.ConnectionString(ctx, "sslmode=disable")
 				return dsn, c, err
-			}))
-		},
+			})
+		}},
 	}
-	for name, open := range dbs {
+	for name, database := range dbs {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			db, err := gorm.Open(open(t), &gorm.Config{})
+			dsn := database.start(t)
+			db, err := gorm.Open(database.open(dsn), &gorm.Config{})
 			require.NoError(t, err)
 			tables := 0
 			var mu sync.Mutex
@@ -122,7 +127,17 @@ func TestOnRealDatabases(t *testing.T) {
 					var wg sync.WaitGroup
 					errs := make([]error, 6)
 					for i := range errs {
-						wg.Go(func() { errs[i] = New[string](Config[string]{DB: db, TableName: table}).Migrate(ctx) })
+						wg.Go(func() {
+							// a *gorm.DB each, as processes have: GORM's MySQL
+							// dialector races on a schema, or a dialector, shared
+							// by goroutines
+							idb, err := gorm.Open(database.open(dsn), &gorm.Config{})
+							if err != nil {
+								errs[i] = err
+								return
+							}
+							errs[i] = New[string](Config[string]{DB: idb, TableName: table}).Migrate(ctx)
+						})
 					}
 					wg.Wait()
 					for i, err := range errs {

@@ -147,8 +147,10 @@ func New[T any](source Source[T], layers []Layer[T], opts ...Option) *Cache[T] {
 
 // WithFetchTimeout bounds, each on its own: a fetch's double check, each
 // lower layer read together with the backfill of what it found, each source
-// call together with the backfill of its answers, and the invalidation after
-// a failed write. Default DefaultFetchTimeout.
+// call together with the backfill of its answers, taking and releasing
+// leases (a lease lasts two of it), the invalidation after a failed write, a
+// broadcast's publish of each message, a received invalidation, and the
+// clear after subscribing again. Default DefaultFetchTimeout.
 func WithFetchTimeout(timeout time.Duration) Option {
 	return func(o *options) { o.fetchTimeout = timeout }
 }

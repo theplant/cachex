@@ -37,7 +37,7 @@ func (c *Cache[T]) lockWrite(ctx context.Context, key string) error {
 	if s.TryLock() { // the closures below cost allocations, so only when waiting
 		return nil
 	}
-	return c.lockStripe(ctx, s, c.lateWrite(ctx, s, []string{key}, false))
+	return c.lockStripe(ctx, s, c.lateWrite(ctx, s, []string{key}, false), c.latePublish(ctx, []string{key}, false))
 }
 
 // unlockWrite ends a write of key.
@@ -95,12 +95,12 @@ func (c *Cache[T]) lockWrites(ctx context.Context, keys []string, local bool) (u
 		if s.TryLock() {
 			continue
 		}
-		if err := c.lockStripe(ctx, s, c.lateWrite(ctx, s, byStripe[i], local)); err != nil {
+		if err := c.lockStripe(ctx, s, c.lateWrite(ctx, s, byStripe[i], local), c.latePublish(ctx, byStripe[i], local)); err != nil {
 			held := order[:n:n]
 			for _, j := range order[n+1:] {
 				r := c.stripes.At(j)
 				// ctx is done: this does not wait
-				if r.TryLock() || c.lockStripe(ctx, r, c.lateWrite(ctx, r, byStripe[j], local)) == nil {
+				if r.TryLock() || c.lockStripe(ctx, r, c.lateWrite(ctx, r, byStripe[j], local), c.latePublish(ctx, byStripe[j], local)) == nil {
 					held = append(held, j)
 				}
 			}
@@ -121,10 +121,7 @@ func (c *Cache[T]) lockWrites(ctx context.Context, keys []string, local bool) (u
 }
 
 // lateWrite is what a write that gave up waiting for s does once it holds s:
-// it drops keys and counts a write. A write's drop (not local) is published
-// again after it: the message the write sent when it gave up may have reached
-// an instance that then copied the old value from a shared layer before the
-// drop.
+// it drops keys and counts a write (see latePublish for what follows).
 func (c *Cache[T]) lateWrite(ctx context.Context, s *stripe.Stripe, keys []string, local bool) func() {
 	return func() {
 		defer func() { // it runs in a goroutine of its own: a panic would end the process
@@ -132,15 +129,28 @@ func (c *Cache[T]) lateWrite(ctx context.Context, s *stripe.Stripe, keys []strin
 				c.opts.logger.ErrorContext(ctx, "cachex: panic during a late drop", "keys", keys, "panic", r)
 			}
 		}()
-		defer func() { // even if a layer calls runtime.Goexit
-			c.countWrite(s, keys...)
-			if !local {
-				// not while holding s: a publish can wait up to a fetch
-				// timeout, and a clear (see clearLocal) waits for every stripe
-				c.background(func() { c.publish(ctx, keys) })
+		defer c.countWrite(s, keys...) // even if a layer calls runtime.Goexit
+		c.drop(ctx, keys, local)
+	}
+}
+
+// latePublish is what follows a write's late drop (not a broadcast's, local),
+// once s is free: the drop is published again, since the message the write
+// sent when it gave up may have reached an instance that then copied the old
+// value from a shared layer before the drop. Not while holding s: a publish
+// can wait up to a fetch timeout, and a clear (see clearLocal) waits for every
+// stripe.
+func (c *Cache[T]) latePublish(ctx context.Context, keys []string, local bool) func() {
+	if local {
+		return nil
+	}
+	return func() {
+		defer func() { // it runs in a goroutine of its own: a panic would end the process
+			if r := recover(); r != nil {
+				c.opts.logger.ErrorContext(ctx, "cachex: panic while publishing a late drop", "keys", keys, "panic", r)
 			}
 		}()
-		c.drop(ctx, keys, local)
+		c.publish(ctx, keys)
 	}
 }
 
@@ -167,13 +177,15 @@ func (c *Cache[T]) drop(ctx context.Context, keys []string, local bool) {
 }
 
 // lockStripe takes s for writing; if ctx ends first, it returns an error and
-// late runs once s is free, holding it; s is released after it. Close waits
-// for late.
-func (c *Cache[T]) lockStripe(ctx context.Context, s *stripe.Stripe, late func()) error {
+// late runs once s is free, holding it; s is released after it, and then
+// after runs (if not nil). Close waits for both.
+func (c *Cache[T]) lockStripe(ctx context.Context, s *stripe.Stripe, late, after func()) error {
 	done, _ := c.track()
-	err := s.Lock(ctx, func() {
+	err := s.Lock(ctx, late, func() {
 		defer done()
-		late()
+		if after != nil {
+			after()
+		}
 	})
 	if err == nil {
 		done() // late never runs
@@ -271,7 +283,7 @@ func (c *Cache[T]) invalidateLocal(keys []string) {
 func (c *Cache[T]) clearLocal() {
 	ctx := context.Background()
 	for i := range stripe.Count {
-		_ = c.stripes.At(i).Lock(ctx, func() {}) // a background ctx never gives up
+		_ = c.stripes.At(i).Lock(ctx, func() {}, nil) // a background ctx never gives up
 	}
 	defer func() { // even if a layer panics or calls runtime.Goexit
 		c.sourcing.Clear() // before the flights, as in dropFlights

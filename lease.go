@@ -132,6 +132,7 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 	}
 	l := c.leasers[li]
 	lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
+	at := time.Now() // no later than the backend starts the lease's TTL
 	tokens, err := l.Lease(lctx, keysAt(p.keys, idxs), 2*c.opts.fetchTimeout)
 	cancel()
 	warn := false
@@ -143,7 +144,7 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 		if token, ok := tokens[p.keys[i]]; ok {
 			k.leases.tokens[li] = token
 			if k.leases.at.IsZero() {
-				k.leases.at = time.Now() // the lease's TTL runs on the backend's clock
+				k.leases.at = at
 			}
 		} else if kerr := errForKey(err, p.keys[i]); kerr == nil {
 			k.leases.refused = true // another instance holds it; a key that failed is not refused
@@ -179,6 +180,7 @@ func (c *Cache[T]) renew(ctx context.Context, p *claimed[T], i int) {
 		return
 	}
 	key := p.keys[i]
+	at := time.Now() // no later than any of the new leases starts its TTL
 	for li, token := range l.tokens {
 		if token == "" {
 			continue
@@ -192,7 +194,7 @@ func (c *Cache[T]) renew(ctx context.Context, p *claimed[T], i int) {
 		}
 		l.tokens[li] = tokens[key] // "": not backfilled there
 	}
-	l.at = time.Now()
+	l.at = at
 }
 
 // skipLeased answers, for a refresh, the flights idxs that another instance

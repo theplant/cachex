@@ -132,7 +132,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
     rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
 ```
 
-It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `gobuscachex.NewBroadcast` does the same over go-bus, with messages polled from a queue per instance. Over Redis, messages published while an instance is disconnected are lost; over go-bus they wait in its queue, unless its subscription expired. Either way, each time an instance subscribes again it clears its memory layers: the cost of a message lost that way is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A publish that fails is tried again twice (a pooled connection the database dropped, say); if it still fails, it is logged as an error, not returned, and the other instances keep the old value in their memory layers until it rots: their memory layer TTLs bound how long, so keep them short enough for that. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
+It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `gobuscachex.NewBroadcast` does the same over go-bus, with messages polled from a queue per instance. Over Redis, messages published while an instance is disconnected are lost; over go-bus they wait in its queue, unless its subscription expired. Either way, each time an instance subscribes again it clears its memory layers: the cost of a message lost that way is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A publish that fails is tried again twice (a pooled connection the database dropped, say); if it still fails, it is logged as an error, not returned, and the other instances serve the old value from their memory layers until it stops being fresh there (they then refresh it, or miss and read the shared layer): the memory layers' fresh TTL bounds how long, so keep it short enough for that. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
 
 ## Options
 
@@ -174,7 +174,7 @@ Each item: the mistake, what happens, what to do.
 - **Returning `nil, nil` for a missing key.** The zero value is cached as a real value. Return `cachex.ErrNotFound` (wrapping it is fine).
 - **Returning `ErrNotFound` from `BatchSource.GetMany`.** Every key of the call reads as missing but nothing is cached, so each read asks again. Leave missing keys out of the map; for some keys failing, return a `*cachex.BatchError` as is, not wrapped.
 - **Relying on the caller's cancellation inside the source.** A fetch is shared by every caller waiting for the key, so its ctx does not end when one caller leaves; it is bounded by `WithFetchTimeout` instead, and keeps the caller's values. Do not use caller state from it, such as a database transaction (`cachex.IsShared(ctx)` tells you it is a fetch).
-- **Calling the same `Cache` from inside the source.** A key the call's own fetch is fetching (the same key, or another key of the same `GetMany`) would wait for that fetch: the call fails at once with an error saying so. Read what the source needs from the data store, or from another `Cache`.
+- **Calling the same `Cache` from inside the source.** A key the call is itself asking the source for (the same key, a key of the same `BatchSource` call, or a key whose source in turn calls back for this one) would wait for itself: the call fails at once with an error saying so. A key of the same `GetMany` still waiting for its turn is asked for at once, in the caller's turn; one being asked is waited for. Better still, read what the source needs from the data store, or from another `Cache`.
 - **A source without `GetMany` behind large `GetMany` calls.** Keys are fetched one by one (`WithGetManyConcurrency` at a time), and by default a concurrent `Get` of a queued key waits for its turn. Implement `BatchSource`, or set `WithGetManyChunkSize` to about `WithGetManyConcurrency`.
 
 **Reads**
@@ -208,7 +208,7 @@ Each item: the mistake, what happens, what to do.
 
 **Lifecycle**
 
-- **Closing the backends while the `Cache` still works.** Call `Close` first: it stops listening to the broadcast, if any, and waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting.
+- **Closing the backends while the `Cache` still works.** Call `Close` first: it stops listening to the broadcast, if any, and waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting (and their publishes).
 - **Exiting right after a read** (a command-line tool, a cron job). A read returns before its answer is written into the layers, so the process can end before Redis or the table is filled, and the next run fetches again. Call `Close` before exiting.
 
 ## Documentation

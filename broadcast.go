@@ -51,8 +51,8 @@ type Broadcast interface {
 // subscribes, the Cache clears its local layers, as a message may have been
 // lost. A Cache with a broadcast needs a local layer. A publish that fails
 // is tried again twice; if it still fails it is logged as an error, not
-// returned (the layers were written), and the other instances keep what
-// their local layers hold of those keys until it rots.
+// returned (the layers were written), and the other instances serve what
+// their local layers hold of those keys until it stops being fresh there.
 func WithBroadcast(b Broadcast) Option {
 	return func(o *options) { o.broadcast = b }
 }
@@ -141,14 +141,18 @@ func (c *Cache[T]) publish(ctx context.Context, keys []string) {
 		return
 	}
 	keys = slices.DeleteFunc(slices.Clone(keys), func(key string) bool { return !supportedKey(key) })
-	pctx, cancel := context.WithTimeout(sharedCtx(ctx), c.opts.fetchTimeout)
-	defer cancel()
+	ctx = sharedCtx(ctx)
 	for chunk := range slices.Chunk(keys, maxMessageKeys) {
+		// each message within a fetch timeout of its own: one that hangs
+		// does not fail the others
+		pctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 		if err := c.publishOne(pctx, encodeMessage(c.sender, chunk)); err != nil {
-			// the other instances keep what they hold of these keys until it
-			// rots (see WithBroadcast); go on with the other messages
+			// the other instances keep what they hold of these keys until
+			// they refresh or drop it (see WithBroadcast); go on with the
+			// other messages
 			c.opts.logger.ErrorContext(pctx, "cachex: broadcast publish failed", "keys", len(chunk), "error", err)
 		}
+		cancel()
 	}
 }
 

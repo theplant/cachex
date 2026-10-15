@@ -266,6 +266,8 @@ func chaosRedis(t *testing.T, prefix string) *chaosEnv {
 	}
 }
 
+// pgContainerDSN is the PostgreSQL that pgDSN started for the test running
+// (and its subtests), cleared when that test ends with its container.
 var pgContainerDSN string
 
 func pgDSN(t *testing.T) string {
@@ -281,6 +283,9 @@ func pgDSN(t *testing.T) string {
 		testcontainers.CleanupContainer(t, c)
 		if err == nil {
 			pgContainerDSN, err = c.ConnectionString(ctx, "sslmode=disable")
+		}
+		if err == nil {
+			t.Cleanup(func() { pgContainerDSN = "" }) // the container goes with t
 		}
 		if err == nil {
 			break
@@ -752,8 +757,9 @@ func TestAWriteRightAfterTheDatabaseDroppedEveryConnectionReachesTheOthers(t *te
 	time.Sleep(500 * time.Millisecond)
 
 	src.put("k", 2, false)
-	err = a.Set(ctx, "k", 2)
-	require.NoError(t, err)
+	// the write itself may hit a dead pooled connection too: it fails and
+	// says so, and is tried again, as an application would
+	require.Eventually(t, func() bool { return a.Set(ctx, "k", 2) == nil }, 10*time.Second, 50*time.Millisecond)
 	ready := 0
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {

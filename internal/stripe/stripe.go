@@ -46,8 +46,9 @@ func (s *Stripe) Epoch() uint64 { return s.gen.Load() + s.fills.Load() }
 // ctx. Waiting (for another write, or a backfill writing the layer) gives up
 // when ctx is done: Lock then returns ctx's error, and the lock it gave up on
 // is still taken in the background, runs late while holding it, and is
-// released.
-func (s *Stripe) Lock(ctx context.Context, late func()) error {
+// released; then after runs, if not nil (even if late panics or calls
+// runtime.Goexit).
+func (s *Stripe) Lock(ctx context.Context, late, after func()) error {
 	if s.mu.TryLock() {
 		return nil
 	}
@@ -62,6 +63,9 @@ func (s *Stripe) Lock(ctx context.Context, late func()) error {
 	case <-ctx.Done():
 		go func() {
 			<-locked
+			if after != nil {
+				defer after() // deferred first: runs once the stripe is released
+			}
 			defer s.mu.Unlock() // even if late panics or calls runtime.Goexit
 			late()
 		}()

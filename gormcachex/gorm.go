@@ -192,9 +192,12 @@ func (b *byteBackend) migrate(ctx context.Context) error {
 	// one fail; once it exists, migrating again does nothing
 	var err error
 	for range migrateAttempts {
-		if err = db.AutoMigrate(&leasedRow{}); err == nil {
-			return nil
+		if err = db.AutoMigrate(&leasedRow{}); err == nil || ctx.Err() != nil {
+			break
 		}
+	}
+	if err == nil {
+		return nil
 	}
 	return fmt.Errorf("gormcachex: migrate table %s: %w", b.table, err)
 }

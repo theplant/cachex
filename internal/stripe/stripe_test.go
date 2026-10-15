@@ -13,7 +13,7 @@ func TestLockTakesAFreeStripeEvenWithADoneCtx(t *testing.T) {
 	var s Stripe
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	require.NoError(t, s.Lock(ctx, func() { t.Error("late must not run") }))
+	require.NoError(t, s.Lock(ctx, func() { t.Error("late must not run") }, nil))
 	s.Unlock()
 }
 
@@ -24,7 +24,7 @@ func TestLockGivesUpWaitingAndRunsLateWhileHoldingTheLock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	lateRan := make(chan bool, 1)
-	err := s.Lock(ctx, func() { lateRan <- !s.TryRLock() })
+	err := s.Lock(ctx, func() { lateRan <- !s.TryRLock() }, nil)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	s.Unlock() // the other write ends

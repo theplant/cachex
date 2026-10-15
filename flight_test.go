@@ -252,11 +252,14 @@ func TestASourceCallingBackForItsOwnKeyFailsAtOnce(t *testing.T) {
 	requireCallbackError(t, inner)
 }
 
-func TestASourceCallingBackForAKeyOfItsGetManyFailsAtOnce(t *testing.T) {
+func TestASourceCallingBackForAKeyWaitingItsTurnAsksForIt(t *testing.T) {
 	var c *cachex.Cache[string]
+	var calls sync.Map
 	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		n, _ := calls.LoadOrStore(key, new(atomic.Int64))
+		n.(*atomic.Int64).Add(1)
 		if key == "a" {
-			v, err := c.Get(ctx, "b") // b waits for a's slot: GetMany asks one key at a time
+			v, err := c.Get(ctx, "b") // b waits for a's turn: GetMany asks one key at a time
 			return "a+" + v, err
 		}
 		return key, nil
@@ -273,11 +276,90 @@ func TestASourceCallingBackForAKeyOfItsGetManyFailsAtOnce(t *testing.T) {
 	}()
 	select {
 	case r := <-done:
-		requireCallbackError(t, r.err)
-		assert.Equal(t, map[string]string{"b": "b"}, r.got)
+		require.NoError(t, r.err)
+		assert.Equal(t, map[string]string{"a": "a+b", "b": "b"}, r.got)
+		n, _ := calls.Load("b")
+		assert.Equal(t, int64(1), n.(*atomic.Int64).Load(), "b asked once, by a's source, in a's turn")
 	case <-time.After(5 * time.Second):
 		t.Fatal("a's source waited for b, which waited for a's turn")
 	}
+}
+
+func TestASourceCallingBackForAKeyBeingAskedWaitsForIt(t *testing.T) {
+	var c *cachex.Cache[string]
+	aCalling := make(chan struct{})
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		if key == "a" {
+			close(aCalling)
+			v, err := c.Get(ctx, "b") // b is being asked at the same time
+			return "a+" + v, err
+		}
+		<-aCalling // b answers only after a started waiting for it
+		return key, nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
+		cachex.WithFetchTimeout(time.Hour), cachex.WithGetManyConcurrency(2))
+	got, err := c.GetMany(context.Background(), []string{"a", "b"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"a": "a+b", "b": "b"}, got)
+}
+
+func TestACallbackCycleFailsAtOnce(t *testing.T) {
+	var c *cachex.Cache[string]
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		v, err := c.Get(ctx, map[string]string{"a": "b", "b": "a"}[key]) // a needs b, b needs a
+		return key + v, err
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
+		cachex.WithFetchTimeout(time.Hour))
+	done := make(chan error, 1)
+	go func() { _, err := c.Get(context.Background(), "a"); done <- err }()
+	select {
+	case err := <-done:
+		requireCallbackError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a's source waited for b, whose source waited for a")
+	}
+}
+
+// batchFunc adapts a function to a BatchSource (and a Source of one key).
+type batchFunc func(ctx context.Context, keys []string) (map[string]string, error)
+
+func (f batchFunc) Get(ctx context.Context, key string) (string, error) {
+	m, err := f(ctx, []string{key})
+	if err != nil {
+		return "", err
+	}
+	if v, ok := m[key]; ok {
+		return v, nil
+	}
+	return "", cachex.ErrNotFound
+}
+
+func (f batchFunc) GetMany(ctx context.Context, keys []string) (map[string]string, error) {
+	return f(ctx, keys)
+}
+
+func TestABatchSourceCallingBackForAKeyOfItsCallFailsAtOnce(t *testing.T) {
+	var c *cachex.Cache[string]
+	var inner error
+	c = cachex.New[string](batchFunc(func(ctx context.Context, keys []string) (map[string]string, error) {
+		if len(keys) > 1 {
+			_, inner = c.Get(ctx, keys[1]) // asked in this very call
+		}
+		out := map[string]string{}
+		for _, k := range keys {
+			out[k] = k
+		}
+		return out, nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
+		cachex.WithFetchTimeout(time.Hour))
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = c.GetMany(context.Background(), []string{"a", "b"}) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the batch source's call for a key of its own call waited for itself")
+	}
+	requireCallbackError(t, inner)
 }
 
 func TestASourceCanReadAnotherKeyOfItsCache(t *testing.T) {

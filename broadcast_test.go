@@ -521,3 +521,48 @@ func TestALateDropPublishesAfterReleasingItsStripe(t *testing.T) {
 		t.Fatal("deadlock: a's listener waits in clearLocal for a stripe held by a late drop, which waits in Publish for the bus, which waits for a's listener")
 	}
 }
+
+// gatedBroadcast holds its second publish until gate closes, and counts the
+// publishes that finished.
+type gatedBroadcast struct {
+	cachex.Broadcast
+	gate  chan struct{}
+	calls atomic.Int64
+	done  atomic.Int64
+}
+
+func (g *gatedBroadcast) Publish(ctx context.Context, msg []byte) error {
+	if g.calls.Add(1) == 2 {
+		<-g.gate
+	}
+	defer g.done.Add(1)
+	return g.Broadcast.Publish(ctx, msg)
+}
+
+func TestCloseWaitsForALateDropsPublish(t *testing.T) {
+	ctx := context.Background()
+	bus := cachextest.NewBus()
+	local := cachextest.NewMap[string]()
+	bl := newBlocker("k")
+	gated := &gatedBroadcast{Broadcast: bus.Broadcast(), gate: make(chan struct{})}
+	sub := bus.Subscribed()
+	c := cachex.New[string](newSource(nil), []cachex.Layer[string]{
+		cachex.NewLayer[string](localHooked{bl.wrap(local), local}, cachex.TTL(time.Hour, 0)),
+	}, cachex.WithBroadcast(gated))
+	require.Eventually(t, func() bool { return bus.Subscribed() > sub }, 5*time.Second, time.Millisecond)
+
+	go func() { _ = c.Set(ctx, "k", "v1") }() // holds k's stripe: publish 1 after it
+	<-bl.entered
+	wctx, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, c.Set(wctx, "k", "v2"), "gives up: its drop runs, and publishes (2), once the stripe is free")
+
+	go func() {
+		time.Sleep(100 * time.Millisecond) // Close is waiting by now
+		close(bl.release)
+		time.Sleep(200 * time.Millisecond)
+		close(gated.gate)
+	}()
+	require.NoError(t, c.Close())
+	assert.Equal(t, int64(2), gated.done.Load(), "Close returned before the late drop's publish")
+}

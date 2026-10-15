@@ -61,7 +61,7 @@ With a shared layer (Redis or a table), hardly: the restarted instance's misses 
 
 ### Do I need to call `Close`?
 
-Call it at shutdown, before closing the backends. It waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting, all of which still write the backends; it starts no more refreshes. With a broadcast, it also stops listening to it. It does not close the backends. A `Cache` without a broadcast that is never closed leaks nothing once its last fetch ends; with one, it keeps its subscription (a Redis connection, or a go-bus queue and its heartbeats) until `Close`.
+Call it at shutdown, before closing the backends. It waits for the fetches in progress and their backfills, background refreshes, and the invalidations of writes that gave up waiting (and their publishes), all of which still write the backends or the bus; it starts no more refreshes. With a broadcast, it also stops listening to it. It does not close the backends. A `Cache` without a broadcast that is never closed leaks nothing once its last fetch ends; with one, it keeps its subscription (a Redis connection, or a go-bus queue and its heartbeats) until `Close`.
 
 ### What happens to cached data from v1 after upgrading?
 
@@ -123,7 +123,7 @@ Usually not, but it is not guaranteed. Backfills of a key land one at a time, a 
 The striped lock works within one process only. Across instances there are two problems, each solved by an option:
 
 - **Another instance can backfill an old value into a shared layer** (Redis or a table): turn leases on for it (`Leases`); only a fetch that still holds its lease backfills, and a write ends the lease.
-- **Other instances' memory layers do not see your write**: turn on the invalidation broadcast (`WithBroadcast`); a write sends its keys to the other instances, which drop them from their memory layers, and clear those layers each time they subscribe again, since a message may have been lost meanwhile. A publish that still fails after its retries is logged as an error, and the other instances keep the old value until it rots in their memory layers.
+- **Other instances' memory layers do not see your write**: turn on the invalidation broadcast (`WithBroadcast`); a write sends its keys to the other instances, which drop them from their memory layers, and clear those layers each time they subscribe again, since a message may have been lost meanwhile. A publish that still fails after its retries is logged as an error, and the other instances serve the old value until it stops being fresh in their memory layers.
 
 With neither, TTLs are the only backstop: set every layer's TTLs to how long you can accept old data. See [design/consistency.md](design/consistency.md) (Chinese).
 

@@ -131,7 +131,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
     rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
 ```
 
-它用 Redis Pub/Sub（Redis Cluster 也可以）；没有 Redis、但数据库是 PostgreSQL 时，`gobuscachex.NewBroadcast` 用 go-bus 做同样的事，每个实例一个队列，轮询取消息。用 Redis 时，实例断线期间发布的消息会丢；用 go-bus 时消息留在它的队列里，除非订阅已经过期。不管哪种，实例每次重新订阅时都清空自己的内存层：这样丢一条消息的代价是内存层变冷，而不是读到旧值。广播只碰后端在进程内的层（`ottercachex`、`bigcachex`，或者自己实现了 `cachex.LocalBackend` 的后端），开了广播就至少要有一个这样的层。发布失败会再试两次（比如用到了一条已被数据库断开的池内连接）；仍然失败就记 ERROR 日志，不返回错误，其他实例的内存层会一直留着旧值，直到它腐烂：内存层的 TTL 就是这种情况下读旧值的上限，按它来设。租约和失效广播都打开时，Redis 层的 TTL 可以设长，一次写入在消息到达时就在每个实例上可见。
+它用 Redis Pub/Sub（Redis Cluster 也可以）；没有 Redis、但数据库是 PostgreSQL 时，`gobuscachex.NewBroadcast` 用 go-bus 做同样的事，每个实例一个队列，轮询取消息。用 Redis 时，实例断线期间发布的消息会丢；用 go-bus 时消息留在它的队列里，除非订阅已经过期。不管哪种，实例每次重新订阅时都清空自己的内存层：这样丢一条消息的代价是内存层变冷，而不是读到旧值。广播只碰后端在进程内的层（`ottercachex`、`bigcachex`，或者自己实现了 `cachex.LocalBackend` 的后端），开了广播就至少要有一个这样的层。发布失败会再试两次（比如用到了一条已被数据库断开的池内连接）；仍然失败就记 ERROR 日志，不返回错误，其他实例会从内存层返回旧值，直到它在那里不再新鲜（之后会刷新，或者未命中去读共享层）：内存层的新鲜期就是这种情况下读旧值的上限，按它来设。租约和失效广播都打开时，Redis 层的 TTL 可以设长，一次写入在消息到达时就在每个实例上可见。
 
 ## 选项
 
@@ -173,7 +173,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 - **不存在的 key 返回 `nil, nil`。** 零值会被当成真实的值缓存起来。应该返回 `cachex.ErrNotFound`（包装一层也可以）。
 - **`BatchSource.GetMany` 返回 `ErrNotFound`。** 这次调用的所有 key 都会读成不存在，但什么也不缓存，所以每次读取都会再回源。不存在的 key 不放进 map 就行；部分 key 失败时，原样返回 `*cachex.BatchError`，不要再包装。
 - **在数据源里依赖调用方的取消。** 一次回源由等这个 key 的所有调用方共用，所以它的 ctx 不会因为某个调用方离开而结束，而是由 `WithFetchTimeout` 限时，并保留调用方的值。不要使用里面属于某个调用方的状态，比如数据库事务（`cachex.IsShared(ctx)` 能判断这是回源用的 ctx）。
-- **在数据源里调用同一个 `Cache`。** 要读的 key 如果正由这次回源自己在取（同一个 key，或者同一次 `GetMany` 里的另一个 key），就会等它自己：这种调用会立即失败，错误里写明原因。数据源需要的东西直接从数据库读，或者用另一个 `Cache`。
+- **在数据源里调用同一个 `Cache`。** 要读的 key 如果正由这次调用自己在问数据源（同一个 key、同一次 `BatchSource` 调用里的 key，或者它的数据源又回调回来读这个 key），就会等它自己：这种调用会立即失败，错误里写明原因。同一次 `GetMany` 里还在排队的 key，会在调用方占着的额度里当场去问；正在问的就等它。更好的做法是直接从数据库读，或者用另一个 `Cache`。
 - **数据源没有 `GetMany`，却有大批量的 `GetMany` 调用。** key 会逐个回源（同时最多 `WithGetManyConcurrency` 个），默认情况下并发的 `Get` 碰上还在排队的 key，要等它轮到。请实现 `BatchSource`，或者把 `WithGetManyChunkSize` 设成 `WithGetManyConcurrency` 左右。
 
 **读取**
@@ -207,7 +207,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 
 **生命周期**
 
-- **`Cache` 还在工作时就关闭后端。** 先调用 `Close`：开了失效广播的，它停止监听广播；它会等正在进行的回源和它们的回填、后台刷新，以及放弃等待的写入要补做的失效。
+- **`Cache` 还在工作时就关闭后端。** 先调用 `Close`：开了失效广播的，它停止监听广播；它会等正在进行的回源和它们的回填、后台刷新，以及放弃等待的写入要补做的失效（和随后的广播发布）。
 - **读完马上退出进程**（命令行工具、定时任务）。读取在结果写进各层之前就返回了，进程可能在 Redis 或数据表写好之前就结束，下次运行又得回源。退出前调用 `Close`。
 
 ## 文档
