@@ -173,7 +173,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 - **不存在的 key 返回 `nil, nil`。** 零值会被当成真实的值缓存起来。应该返回 `cachex.ErrNotFound`（包装一层也可以）。
 - **`BatchSource.GetMany` 返回 `ErrNotFound`。** 这次调用的所有 key 都会读成不存在，但什么也不缓存，所以每次读取都会再回源。不存在的 key 不放进 map 就行；部分 key 失败时，原样返回 `*cachex.BatchError`，不要再包装。
 - **在数据源里依赖调用方的取消。** 一次回源由等这个 key 的所有调用方共用，所以它的 ctx 不会因为某个调用方离开而结束，而是由 `WithFetchTimeout` 限时，并保留调用方的值。不要使用里面属于某个调用方的状态，比如数据库事务（`cachex.IsShared(ctx)` 能判断这是回源用的 ctx）。
-- **在数据源里调用同一个 `Cache`。** 要读的 key 如果正由这次调用自己在问数据源（同一个 key、同一次 `BatchSource` 调用里的 key，或者它的数据源又回调回来读这个 key），就会等它自己：这种调用会立即失败，错误里写明原因。同一次 `GetMany` 里还在排队的 key，会在调用方占着的额度里当场去问；正在问的就等它。更好的做法是直接从数据库读，或者用另一个 `Cache`。
+- **在数据源里调用同一个 `Cache`。** 要读的 key 如果正由这次调用自己在问数据源（同一个 key，或者同一次 `BatchSource` 调用里的 key），就会等它自己：这种调用会立即失败，错误里写明原因。经别的 key 绕成的环（a 的数据源读 b，b 的又读 a）认不出来，到回源超时才失败。同一次 `GetMany` 里还在排队的 key，会在调用方占着的额度里当场去问；正在问的就等它。更好的做法是直接从数据库读，或者用另一个 `Cache`。
 - **数据源没有 `GetMany`，却有大批量的 `GetMany` 调用。** key 会逐个回源（同时最多 `WithGetManyConcurrency` 个），默认情况下并发的 `Get` 碰上还在排队的 key，要等它轮到。请实现 `BatchSource`，或者把 `WithGetManyChunkSize` 设成 `WithGetManyConcurrency` 左右。
 
 **读取**

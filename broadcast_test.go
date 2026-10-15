@@ -522,19 +522,23 @@ func TestALateDropPublishesAfterReleasingItsStripe(t *testing.T) {
 	}
 }
 
-// gatedBroadcast holds its second publish until gate closes, and counts the
-// publishes that finished.
+type lateTag struct{}
+
+// gatedBroadcast holds the second publish of a ctx tagged lateTag (the first
+// is the write's own, as it gives up; the second its late drop's) until gate
+// closes, and counts the late ones that finished.
 type gatedBroadcast struct {
 	cachex.Broadcast
-	gate  chan struct{}
-	calls atomic.Int64
-	done  atomic.Int64
+	gate   chan struct{}
+	tagged atomic.Int64
+	done   atomic.Int64
 }
 
 func (g *gatedBroadcast) Publish(ctx context.Context, msg []byte) error {
-	if g.calls.Add(1) == 2 {
-		<-g.gate
+	if ctx.Value(lateTag{}) == nil || g.tagged.Add(1) == 1 {
+		return g.Broadcast.Publish(ctx, msg)
 	}
+	<-g.gate
 	defer g.done.Add(1)
 	return g.Broadcast.Publish(ctx, msg)
 }
@@ -551,11 +555,11 @@ func TestCloseWaitsForALateDropsPublish(t *testing.T) {
 	}, cachex.WithBroadcast(gated))
 	require.Eventually(t, func() bool { return bus.Subscribed() > sub }, 5*time.Second, time.Millisecond)
 
-	go func() { _ = c.Set(ctx, "k", "v1") }() // holds k's stripe: publish 1 after it
+	go func() { _ = c.Set(ctx, "k", "v1") }() // holds k's stripe
 	<-bl.entered
-	wctx, cancel := context.WithCancel(ctx)
+	wctx, cancel := context.WithCancel(context.WithValue(ctx, lateTag{}, true)) // its publishes keep the tag
 	cancel()
-	require.Error(t, c.Set(wctx, "k", "v2"), "gives up: its drop runs, and publishes (2), once the stripe is free")
+	require.Error(t, c.Set(wctx, "k", "v2"), "gives up: its drop runs, and publishes, once the stripe is free")
 
 	go func() {
 		time.Sleep(100 * time.Millisecond) // Close is waiting by now
@@ -564,5 +568,5 @@ func TestCloseWaitsForALateDropsPublish(t *testing.T) {
 		close(gated.gate)
 	}()
 	require.NoError(t, c.Close())
-	assert.Equal(t, int64(2), gated.done.Load(), "Close returned before the late drop's publish")
+	assert.Equal(t, int64(1), gated.done.Load(), "Close returned before the late drop's publish")
 }

@@ -303,23 +303,6 @@ func TestASourceCallingBackForAKeyBeingAskedWaitsForIt(t *testing.T) {
 	assert.Equal(t, map[string]string{"a": "a+b", "b": "b"}, got)
 }
 
-func TestACallbackCycleFailsAtOnce(t *testing.T) {
-	var c *cachex.Cache[string]
-	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
-		v, err := c.Get(ctx, map[string]string{"a": "b", "b": "a"}[key]) // a needs b, b needs a
-		return key + v, err
-	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
-		cachex.WithFetchTimeout(time.Hour))
-	done := make(chan error, 1)
-	go func() { _, err := c.Get(context.Background(), "a"); done <- err }()
-	select {
-	case err := <-done:
-		requireCallbackError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("a's source waited for b, whose source waited for a")
-	}
-}
-
 // batchFunc adapts a function to a BatchSource (and a Source of one key).
 type batchFunc func(ctx context.Context, keys []string) (map[string]string, error)
 
@@ -374,4 +357,84 @@ func TestASourceCanReadAnotherKeyOfItsCache(t *testing.T) {
 	v, err := c.Get(context.Background(), "a")
 	require.NoError(t, err)
 	assert.Equal(t, "a+b", v)
+}
+
+// A fetch started by a source (i's source -> Get(y)) does not take over a key
+// of the source's fetch (y's source -> Get(j)): it waits, so j is never asked
+// outside the fetch that leads it, nor twice, even once i gave up on y.
+func TestANestedFetchDoesNotTakeOverTheCallersKeys(t *testing.T) {
+	testNestedTakeover(t, cachextest.NewMap[string]())
+}
+
+func TestANestedFetchDoesNotTakeOverTheCallersKeysWithLeases(t *testing.T) {
+	testNestedTakeover(t, cachextest.NewLeasingMap[string]())
+}
+
+func testNestedTakeover(t *testing.T, b cachex.Backend[string]) {
+	var c *cachex.Cache[string]
+	var jCalls atomic.Int64
+	jStarted, releaseJ, iDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		switch key {
+		case "i":
+			v, err := c.Get(ctx, "y")
+			close(iDone)
+			return "i+" + v, err
+		case "y":
+			v, err := c.Get(ctx, "j")
+			return "y+" + v, err
+		case "j":
+			if jCalls.Add(1) == 1 {
+				once.Do(func() { close(jStarted) })
+				<-releaseJ
+			}
+			return "j", nil
+		}
+		return key, nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](b, cachex.TTL(time.Minute, 0))},
+		cachex.WithFetchTimeout(300*time.Millisecond), cachex.WithGetManyConcurrency(1))
+	outer := make(chan struct{})
+	go func() { defer close(outer); _, _ = c.GetMany(context.Background(), []string{"i", "j"}) }()
+	defer func() { <-outer; _ = c.Close() }()
+	<-jStarted
+	<-iDone
+	defer close(releaseJ)
+	time.Sleep(50 * time.Millisecond) // let the wave end
+	go func() { _, _ = c.Get(context.Background(), "j") }()
+	require.Never(t, func() bool { return jCalls.Load() > 1 }, 500*time.Millisecond, 10*time.Millisecond,
+		"j asked again while the takeover is still asking for it")
+}
+
+// A refresh started by a source's read of a stale key is not that source's
+// call: its own source reading the first key waits for it, it does not fail.
+func TestARefreshStartedFromASourceIsNotItsCall(t *testing.T) {
+	clock, now := newClock()
+	var c *cachex.Cache[string]
+	releaseI := make(chan struct{})
+	xErr := make(chan error, 1)
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		switch key {
+		case "i":
+			v, err := c.Get(ctx, "x") // stale: returned at once, refreshed in the background
+			<-releaseI
+			return "i+" + v, err
+		case "x":
+			_, err := c.Get(ctx, "i")
+			xErr <- err
+			return "x2", nil
+		}
+		return key, nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, time.Hour))},
+		cachex.WithFetchTimeout(time.Hour), now)
+	require.NoError(t, c.Set(context.Background(), "x", "x1"))
+	clock.Advance(2 * time.Minute)
+	go func() { _, _ = c.Get(context.Background(), "i") }()
+	select {
+	case err := <-xErr:
+		t.Fatalf("x's refresh failed to read i at once: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseI)
+	require.NoError(t, <-xErr)
 }
