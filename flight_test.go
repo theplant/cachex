@@ -2,6 +2,7 @@ package cachex_test
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -252,55 +253,81 @@ func TestASourceCallingBackForItsOwnKeyFailsAtOnce(t *testing.T) {
 	requireCallbackError(t, inner)
 }
 
-func TestASourceCallingBackForAKeyWaitingItsTurnAsksForIt(t *testing.T) {
-	var c *cachex.Cache[string]
-	var calls sync.Map
-	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
-		n, _ := calls.LoadOrStore(key, new(atomic.Int64))
-		n.(*atomic.Int64).Add(1)
-		if key == "a" {
-			v, err := c.Get(ctx, "b") // b waits for a's turn: GetMany asks one key at a time
-			return "a+" + v, err
-		}
-		return key, nil
-	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
-		cachex.WithFetchTimeout(time.Hour), cachex.WithGetManyConcurrency(1))
-	type res struct {
-		got map[string]string
-		err error
-	}
-	done := make(chan res, 1)
-	go func() {
-		got, err := c.GetMany(context.Background(), []string{"a", "b"})
-		done <- res{got, err}
-	}()
-	select {
-	case r := <-done:
-		require.NoError(t, r.err)
-		assert.Equal(t, map[string]string{"a": "a+b", "b": "b"}, r.got)
-		n, _ := calls.Load("b")
-		assert.Equal(t, int64(1), n.(*atomic.Int64).Load(), "b asked once, by a's source, in a's turn")
-	case <-time.After(5 * time.Second):
-		t.Fatal("a's source waited for b, which waited for a's turn")
+func TestASourceCallingBackForAKeyOfItsGetManyFailsAtOnce(t *testing.T) {
+	// whether b waits for a's turn (one at a time) or is being asked beside
+	// it, a's source reading b through the Cache fails at once: the rule is
+	// that a source does not read the keys of its own fetch that way
+	for _, conc := range []int{1, 2} {
+		t.Run(fmt.Sprint("concurrency ", conc), func(t *testing.T) {
+			var c *cachex.Cache[string]
+			aCalled := make(chan struct{})
+			c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+				if key == "a" {
+					v, err := c.Get(ctx, "b")
+					close(aCalled)
+					return "a+" + v, err
+				}
+				if conc > 1 {
+					<-aCalled // b answers only once a's call for it returned
+				}
+				return key, nil
+			}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
+				cachex.WithFetchTimeout(time.Hour), cachex.WithGetManyConcurrency(conc))
+			type res struct {
+				got map[string]string
+				err error
+			}
+			done := make(chan res, 1)
+			go func() {
+				got, err := c.GetMany(context.Background(), []string{"a", "b"})
+				done <- res{got, err}
+			}()
+			select {
+			case r := <-done:
+				requireCallbackError(t, r.err)
+				assert.Equal(t, map[string]string{"b": "b"}, r.got)
+			case <-time.After(5 * time.Second):
+				t.Fatal("a's source waited for b")
+			}
+		})
 	}
 }
 
-func TestASourceCallingBackForAKeyBeingAskedWaitsForIt(t *testing.T) {
+func TestASourceCallingBackForAKeyItsFetchJoinedFailsAtOnce(t *testing.T) {
+	// b of the GetMany takes the answer of a refresh of b, and is published
+	// only after a's call: a's source reading b would wait for it
+	clock, now := newClock()
+	m := cachextest.NewMap[string]()
 	var c *cachex.Cache[string]
-	aCalling := make(chan struct{})
+	bStarted, releaseB := make(chan struct{}), make(chan struct{})
+	var once sync.Once
 	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
 		if key == "a" {
-			close(aCalling)
-			v, err := c.Get(ctx, "b") // b is being asked at the same time
+			once.Do(func() { close(releaseB) })
+			v, err := c.Get(ctx, "b")
 			return "a+" + v, err
 		}
-		<-aCalling // b answers only after a started waiting for it
+		close(bStarted)
+		<-releaseB
 		return key, nil
-	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
-		cachex.WithFetchTimeout(time.Hour), cachex.WithGetManyConcurrency(2))
-	got, err := c.GetMany(context.Background(), []string{"a", "b"})
+	}), []cachex.Layer[string]{cachex.NewLayer[string](m, cachex.TTL(time.Minute, time.Hour))},
+		cachex.WithFetchTimeout(time.Hour), now)
+	defer func() { _ = c.Close() }()
+	ctx := context.Background()
+	require.NoError(t, c.Set(ctx, "b", "b1"))
+	clock.Advance(2 * time.Minute)
+	_, err := c.Get(ctx, "b") // stale: refreshed
 	require.NoError(t, err)
-	assert.Equal(t, map[string]string{"a": "a+b", "b": "b"}, got)
+	<-bStarted
+	require.NoError(t, m.Del(ctx, "b")) // gone from the layer while its refresh asks the source
+	done := make(chan error, 1)
+	go func() { _, err := c.GetMany(ctx, []string{"a", "b"}); done <- err }()
+	select {
+	case err := <-done:
+		requireCallbackError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a's source waited for b")
+	}
 }
 
 // batchFunc adapts a function to a BatchSource (and a Source of one key).

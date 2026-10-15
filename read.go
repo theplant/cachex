@@ -223,9 +223,9 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (
 		return f.Result()
 	default:
 	}
-	if err := c.callback(ctx, key, f); err != nil {
+	if p, ok := ctx.Value(inSourceKey{}).(*claimed[T]); ok && p.c == c && p.leads(f) {
 		var zero T
-		return zero, err
+		return zero, fmt.Errorf("cachex: the source called back into the same Cache for %q, which its fetch is fetching", key)
 	}
 	select {
 	case <-f.Done():
@@ -270,12 +270,6 @@ type claimed[T any] struct {
 	keys    []string        // the keys, for the backends' calls
 	ks      []claimedKey[T] // what the fetch knows of each key, in the same order
 	refresh bool            // stale entries below do not count
-
-	// the turns of keys asked a few at a time (see askSourceOwn), and the
-	// asks a source took over (see callback), which it waits for
-	waveMu   sync.Mutex
-	wave     sync.WaitGroup
-	waveDone bool // no more takeovers: its wait began
 }
 
 // claimedKey is what a fetch knows of one key it leads.
@@ -286,92 +280,23 @@ type claimedKey[T any] struct {
 	gen    uint64         // write generation from before the fetch read below it
 	leases *keyLeases     // nil: none taken or refused (see Leaser)
 	source *sourceCall[T] // set while the fetch asks the source for the key (see askSource)
-	ask    int32          // askQueued while it waits for a turn to ask the source (see askSourceOwn); under waveMu
 }
-
-// The states of claimedKey.ask: a key asked in turn is queued until its turn
-// comes, or until the source, asking for another key, calls back for it and
-// asks for it at once (see callback).
-const (
-	askNone int32 = iota
-	askQueued
-	askTaken
-)
 
 func (c *Cache[T]) claim(refresh bool) *claimed[T] { return &claimed[T]{c: c, refresh: refresh} }
 
-// inSourceKey keys the *sourceMark of the context a fetch passes to the
-// source, so that the source calling back into the Cache is recognized (see
-// callback). Only that call's own wait looks at it: a fetch started from
-// there marks its own source calls.
+// inSourceKey marks the context a fetch passes to the source with the fetch
+// (*claimed), so that a call of the source back into the Cache for a key the
+// fetch leads fails at once instead of waiting for itself (see await).
 type inSourceKey struct{}
 
-// sourceMark is a fetch (owner, a *claimed of some Cache) asking the source
-// for its keys self, with its fetch context fctx.
-type sourceMark struct {
-	owner any
-	self  []int
-	fctx  context.Context
-}
-
-// markSource returns sctx marked as p asking the source for self.
-func markSource[T any](sctx, fctx context.Context, p *claimed[T], self []int) context.Context {
-	return context.WithValue(sctx, inSourceKey{}, &sourceMark{owner: p, self: self, fctx: fctx})
-}
-
-// index returns the index of the flight f in p, or -1.
-func (p *claimed[T]) index(f *flight.Flight[T]) int {
+// leads reports whether p leads the flight f.
+func (p *claimed[T]) leads(f *flight.Flight[T]) bool {
 	for i := range p.ks {
 		if p.ks[i].flight == f {
-			return i
+			return true
 		}
 	}
-	return -1
-}
-
-// callback handles a wait for f from the source of a fetch that ctx marks
-// (see sourceMark): an error if f is a key that very call is asking for (it
-// would wait for itself); if f is a key of the same fetch still waiting for
-// its turn to ask the source, it asks for it now, in this goroutine, whose
-// own turn is spent waiting for it anyway, counted in the fetch's wait for
-// its turns.
-func (c *Cache[T]) callback(ctx context.Context, key string, f *flight.Flight[T]) error {
-	m, _ := ctx.Value(inSourceKey{}).(*sourceMark)
-	if m == nil {
-		return nil
-	}
-	p, ok := m.owner.(*claimed[T])
-	if !ok || p.c != c {
-		return nil
-	}
-	j := p.index(f)
-	if j < 0 {
-		return nil
-	}
-	if slices.Contains(m.self, j) {
-		return fmt.Errorf("cachex: the source called back into the same Cache for %q, which it is fetching", key)
-	}
-	if p.takeTurn(j, true) {
-		defer p.wave.Done()
-		c.askInTurn(m.fctx, p, j)
-	}
-	return nil
-}
-
-// takeTurn moves flight j from waiting for its turn to being asked, and
-// reports whether it did. A takeover (see callback) also counts in p.wave,
-// unless the fetch's wait for its turns began.
-func (p *claimed[T]) takeTurn(j int, takeover bool) bool {
-	p.waveMu.Lock()
-	defer p.waveMu.Unlock()
-	if p.ks[j].ask != askQueued || takeover && p.waveDone {
-		return false
-	}
-	p.ks[j].ask = askTaken
-	if takeover {
-		p.wave.Add(1)
-	}
-	return true
+	return false
 }
 
 // add makes p lead the flight f of key.
@@ -653,45 +578,28 @@ func (c *Cache[T]) askSourceOwn(ctx context.Context, p *claimed[T], idxs []int, 
 		c.askSourceChunk(ctx, p, idxs)
 		return
 	}
-	p.waveMu.Lock()
-	for _, i := range idxs {
-		p.ks[i].ask = askQueued
-	}
-	p.waveMu.Unlock()
+	var wg sync.WaitGroup
 	sem := make(chan struct{}, conc)
 	for _, i := range idxs {
 		sem <- struct{}{}
-		if !p.takeTurn(i, false) { // a source calling back asked for it
-			<-sem
-			continue
-		}
-		p.wave.Go(func() {
+		wg.Go(func() {
 			defer func() { <-sem }()
-			c.askInTurn(ctx, p, i)
+			p.run(ctx, []int{i}, func() {
+				if c.leasers != nil {
+					c.renew(ctx, p, i)
+				}
+				c.askSourceOne(ctx, p, i)
+			})
 		})
 	}
-	p.waveMu.Lock()
-	p.waveDone = true // every key has had its turn: no takeover can start
-	p.waveMu.Unlock()
-	p.wave.Wait()
-}
-
-// askInTurn asks the source for flight i of a fetch that asks its keys a few
-// at a time (see askSourceOwn).
-func (c *Cache[T]) askInTurn(ctx context.Context, p *claimed[T], i int) {
-	p.run(ctx, []int{i}, func() {
-		if c.leasers != nil {
-			c.renew(ctx, p, i)
-		}
-		c.askSourceOne(ctx, p, i)
-	})
+	wg.Wait()
 }
 
 func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], i int) {
 	key := p.keys[i]
 	sctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	defer cancel()
-	value, err := c.source.Get(markSource(sctx, ctx, p, []int{i}), key)
+	value, err := c.source.Get(context.WithValue(sctx, inSourceKey{}, p), key)
 	switch {
 	case err == nil:
 		p.settle(sctx, len(c.layers), []int{i}, []Entry[T]{c.answer(value, false)})
@@ -707,7 +615,7 @@ func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], i int) {
 func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], idxs []int) {
 	sctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	defer cancel()
-	values, err := c.batchSource.GetMany(markSource(sctx, ctx, p, idxs), keysAt(p.keys, idxs))
+	values, err := c.batchSource.GetMany(context.WithValue(sctx, inSourceKey{}, p), keysAt(p.keys, idxs))
 	answered := make([]int, 0, len(idxs))
 	entries := make([]Entry[T], 0, len(idxs))
 	for _, i := range idxs {
