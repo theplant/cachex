@@ -221,6 +221,15 @@ func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (
 	select {
 	case <-f.Done():
 		return f.Result()
+	default:
+	}
+	if p, ok := ctx.Value(inSourceKey{}).(*claimed[T]); ok && p.c == c && p.leads(f) {
+		var zero T
+		return zero, fmt.Errorf("cachex: the source called back into the same Cache for %q, which its fetch is fetching", key)
+	}
+	select {
+	case <-f.Done():
+		return f.Result()
 	case <-ctx.Done():
 	}
 	select { // a result that arrived together with ctx's end wins
@@ -274,6 +283,21 @@ type claimedKey[T any] struct {
 }
 
 func (c *Cache[T]) claim(refresh bool) *claimed[T] { return &claimed[T]{c: c, refresh: refresh} }
+
+// inSourceKey marks the context a fetch passes to the source with the fetch
+// (*claimed), so that a call of the source back into the Cache for a key the
+// fetch leads fails at once instead of waiting for itself (see await).
+type inSourceKey struct{}
+
+// leads reports whether p leads the flight f.
+func (p *claimed[T]) leads(f *flight.Flight[T]) bool {
+	for i := range p.ks {
+		if p.ks[i].flight == f {
+			return true
+		}
+	}
+	return false
+}
 
 // add makes p lead the flight f of key.
 func (p *claimed[T]) add(key string, fk flightKey, f *flight.Flight[T], seen uint64) {
@@ -560,7 +584,12 @@ func (c *Cache[T]) askSourceOwn(ctx context.Context, p *claimed[T], idxs []int, 
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			p.run(ctx, []int{i}, func() { c.askSourceOne(ctx, p, i) })
+			p.run(ctx, []int{i}, func() {
+				if c.leasers != nil {
+					c.renew(ctx, p, i)
+				}
+				c.askSourceOne(ctx, p, i)
+			})
 		})
 	}
 	wg.Wait()
@@ -570,7 +599,7 @@ func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], i int) {
 	key := p.keys[i]
 	sctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	defer cancel()
-	value, err := c.source.Get(sctx, key)
+	value, err := c.source.Get(context.WithValue(sctx, inSourceKey{}, p), key)
 	switch {
 	case err == nil:
 		p.settle(sctx, len(c.layers), []int{i}, []Entry[T]{c.answer(value, false)})
@@ -586,7 +615,7 @@ func (c *Cache[T]) askSourceOne(ctx context.Context, p *claimed[T], i int) {
 func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], idxs []int) {
 	sctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	defer cancel()
-	values, err := c.batchSource.GetMany(sctx, keysAt(p.keys, idxs))
+	values, err := c.batchSource.GetMany(context.WithValue(sctx, inSourceKey{}, p), keysAt(p.keys, idxs))
 	answered := make([]int, 0, len(idxs))
 	entries := make([]Entry[T], 0, len(idxs))
 	for _, i := range idxs {
@@ -617,8 +646,7 @@ func (c *Cache[T]) askSourceChunk(ctx context.Context, p *claimed[T], idxs []int
 // holds from a later answer of the source (a later CachedAt): held up, it
 // would otherwise undo a refresh. An answer of the source needs no such check
 // (the source is asked once at a time, see askSource, so no other answer is
-// newer), nor does a layer that leases (only the holder of its lease writes
-// it).
+// newer). A layer that leases is checked too (see putLeased).
 func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	ok, end := c.beginFills(fills)
 	defer end()
@@ -632,7 +660,7 @@ func (c *Cache[T]) backfill(ctx context.Context, origin int, fills []fill[T]) {
 	now := c.opts.now()
 	for j := origin - 1; j >= 0; j-- {
 		if c.leasers != nil && c.leasers[j] != nil {
-			c.putLeased(ctx, j, fills, ok, now)
+			c.putLeased(ctx, j, fills, ok, origin < len(c.layers), now)
 			continue
 		}
 		var newer map[string]error
@@ -654,7 +682,7 @@ func (c *Cache[T]) backfillOne(ctx context.Context, origin int, f fill[T]) {
 	now := c.opts.now()
 	for j := origin - 1; j >= 0; j-- {
 		if c.leasers != nil && c.leasers[j] != nil {
-			c.putLeasedOne(ctx, j, &f, now)
+			c.putLeasedOne(ctx, j, &f, origin < len(c.layers), now)
 			continue
 		}
 		if origin < len(c.layers) && c.newerInOne(ctx, j, f.key, f.entry.CachedAt) {

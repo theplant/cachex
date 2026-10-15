@@ -73,7 +73,15 @@ func StartCleanup(ctx context.Context, cfg CleanupConfig) (*Cleanup, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	q, err := pg.NewWithOptions(pg.Options{DB: cfg.DB, DBMigrate: true})
+	// instances that start at once race to create go-que's tables, and all
+	// but one fail; once they exist, migrating again does nothing
+	var q que.Queue
+	var err error
+	for range 3 {
+		if q, err = pg.NewWithOptions(pg.Options{DB: cfg.DB, DBMigrate: true}); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("goquecachex: StartCleanup: %w", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -397,4 +398,126 @@ func TestAGoexitUnderTheListenerDoesNotEndIt(t *testing.T) {
 		_, ok := stored(t, bLocal.Map, "k")
 		return !ok
 	}, 5*time.Second, 5*time.Millisecond, "b hears a's writes again")
+}
+
+// flakyBroadcast fails the first fails publishes, then passes them on.
+type flakyBroadcast struct {
+	cachex.Broadcast
+	mu        sync.Mutex
+	fails     int
+	calls, ok int
+}
+
+func (f *flakyBroadcast) Publish(ctx context.Context, msg []byte) error {
+	f.mu.Lock()
+	f.calls++
+	failing := f.calls <= f.fails
+	if !failing {
+		f.ok++
+	}
+	f.mu.Unlock()
+	if failing {
+		return errBoom
+	}
+	return f.Broadcast.Publish(ctx, msg)
+}
+
+func (f *flakyBroadcast) counts() (calls, ok int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, f.ok
+}
+
+func TestAPublishThatFailsIsRetried(t *testing.T) {
+	ctx := context.Background()
+	bus := cachextest.NewBus()
+	shared := cachextest.NewLeasingMap[string]()
+	src := newSource(map[string]string{"k": "v1"})
+	flaky := &flakyBroadcast{Broadcast: bus.Broadcast(), fails: 1} // a connection the database dropped, say
+	a := newInstance(t, src, shared, bus, cachex.WithBroadcast(flaky))
+	b := newInstance(t, src, shared, bus)
+	_, err := b.c.Get(ctx, "k")
+	require.NoError(t, err)
+	cachex.Settle(b.c)
+
+	src.set("k", "v2")
+	require.NoError(t, a.c.Set(ctx, "k", "v2"))
+	eventuallyGone(t, b.local, "k", "the retried publish reached b")
+}
+
+func TestAChunkThatFailsToPublishDoesNotStopTheOthers(t *testing.T) {
+	ctx := context.Background()
+	var logs bytes.Buffer
+	bus := cachextest.NewBus()
+	flaky := &flakyBroadcast{Broadcast: bus.Broadcast(), fails: 3} // every attempt of the first message
+	a := newInstance(t, newSource(nil), cachextest.NewLeasingMap[string](), bus,
+		cachex.WithBroadcast(flaky), cachex.WithLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	keys := make([]string, 1001) // two messages
+	for i := range keys {
+		keys[i] = fmt.Sprint("k", i)
+	}
+	require.NoError(t, a.c.DelMany(ctx, keys))
+	calls, ok := flaky.counts()
+	assert.Equal(t, 1, ok, "the second message was published after the first failed")
+	assert.Equal(t, 4, calls, "three attempts for the first message, one for the second")
+	assert.Contains(t, logs.String(), "level=ERROR")
+}
+
+// A late drop publishes only after it released its stripe: a resubscription's
+// clear waits for every stripe, and cachextest.Bus.Publish waits for a
+// listener's full buffer under the bus's lock, so a publish holding the
+// stripe would leave the listener stuck and every publisher with it.
+func TestALateDropPublishesAfterReleasingItsStripe(t *testing.T) {
+	ctx := context.Background()
+	src := newSource(map[string]string{})
+	shared := cachextest.NewLeasingMap[string]()
+	bus := cachextest.NewBus()
+	aMap := cachextest.NewMap[string]()
+	sub := bus.Subscribed()
+	var key, low string
+	bl := &blocker{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	a := cachex.New[string](src, []cachex.Layer[string]{
+		cachex.NewLayer[string](localHooked{bl.wrap(aMap), aMap}, cachex.TTL(time.Hour, 0)),
+		cachex.NewLayer[string](shared, cachex.TTL(time.Hour, 0)),
+	}, cachex.WithBroadcast(bus.Broadcast()), cachex.WithFetchTimeout(100*time.Millisecond))
+	require.Eventually(t, func() bool { return bus.Subscribed() > sub }, 5*time.Second, time.Millisecond)
+	for i := 0; key == "" || low == ""; i++ {
+		k := "k" + strconv.Itoa(i)
+		if key == "" && cachex.StripeIndex(a, k) > 0 {
+			key = k
+		} else if key != "" && cachex.StripeIndex(a, k) < cachex.StripeIndex(a, key) {
+			low = k
+		}
+	}
+	bl.key = key
+
+	go func() { _ = a.Set(ctx, key, "v1") }() // holds key's stripe, blocked in the memory layer
+	<-bl.entered
+	wctx, cancel := context.WithCancel(ctx)
+	cancel()
+	require.Error(t, a.Set(wctx, key, "v2"), "gives up; its late drop waits for the stripe")
+
+	bus.Reconnect()                     // a's listener clears: it takes every stripe in order, and waits at key's
+	require.Eventually(t, func() bool { // the clear holds low's stripe: the listener is stuck
+		c, cancel := context.WithCancel(ctx)
+		cancel()
+		return a.Set(c, low, "x") != nil
+	}, 5*time.Second, time.Millisecond)
+
+	filled := make(chan struct{})
+	go func() { // fill a's listener buffer, and one more
+		raw := bus.Broadcast()
+		for range 1100 {
+			_ = raw.Publish(ctx, []byte("not a message"))
+		}
+		close(filled)
+	}()
+	time.Sleep(100 * time.Millisecond) // let the filler block on the full buffer
+	close(bl.release)                  // the first write ends; the late drop takes the stripe and publishes
+
+	select {
+	case <-filled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock: a's listener waits in clearLocal for a stripe held by a late drop, which waits in Publish for the bus, which waits for a's listener")
+	}
 }

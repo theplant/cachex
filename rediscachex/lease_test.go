@@ -2,10 +2,12 @@ package rediscachex
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -318,4 +320,37 @@ func TestALeasedEntryThatDoesNotEncodeEndsItsLease(t *testing.T) {
 	again, err := l.Lease(ctx, []string{"k"}, time.Minute)
 	require.NoError(t, err)
 	assert.NotEmpty(t, again["k"], "the lease ended, not left until its TTL")
+}
+
+type lostReply struct{ armed *atomic.Bool }
+
+func (lostReply) DialHook(next redis.DialHook) redis.DialHook          { return next }
+func (lostReply) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (h lostReply) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		err := next(ctx, cmds)
+		if len(cmds) > 0 && cmds[0].Name() == "set" && h.armed.CompareAndSwap(true, false) {
+			return errors.New("i/o timeout") // the commands landed, their replies did not
+		}
+		return err
+	}
+}
+
+// A Lease whose commands landed but whose replies were lost (after go-redis's
+// own retries) reports the key failed, and ends the lease it may have taken:
+// left, a token nobody has would refuse the key to every instance until its
+// TTL.
+func TestAFailedLeaseLeavesNoLeaseBehind(t *testing.T) {
+	ctx := context.Background()
+	_, client := newRedis(t)
+	armed := &atomic.Bool{}
+	client.AddHook(lostReply{armed})
+	l := New[string](Config[string]{Client: client, KeyPrefix: "p:", Leases: true}).(cachex.Leasing[string]).Leaser()
+	armed.Store(true)
+	tokens, err := l.Lease(ctx, []string{"k"}, time.Minute)
+	require.Error(t, err)
+	require.Empty(t, tokens)
+	tokens, err = l.Lease(ctx, []string{"k"}, time.Minute)
+	require.NoError(t, err)
+	assert.NotEmpty(t, tokens["k"], "a lease nobody holds a token of blocks the key")
 }

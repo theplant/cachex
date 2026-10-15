@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -156,4 +157,24 @@ func TestTheCleanupSurvivesADroppedConnection(t *testing.T) {
 	_, err := db.ExecContext(context.Background(), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND datname = current_database()")
 	require.NoError(t, err)
 	runsReach(t, c, c.runs.Load()+2, "running again")
+}
+
+func TestInstancesThatStartAtOnceAllStart(t *testing.T) {
+	db := newDB(t) // go-que's tables do not exist yet
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	errs := make([]error, 6)
+	for i := range errs {
+		wg.Go(func() {
+			cl, err := StartCleanup(ctx, CleanupConfig{DB: db, Cleaner: &cleaner{}, Name: "at-once", Interval: time.Hour})
+			errs[i] = err
+			if err == nil {
+				t.Cleanup(func() { _ = cl.Stop(context.Background()) })
+			}
+		})
+	}
+	wg.Wait()
+	for i, err := range errs {
+		assert.NoError(t, err, "instance %d", i)
+	}
 }

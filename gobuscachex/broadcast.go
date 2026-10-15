@@ -16,6 +16,7 @@ import (
 	"time"
 
 	bus "github.com/qor5/go-bus"
+	"github.com/qor5/go-bus/bussql"
 
 	"github.com/theplant/cachex/v2"
 )
@@ -41,7 +42,9 @@ type BroadcastConfig struct {
 	// polls the database, which bounds how soon a message arrives. Default
 	// go-bus's.
 	WorkerConfig *bus.WorkerConfig
-	// Logger reports failed heartbeats. Default slog.Default().
+	// Logger reports failed heartbeats, lost subscriptions and failures to
+	// unsubscribe the expired subscriptions of dead instances. Default
+	// slog.Default().
 	Logger *slog.Logger
 }
 
@@ -79,6 +82,9 @@ type broadcast struct{ cfg BroadcastConfig }
 
 // Publish sends msg as the payload, which go-bus encodes as base64 JSON.
 func (b *broadcast) Publish(ctx context.Context, msg []byte) error {
+	// never in the caller's transaction (go-bus takes one from ctx): it may
+	// have ended, or roll back, and the message is the cache's, not the caller's
+	ctx = bussql.NewContext(ctx, nil)
 	if _, err := b.cfg.Bus.Publish(ctx, &bus.Outbound{Message: bus.Message{Subject: b.cfg.Subject, Payload: msg}}); err != nil {
 		return fmt.Errorf("gobuscachex: publish to %s: %w", b.cfg.Subject, err)
 	}

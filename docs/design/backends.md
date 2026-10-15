@@ -115,7 +115,7 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 `Config.Leases` 打开租约（默认关闭），机制见 [consistency.md](consistency.md#租约lease)。
 
 - **租约 key 和数据 key 在同一个 slot**：数据 key 带 hash tag 时，租约 key 是 `cachex-lease:t:` 加数据 key（hash tag 仍是第一个）；不带时是 `cachex-lease:{数据 key}`。`t:` 让 `X` 和 `{X}` 各有各的租约（没有它，两者的租约 key 是同一个）。含 `}` 却没有 hash tag 的 key 推不出来，`Cache` 拒绝它（[ADR 0019](../adr/0019-core-rejects-keys-without-a-redis-slot-for-their-lease.md)）。前缀和 key 都为空时也推不出来（`{}` 不是 hash tag，`cachex-lease:{}` 会落在别的 slot），开了租约时这个空 key 的写入报 `ErrUnsupportedKey`。`cachex-lease:` 开头的 key 留给租约：`New` 拒绝这样开头的 `KeyPrefix`；前缀为空（或是它的开头，比如 `cachex-`）时，拼上前缀之后落进这个命名空间的 key 不存：读成未命中，写入报 `ErrUnsupportedKey`，删除什么也不做，也不给它领租约，否则数据 key 会和某个租约 key 撞成同一个 Redis key。同一个 Redis 里别的程序也不要用它开头。开了租约时，`New` 还拒绝含括号却没有完整 hash tag 的 `KeyPrefix`：`p}` 下面的每个 key 都推不出租约 key，`a{` 和 Cache 接受的 `}b{c}` 拼成 `a{}b{c}`，第一个 tag 是空的。
-- **领租约读回令牌**：`SET NX PX` 之后在同一个 pipeline 里 `GET` 租约 key。go-redis 遇到网络错误会重试整个 pipeline：第一次的 `SET NX` 已经生效、只是回复丢了时，重试的 `SET NX` 失败，但 `GET` 读到的是这次调用的令牌，仍然算领到。否则这个 key 会被自己的孤儿租约挡住一个回源超时（默认 60 秒）：谁都不回填共享层，后台刷新也全部跳过。
+- **领租约读回令牌**：`SET NX PX` 之后在同一个 pipeline 里 `GET` 租约 key。go-redis 遇到网络错误会重试整个 pipeline：第一次的 `SET NX` 已经生效、只是回复丢了时，重试的 `SET NX` 失败，但 `GET` 读到的是这次调用的令牌，仍然算领到。否则这个 key 会被自己的孤儿租约挡住一个租约有效期：谁都不回填共享层，后台刷新也全部跳过。go-redis 的重试也用完、调用方只拿到错误时，`SET NX` 仍可能已经生效，所以出错的 key 再按本次生成的令牌 `Release` 一次（核对令牌，不会误删别人的租约）。
 - **领**：`SET 租约key 令牌 NX PX 有效期`，按 `ChunkSize` 走 pipeline。令牌是 128 位随机数。
 - **回填、释放**：Lua 脚本，「租约仍是这个令牌」的核对和写入（或删除、释放）在一个原子操作里。pipeline 里用 `EVALSHA`；节点上没有脚本（重启、`SCRIPT FLUSH`）报 `NOSCRIPT` 的 key，再用 `EVAL` 发一次，顺带把脚本装上。
 - **写入**：同一个 pipeline 里**先删租约 key、再写数据**。顺序反过来的话，写完数据、还没删租约的那一刻，持有旧令牌的回填仍能把旧值写进去。有测试截获 pipeline 检查这个顺序。
@@ -155,6 +155,8 @@ type row struct {
 |---|---|---|
 | PostgreSQL、SQLite | 逐字节 | 不需要额外处理 |
 | MySQL | 默认排序规则（`utf8mb4_0900_ai_ci`）**不区分大小写和重音** | `Migrate` 建表时使用 `utf8mb4_0900_bin`。建表前检查版本：低于 8.0.17 的 MySQL 和 MariaDB 都没有这个排序规则，会返回写明版本号的错误。表已经存在时，检查 `key` 列的排序规则，不是 `utf8mb4_0900_bin` 就返回错误，错误里带转换语句 |
+
+几个实例第一次同时 `Migrate` 时，建表会互相冲突（MySQL 报表已存在，PostgreSQL 报 `pg_type` 唯一约束冲突），所以 `Migrate` 失败后再试，最多三次：表建好之后再迁移什么也不做。有测试让六个实例同时迁移一张新表。
 
 `Migrate` 不替你改表。用 MySQL 默认配置建的表要自己转换：`ALTER TABLE <表> CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`。不调 `Migrate`、自己建表时，同样要用这个排序规则。
 
@@ -214,6 +216,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 只有失效广播的传输，不存条目：`NewBroadcast` 返回一个基于 go-bus（github.com/qor5/go-bus，PostgreSQL 上的发布订阅）的 `cachex.Broadcast`。go-bus 只支持 PostgreSQL，所以它只适合数据库是 PostgreSQL、又没有 Redis 的部署；缓存表在 MySQL 的项目要用它，得另起一个 PostgreSQL，不如用 `rediscachex.NewBroadcast`。机制见 [consistency.md](consistency.md#失效广播)。
 
 - **主题**默认 `cachex.invalidate`；几份缓存共用一个 go-bus 时，各给各的（只能是小写、用点分隔）。
+- **发布不进调用方的事务**：go-bus 会从 ctx 里取事务（`bussql.NewContext`），调用方按惯例用同一个 ctx 改完数据源、提交、再写缓存时，发布会跑进已经结束的事务。`Publish` 用 `bussql.NewContext(ctx, nil)` 把它屏蔽掉，消息总是独立提交（[ADR 0023](../adr/0023-invalidation-broadcast.md#修订2026-10-15)）。数据库断开所有连接后的第一次发布可能用到池里已断的连接而失败，`Cache` 会重试。
 - **每次 `Listen` 订阅一个自己的队列**（`cachex-` 加随机后缀），带 TTL（默认 1 分钟）和自动清空，订阅成功就调用 `ready`；`ctx` 结束时停掉消费者、退订（go-bus 的退订是软删除）。
 - **心跳**：go-bus 提供 `Heartbeat`，但要使用者自己定期调用，这里每 TTL 的三分之一调一次。订阅过期后 go-bus 不再往它的队列投递，`Heartbeat` 返回 `ErrSubscriptionNotFound`：这时可能漏了消息，就重新订阅，再调用一次 `ready`，`Cache` 清空本地层。数据库暂时连不上导致的心跳失败只记 WARN，下次再试，订阅在 TTL 内仍然有效。过期按数据库的 `NOW()` 判断，不受实例之间的时钟偏差影响。消费者自己停下（比如数据库出错）时也重新订阅。
 - **断线后恢复**：go-bus 的 quex 重建 worker 时复用同一个 go-que mutex，而 go-que v1.1.2 及以前，mutex 出一次错（比如连接断了）就作废，之后每次都报 `que: bad mutex`：数据库重启一次，消费者就永远停投，心跳却照常成功。修在 go-que（qor5/go-que#16：mutex 出错后断开连接、下次重连），go-bus 依赖它（qor5/go-bus#37）；有测试切断所有连接后检查投递恢复。数据库停摆期间 quex 的重连间隔指数增长（默认最长 30 秒，随机化后最多约 45 秒），所以数据库恢复后，投递最多要再等这么久才恢复；这期间的消息不丢，届时一起到达，但本地层可能读到别的实例已经改掉的值（停摆短于 TTL 时订阅不过期，也就不会清空本地层）。连接被切断而数据库一直可用时，间隔回到约 1 秒（quex 只在 worker 成功取过任务后才重置退避）。
@@ -229,6 +232,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 
 把 gormcachex 的 `DeleteExpired`（或者任何有这个方法的后端）做成 go-que（github.com/qor5/go-que）上的定时任务：`StartCleanup` 在每个实例上调用，同一时刻只有一个实例在跑。go-que 的队列只支持 PostgreSQL，被清理的表可以在别的数据库（比如 MySQL）。
 
+- **几个实例同时第一次启动**：go-que 建表在 PostgreSQL 上并发执行会互相冲突，所以建队列失败后再试，最多三次。
 - **一条自我续期的链**：任务带固定的 `UniqueID`（`cachex-cleanup:` 加 `Name`），生命周期是 `que.Lockable`，队列里同一时刻最多一个；每个实例启动时都入队一次，重复入队报 `ErrViolateUniqueConstraint`，忽略。每个实例都起一个 worker 抢它，只有一个能锁住。
 - **每次运行在同一个事务里 `Destroy` 自己、入队下一次**（`RunAt` 是现在加 `Interval`，默认 1 小时）。
 - **清理失败不算任务失败**：记 ERROR 日志，下一次提前到 `min(间隔, 1 分钟)` 之后。只有「`Destroy` 并入队下一次」这个事务失败（数据库暂时连不上）才返回错误，交给 go-que 重试。

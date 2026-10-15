@@ -188,11 +188,19 @@ func (b *byteBackend) migrate(ctx context.Context) error {
 		}
 		db = db.Set("gorm:table_options", "CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin")
 	}
-	if err := db.AutoMigrate(&leasedRow{}); err != nil {
-		return fmt.Errorf("gormcachex: migrate table %s: %w", b.table, err)
+	// instances that migrate at once race to create the table, and all but
+	// one fail; once it exists, migrating again does nothing
+	var err error
+	for range migrateAttempts {
+		if err = db.AutoMigrate(&leasedRow{}); err == nil {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("gormcachex: migrate table %s: %w", b.table, err)
 }
+
+// migrateAttempts is how many times Migrate tries (see Migrate).
+const migrateAttempts = 3
 
 // checkMySQLVersion fails unless version (SELECT VERSION()) is MySQL 8.0.17
 // or later, the first with utf8mb4_0900_bin. MariaDB has no such collation.

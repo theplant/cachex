@@ -123,7 +123,7 @@ Usually not, but it is not guaranteed. Backfills of a key land one at a time, a 
 The striped lock works within one process only. Across instances there are two problems, each solved by an option:
 
 - **Another instance can backfill an old value into a shared layer** (Redis or a table): turn leases on for it (`Leases`); only a fetch that still holds its lease backfills, and a write ends the lease.
-- **Other instances' memory layers do not see your write**: turn on the invalidation broadcast (`WithBroadcast`); a write sends its keys to the other instances, which drop them from their memory layers, and clear those layers when a message may have been lost.
+- **Other instances' memory layers do not see your write**: turn on the invalidation broadcast (`WithBroadcast`); a write sends its keys to the other instances, which drop them from their memory layers, and clear those layers each time they subscribe again, since a message may have been lost meanwhile. A publish that still fails after its retries is logged as an error, and the other instances keep the old value until it rots in their memory layers.
 
 With neither, TTLs are the only backstop: set every layer's TTLs to how long you can accept old data. See [design/consistency.md](design/consistency.md) (Chinese).
 

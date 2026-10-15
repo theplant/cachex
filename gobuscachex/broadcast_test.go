@@ -10,6 +10,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	bus "github.com/qor5/go-bus"
+	"github.com/qor5/go-bus/bussql"
 	"github.com/qor5/go-bus/pgbus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,6 +23,12 @@ import (
 
 // newBus starts PostgreSQL and returns a bus on it, and its database.
 func newBus(t *testing.T) (bus.Bus, *sql.DB) {
+	t.Helper()
+	return busOn(t, startPostgres(t))
+}
+
+// startPostgres starts PostgreSQL in a container and returns its DSN.
+func startPostgres(t *testing.T) string {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 	ctx := context.Background()
@@ -40,6 +47,12 @@ func newBus(t *testing.T) (bus.Bus, *sql.DB) {
 		t.Logf("starting PostgreSQL, try %d: %v", try, err)
 	}
 	require.NoError(t, err)
+	return dsn
+}
+
+// busOn returns a go-bus on its own connection pool to dsn.
+func busOn(t *testing.T, dsn string) (bus.Bus, *sql.DB) {
+	t.Helper()
 	db, err := sql.Open("pgx", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -141,9 +154,9 @@ func TestTwoInstancesShareTheirWrites(t *testing.T) {
 }
 
 func TestDeliveriesResumeAfterADroppedConnection(t *testing.T) {
-	// a database restart or failover cuts every connection: go-que's mutex
-	// behind the consumer is done after that, and go-bus gives the recreated
-	// worker a new one
+	// a database restart or failover cuts every connection: the consumer's
+	// worker stops, and go-bus recreates it on its go-que mutex, which
+	// connects again
 	b, db := newBus(t)
 	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.drop", TTL: 3 * time.Second, WorkerConfig: fast}
 	br := NewBroadcast(cfg)
@@ -226,4 +239,17 @@ func TestADeadInstancesSubscriptionIsUnsubscribedByAPeer(t *testing.T) {
 		require.NoError(t, db.QueryRow("SELECT count(*) FROM goque_jobs WHERE queue = 'cachex-dead'").Scan(&jobs))
 		return subs == 0 && jobs == 0
 	}, 20*time.Second, 50*time.Millisecond, "the dead instance's subscription is unsubscribed and its queue drained")
+}
+
+func TestPublishNeverJoinsTheCallersTransaction(t *testing.T) {
+	// go-bus publishes in a transaction it finds in ctx (bussql.NewContext):
+	// a caller that changed the source in one, committed, and wrote the cache
+	// with the same ctx would publish into a finished transaction
+	ctx := context.Background()
+	b, db := newBus(t)
+	tx, err := db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.tx", WorkerConfig: fast}
+	assert.NoError(t, NewBroadcast(cfg).Publish(bussql.NewContext(ctx, tx), []byte("x")))
 }

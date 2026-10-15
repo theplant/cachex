@@ -77,6 +77,17 @@ var newToken = func() string {
 func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (map[string]string, error) {
 	out := map[string]string{}
 	errs := map[string]error{}
+	orphans := map[string]string{} // tokens a failed command may have set anyway (its reply lost)
+	defer func() {
+		if len(orphans) == 0 {
+			return
+		}
+		// end them, or nobody could lease the keys until the TTL; best
+		// effort, once, with a budget of its own (ctx may be what ended)
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = l.Release(rctx, orphans)
+	}()
 	ttl = max(ttl, time.Millisecond)
 	for chunk := range slices.Chunk(keys, l.b.chunkSize) {
 		pipe := l.b.client.Pipeline()
@@ -108,6 +119,7 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 			switch taken, err := cmds[i].Result(); {
 			case err != nil:
 				errs[key] = fmt.Errorf("rediscachex: lease %q: %w", key, err)
+				orphans[key] = tokens[i]
 			case taken || gets[i].Val() == tokens[i]:
 				out[key] = tokens[i]
 			}

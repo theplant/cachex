@@ -135,7 +135,9 @@ func (c *Cache[T]) lateWrite(ctx context.Context, s *stripe.Stripe, keys []strin
 		defer func() { // even if a layer calls runtime.Goexit
 			c.countWrite(s, keys...)
 			if !local {
-				c.publish(ctx, keys)
+				// not while holding s: a publish can wait up to a fetch
+				// timeout, and a clear (see clearLocal) waits for every stripe
+				c.background(func() { c.publish(ctx, keys) })
 			}
 		}()
 		c.drop(ctx, keys, local)

@@ -23,7 +23,9 @@ func TestBackend[T any](t *testing.T, newBackend func(t *testing.T) cachex.Backe
 	t.Helper()
 	require.GreaterOrEqual(t, len(values), 3, "TestBackend needs at least three values")
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Millisecond)
+	// with nanoseconds: a Cache compares CachedAt across layers, and a backend
+	// that rounds it orders entries of the same millisecond wrongly
+	now := time.Now().UTC().Truncate(time.Second).Add(123456789 * time.Nanosecond)
 	entry := func(i int) cachex.Entry[T] {
 		return cachex.Entry[T]{Value: values[i%len(values)], CachedAt: now, FreshUntil: now.Add(time.Minute), ExpiresAt: now.Add(time.Hour)}
 	}

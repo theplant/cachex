@@ -116,6 +116,21 @@ func TestOnRealDatabases(t *testing.T) {
 				})
 			})
 
+			t.Run("instances that Migrate at once all succeed", func(t *testing.T) {
+				for round := range 3 { // creating a table concurrently fails at times
+					table := fmt.Sprintf("race_%d", round)
+					var wg sync.WaitGroup
+					errs := make([]error, 6)
+					for i := range errs {
+						wg.Go(func() { errs[i] = New[string](Config[string]{DB: db, TableName: table}).Migrate(ctx) })
+					}
+					wg.Wait()
+					for i, err := range errs {
+						assert.NoError(t, err, "round %d, instance %d", round, i)
+					}
+				}
+			})
+
 			t.Run("a key it cannot store fails alone", func(t *testing.T) {
 				testUnstorableKeys(t, newB(t))
 			})

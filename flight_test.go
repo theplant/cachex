@@ -222,3 +222,74 @@ func TestDoubleCheckSkipsTheReReadWhenNothingWasWritten(t *testing.T) {
 	require.NoError(t, err)
 	assert.EqualValues(t, 1, reads.Load(), "a cold miss reads the layer once")
 }
+
+// errCallback is what a source gets back when it calls the Cache for a key
+// its own fetch is fetching.
+func requireCallbackError(t *testing.T, err error) {
+	t.Helper()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "called back into the same Cache")
+}
+
+func TestASourceCallingBackForItsOwnKeyFailsAtOnce(t *testing.T) {
+	var c *cachex.Cache[string]
+	var inner error
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		_, inner = c.Get(ctx, key)
+		return "v", nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
+		cachex.WithFetchTimeout(time.Hour))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = c.Get(context.Background(), "a")
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the source's call for its own key waited for itself")
+	}
+	requireCallbackError(t, inner)
+}
+
+func TestASourceCallingBackForAKeyOfItsGetManyFailsAtOnce(t *testing.T) {
+	var c *cachex.Cache[string]
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		if key == "a" {
+			v, err := c.Get(ctx, "b") // b waits for a's slot: GetMany asks one key at a time
+			return "a+" + v, err
+		}
+		return key, nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
+		cachex.WithFetchTimeout(time.Hour), cachex.WithGetManyConcurrency(1))
+	type res struct {
+		got map[string]string
+		err error
+	}
+	done := make(chan res, 1)
+	go func() {
+		got, err := c.GetMany(context.Background(), []string{"a", "b"})
+		done <- res{got, err}
+	}()
+	select {
+	case r := <-done:
+		requireCallbackError(t, r.err)
+		assert.Equal(t, map[string]string{"b": "b"}, r.got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a's source waited for b, which waited for a's turn")
+	}
+}
+
+func TestASourceCanReadAnotherKeyOfItsCache(t *testing.T) {
+	var c *cachex.Cache[string]
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		if key == "a" {
+			v, err := c.Get(ctx, "b") // not being fetched: fetched on its own
+			return "a+" + v, err
+		}
+		return key, nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))})
+	v, err := c.Get(context.Background(), "a")
+	require.NoError(t, err)
+	assert.Equal(t, "a+b", v)
+}

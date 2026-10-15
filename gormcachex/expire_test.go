@@ -3,11 +3,13 @@ package gormcachex
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/theplant/cachex/v2"
 )
@@ -59,6 +61,26 @@ func testDeleteExpired(t *testing.T, newB func(t *testing.T, chunkSize int) *Bac
 		_, ok, err := b.Get(ctx, "held")
 		require.NoError(t, err)
 		assert.True(t, ok, "the fetch holding the lease backfilled its row")
+	})
+
+	t.Run("keeps a row written between finding it rotten and deleting it", func(t *testing.T) {
+		b := newB(t, 0)
+		require.NoError(t, b.bytes.SetMany(ctx, map[string]cachex.ByteEntry{"k": {Data: []byte("x"), ExpiresAt: past}}))
+		var once atomic.Bool
+		name := fmt.Sprintf("test:rewrite-%p", b)
+		require.NoError(t, b.bytes.db.Callback().Query().After("gorm:query").Register(name, func(*gorm.DB) {
+			if once.CompareAndSwap(false, true) { // right after the read of the rotten keys
+				require.NoError(t, b.Set(ctx, "k", cachex.Entry[string]{Value: "fresh", ExpiresAt: future}))
+			}
+		}))
+		t.Cleanup(func() { _ = b.bytes.db.Callback().Query().Remove(name) })
+		n, err := b.DeleteExpired(ctx)
+		require.NoError(t, err)
+		assert.Zero(t, n)
+		e, ok, err := b.Get(ctx, "k")
+		require.NoError(t, err)
+		require.True(t, ok, "the row written in between is kept")
+		assert.Equal(t, "fresh", e.Value)
 	})
 
 	t.Run("stops when ctx ends", func(t *testing.T) {

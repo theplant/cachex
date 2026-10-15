@@ -49,8 +49,10 @@ type Broadcast interface {
 // is a LocalBackend), through the write-order guard as a write of its own
 // would. The shared layers were written by the writer. Each time b
 // subscribes, the Cache clears its local layers, as a message may have been
-// lost. A Cache with a broadcast needs a local layer. A failed publish is
-// logged, not returned: the layers were written.
+// lost. A Cache with a broadcast needs a local layer. A publish that fails
+// is tried again twice; if it still fails it is logged as an error, not
+// returned (the layers were written), and the other instances keep what
+// their local layers hold of those keys until it rots.
 func WithBroadcast(b Broadcast) Option {
 	return func(o *options) { o.broadcast = b }
 }
@@ -142,11 +144,38 @@ func (c *Cache[T]) publish(ctx context.Context, keys []string) {
 	pctx, cancel := context.WithTimeout(sharedCtx(ctx), c.opts.fetchTimeout)
 	defer cancel()
 	for chunk := range slices.Chunk(keys, maxMessageKeys) {
-		if err := c.opts.broadcast.Publish(pctx, encodeMessage(c.sender, chunk)); err != nil {
-			c.opts.logger.WarnContext(pctx, "cachex: broadcast publish failed", "keys", len(keys), "error", err)
-			return
+		if err := c.publishOne(pctx, encodeMessage(c.sender, chunk)); err != nil {
+			// the other instances keep what they hold of these keys until it
+			// rots (see WithBroadcast); go on with the other messages
+			c.opts.logger.ErrorContext(pctx, "cachex: broadcast publish failed", "keys", len(chunk), "error", err)
 		}
 	}
+}
+
+// publishAttempts is how many times a message is published before it is
+// given up: a transport fails at times for one call (a pooled connection the
+// database dropped, say) and succeeds on the next.
+const publishAttempts = 3
+
+// publishOne publishes msg, retrying a failure after 100ms and 200ms, within
+// ctx.
+func (c *Cache[T]) publishOne(ctx context.Context, msg []byte) error {
+	var err error
+	for attempt := range publishAttempts {
+		if attempt > 0 {
+			t := time.NewTimer(100 * time.Millisecond << (attempt - 1))
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return err
+			case <-t.C:
+			}
+		}
+		if err = c.opts.broadcast.Publish(ctx, msg); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // received drops the keys of another instance's message from the local

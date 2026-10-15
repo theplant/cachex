@@ -49,7 +49,7 @@ FreshUntil = now + fresh'
 ExpiresAt  = FreshUntil + stale              // 陈旧期跟在新鲜期后面
 ```
 
-数据源的回答写进各层时，`now` 就是 `CachedAt`。
+数据源的回答写进各层时，`CachedAt` 是数据源回答时读的时钟，`now` 是写进各层时再读一次的时钟，两者只差回答到回填之间的那一点时间。
 
 再按两个上限截短：
 

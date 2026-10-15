@@ -120,8 +120,9 @@ func (l encodedLeaser[T]) Release(ctx context.Context, tokens map[string]string)
 var errLeased = errors.New("cachex: another instance holds the lease")
 
 // lease takes, for the flights idxs that missed layer li, a lease there, if
-// the layer leases, before the fetch reads further down. A lease lasts as
-// long as a fetch may (WithFetchTimeout). A key it cannot lease (another
+// the layer leases, before the fetch reads further down. A lease lasts two
+// fetch timeouts (WithFetchTimeout): one to read the lower layers, one to ask
+// the source (see renew for keys asked later). A key it cannot lease (another
 // instance holds it, or the call failed) is not backfilled into the layer;
 // only one another instance holds is refused (see skipLeased), since a key
 // that failed (one the layer cannot store, say) has no holder to refresh it.
@@ -131,7 +132,7 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 	}
 	l := c.leasers[li]
 	lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
-	tokens, err := l.Lease(lctx, keysAt(p.keys, idxs), c.opts.fetchTimeout)
+	tokens, err := l.Lease(lctx, keysAt(p.keys, idxs), 2*c.opts.fetchTimeout)
 	cancel()
 	warn := false
 	for _, i := range idxs {
@@ -141,6 +142,9 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 		}
 		if token, ok := tokens[p.keys[i]]; ok {
 			k.leases.tokens[li] = token
+			if k.leases.at.IsZero() {
+				k.leases.at = time.Now() // the lease's TTL runs on the backend's clock
+			}
 		} else if kerr := errForKey(err, p.keys[i]); kerr == nil {
 			k.leases.refused = true // another instance holds it; a key that failed is not refused
 		} else if !errors.Is(kerr, ErrUnsupportedKey) { // a key the layer cannot store just misses there
@@ -159,6 +163,36 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 type keyLeases struct {
 	tokens  []string
 	refused bool
+	at      time.Time // when the first of tokens was taken
+}
+
+// renew takes flight i's leases again before its source is asked, if they
+// might expire before its backfill: a GetMany asks its keys a few at a time
+// (WithGetManyConcurrency), each within a fetch timeout, so a key asked late
+// outlives leases taken before the chunk read the lower layers. Releasing
+// first is safe: a write in between ends the lease anyway, and the source is
+// asked after the new one is taken. A lease another instance takes in between
+// is lost: the key is not backfilled there.
+func (c *Cache[T]) renew(ctx context.Context, p *claimed[T], i int) {
+	l := p.ks[i].leases
+	if l == nil || l.at.IsZero() || time.Since(l.at) < c.opts.fetchTimeout {
+		return
+	}
+	key := p.keys[i]
+	for li, token := range l.tokens {
+		if token == "" {
+			continue
+		}
+		c.releaseLeases(ctx, li, c.leasers[li], map[string]string{key: token})
+		lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
+		tokens, err := c.leasers[li].Lease(lctx, []string{key}, 2*c.opts.fetchTimeout)
+		cancel()
+		if err != nil {
+			c.opts.logger.WarnContext(ctx, "cachex: lease failed", "layer", li, "error", err)
+		}
+		l.tokens[li] = tokens[key] // "": not backfilled there
+	}
+	l.at = time.Now()
 }
 
 // skipLeased answers, for a refresh, the flights idxs that another instance
@@ -217,25 +251,50 @@ func (c *Cache[T]) releaseLeases(ctx context.Context, li int, leaser Leaser[T], 
 }
 
 // putLeased backfills answers into layer j, which leases: only the keys whose
-// lease the fetch holds there (in tokens, indexed by layer), each ending it.
-func (c *Cache[T]) putLeased(ctx context.Context, j int, fills []fill[T], idxs []int, now time.Time) {
+// lease the fetch holds there (in tokens, indexed by layer), each ending it. A
+// copy from a lower layer (copied) skips a key whose entry in j comes from a
+// later answer of the source, as backfill does: the lease keeps other writers
+// out, not the layer's own newer entry. A key skipped, or whose write fails,
+// keeps its token, so the fetch releases its lease when it ends.
+func (c *Cache[T]) putLeased(ctx context.Context, j int, fills []fill[T], idxs []int, copied bool, now time.Time) {
 	tokens := map[string]string{}
 	entries := map[string]Entry[T]{}
+	answers := map[string]Entry[T]{}
+	held := map[string]*fill[T]{}
 	for _, i := range idxs {
 		f := &fills[i]
 		if f.leases == nil || f.leases.tokens[j] == "" {
 			continue
 		}
-		tokens[f.key] = f.leases.tokens[j]
-		f.leases.tokens[j] = ""
+		held[f.key] = f
+		answers[f.key] = f.entry
+	}
+	if len(held) == 0 {
+		return
+	}
+	var newer map[string]error
+	if copied {
+		newer = c.newerIn(ctx, j, answers)
+	}
+	for key, f := range held {
+		if _, ok := newer[key]; ok {
+			continue
+		}
+		tokens[key] = f.leases.tokens[j]
 		if e, ok := c.layers[j].place(f.entry, now); ok {
-			entries[f.key] = e
+			entries[key] = e
 		}
 	}
 	if len(tokens) == 0 {
 		return
 	}
-	if err := c.leasers[j].PutLeased(ctx, tokens, entries); err != nil {
+	err := c.leasers[j].PutLeased(ctx, tokens, entries)
+	for key := range tokens {
+		if errForKey(err, key) == nil {
+			held[key].leases.tokens[j] = "" // the write ended the lease
+		}
+	}
+	if err != nil {
 		c.opts.logger.WarnContext(ctx, "cachex: backfill failed", "layer", j, "error", err)
 	}
 }
@@ -244,6 +303,6 @@ func (c *Cache[T]) putLeased(ctx context.Context, j int, fills []fill[T], idxs [
 // frame does not grow the fetch goroutine's stack when no layer leases.
 //
 //go:noinline
-func (c *Cache[T]) putLeasedOne(ctx context.Context, j int, f *fill[T], now time.Time) {
-	c.putLeased(ctx, j, []fill[T]{*f}, []int{0}, now)
+func (c *Cache[T]) putLeasedOne(ctx context.Context, j int, f *fill[T], copied bool, now time.Time) {
+	c.putLeased(ctx, j, []fill[T]{*f}, []int{0}, copied, now)
 }

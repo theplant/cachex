@@ -16,7 +16,7 @@ _避免_：级、tier
 `layers[0]`，读取最先查、写入最后写的那一层。两个叫法同义。
 
 **共享层（shared layer）**：
-多个实例共用的层，例如 Redis 层、数据库表层。写入顺序只在一个实例内保证，共享层上跨实例的新鲜度靠 TTL 兜底。
+多个实例共用的层，例如 Redis 层、数据库表层。写入顺序只在一个实例内保证；跨实例时，打开租约（Leases）共享层就不会被旧值回填覆盖，否则只靠 TTL 兜底。
 
 **后端（backend）**：
 一层用来存条目的存储，例如 otter、Redis、数据库表；实现 `Backend[T]`。
@@ -38,7 +38,7 @@ _避免_：item、信封
 _避免_：不存在缓存、空值缓存、negative cache
 
 **契约测试（contract test）**：
-`cachextest.TestBackend`、`TestByteBackend`：每个后端都要通过的一组检查，确认它守着 `Cache` 和 `Encoded` 依赖的约定。
+`cachextest.TestBackend`、`TestByteBackend`：每个后端都要通过的一组检查，确认它守着 `Cache` 和 `Encoded` 依赖的约定；支持租约的后端还要过 `TestLeaser`，失效广播的传输要过 `TestBroadcast`。
 
 **编解码器（codec）**：
 字节后端用来把值和字节互相转换的部分；默认的 `DefaultCodec` 原样存 `string`、`[]byte`，其余用二进制编码或 JSON。

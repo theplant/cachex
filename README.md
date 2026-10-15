@@ -125,14 +125,14 @@ When several processes share a Redis layer, one of them may read a value from th
 shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
 ```
 
-`gormcachex` has the same `Leases` option, for a table several instances share (after `Migrate`). A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. Leases do not reach other instances' memory layers. For that, turn on the invalidation broadcast: after a write, each instance drops the written keys from its memory layers.
+`gormcachex` has the same `Leases` option, for a table several instances share (after `Migrate`). A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. Turn leases on for every instance sharing the layer at once: a write from an instance without them does not end the leases of one with them, which may then write its older value over it. Leases do not reach other instances' memory layers. For that, turn on the invalidation broadcast: after a write, each instance drops the written keys from its memory layers.
 
 ```go
 products := cachex.New(source, layers, cachex.WithBroadcast(
     rediscachex.NewBroadcast(rediscachex.BroadcastConfig{Client: rdb, KeyPrefix: "product:v1:"})))
 ```
 
-It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `gobuscachex.NewBroadcast` does the same over go-bus, with messages polled from a queue per instance. Over Redis, messages published while an instance is disconnected are lost; over go-bus they wait in its queue, unless its subscription expired. Either way, each time an instance subscribes again it clears its memory layers: the cost of a lost message is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A failed publish is logged, not returned. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
+It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `gobuscachex.NewBroadcast` does the same over go-bus, with messages polled from a queue per instance. Over Redis, messages published while an instance is disconnected are lost; over go-bus they wait in its queue, unless its subscription expired. Either way, each time an instance subscribes again it clears its memory layers: the cost of a message lost that way is a cold memory layer, not an old value. Only layers whose backend lives in the process are touched (`ottercachex`, `bigcachex`, or your own backend implementing `cachex.LocalBackend`); a Cache with a broadcast needs one. A publish that fails is tried again twice (a pooled connection the database dropped, say); if it still fails, it is logged as an error, not returned, and the other instances keep the old value in their memory layers until it rots: their memory layer TTLs bound how long, so keep them short enough for that. With leases and the broadcast on, the Redis layer's TTLs can be long and a write shows on every instance as soon as the message arrives.
 
 ## Options
 
@@ -142,7 +142,7 @@ It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `g
 | `NotFoundTTL(fresh, stale)` (layer) | `0, 0`: not recorded | The same for "does not exist" |
 | `Jitter(ratio)` (layer) | `0.1` | Shortens each entry's fresh period by up to this share, so entries written together do not turn stale or rotten together |
 | `WithMaxAge(func(T) time.Duration)` | none | Caps how long a value is kept, in every layer; called for fetched values and for those `Set`/`SetMany` write |
-| `WithFetchTimeout(d)` | 60s | Bounds, each on its own: a fetch's double check, each lower layer read with its backfill, each source call with its backfill, and the invalidation after a failed write |
+| `WithFetchTimeout(d)` | 60s | Bounds, each on its own: a fetch's double check, each lower layer read with its backfill, each source call with its backfill, taking and releasing leases (a lease lasts two of it), the invalidation after a failed write, a broadcast's publish, a received invalidation, and the clear after subscribing again |
 | `WithGetManyConcurrency(n)` | 16 | How many source requests one `GetMany` has in flight |
 | `WithGetManyChunkSize(n)` | 0: one chunk | Fetches a `GetMany`'s misses in chunks of at most n keys, each claimed when it starts; a `Get` of a key whose chunk has not started does not wait |
 | `WithBroadcast(b)` | off | Sends the keys of each write to the other instances, which drop them from their local layers; see "Several instances" |
@@ -174,7 +174,7 @@ Each item: the mistake, what happens, what to do.
 - **Returning `nil, nil` for a missing key.** The zero value is cached as a real value. Return `cachex.ErrNotFound` (wrapping it is fine).
 - **Returning `ErrNotFound` from `BatchSource.GetMany`.** Every key of the call reads as missing but nothing is cached, so each read asks again. Leave missing keys out of the map; for some keys failing, return a `*cachex.BatchError` as is, not wrapped.
 - **Relying on the caller's cancellation inside the source.** A fetch is shared by every caller waiting for the key, so its ctx does not end when one caller leaves; it is bounded by `WithFetchTimeout` instead, and keeps the caller's values. Do not use caller state from it, such as a database transaction (`cachex.IsShared(ctx)` tells you it is a fetch).
-- **Calling the same `Cache` for the same key from inside the source.** The call waits for the fetch it is part of and fails at the fetch timeout.
+- **Calling the same `Cache` from inside the source.** A key the call's own fetch is fetching (the same key, or another key of the same `GetMany`) would wait for that fetch: the call fails at once with an error saying so. Read what the source needs from the data store, or from another `Cache`.
 - **A source without `GetMany` behind large `GetMany` calls.** Keys are fetched one by one (`WithGetManyConcurrency` at a time), and by default a concurrent `Get` of a queued key waits for its turn. Implement `BatchSource`, or set `WithGetManyChunkSize` to about `WithGetManyConcurrency`.
 
 **Reads**
