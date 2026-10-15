@@ -132,6 +132,14 @@ func TestEncoded(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []string{"ok"}, keysOf(got))
 		assert.False(t, m.has("k"))
+
+		// GetInto too (a Cache reads its first layer with it)
+		require.NoError(t, raw.Set(ctx, "k", cachex.Entry[string]{Value: "not json", ExpiresAt: later}))
+		entries, found := make([]cachex.Entry[string], 2), make([]bool, 2)
+		require.NoError(t, b.(cachex.SliceGetter[string]).GetInto(ctx, []string{"k", "ok"}, entries, found))
+		assert.Equal(t, []bool{false, true}, found)
+		assert.Equal(t, "v", entries[1].Value)
+		assert.False(t, m.has("k"))
 	})
 
 	t.Run("an entry already expired deletes its key", func(t *testing.T) {

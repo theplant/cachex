@@ -80,7 +80,16 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 		for i, key := range keys {
 			seen[i] = epoch(c.stripes, key) // before reading, see shouldDoubleCheck
 		}
-		es, err := c.layers[0].backend.GetMany(ctx, keys)
+		var es map[string]Entry[T]
+		var ents []Entry[T]
+		var found []bool
+		var err error
+		if g, ok := c.layers[0].backend.(SliceGetter[T]); ok {
+			ents, found = make([]Entry[T], len(keys)), make([]bool, len(keys))
+			err = g.GetInto(ctx, keys, ents, found)
+		} else {
+			es, err = c.layers[0].backend.GetMany(ctx, keys)
+		}
 		now := c.opts.now()
 		var staleKeys []string
 		var staleSeen []uint64
@@ -90,7 +99,14 @@ func (c *Cache[T]) GetMany(ctx context.Context, keys []string) (map[string]T, er
 				errs[key] = readError(key, 0, kerr)
 				continue
 			}
-			if e, ok := es[key]; ok {
+			var e Entry[T]
+			var ok bool
+			if ents != nil {
+				e, ok = ents[i], found[i]
+			} else {
+				e, ok = es[key]
+			}
+			if ok {
 				if st := e.state(now); st != rotten {
 					if !e.NotFound {
 						out[key] = e.Value

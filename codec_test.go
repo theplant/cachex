@@ -168,6 +168,19 @@ func TestBatched(t *testing.T) {
 			assert.ErrorIs(t, be.Errors["bad"], errBoom)
 		}
 	})
+
+	t.Run("as a first layer, a key it fails to read fails alone", func(t *testing.T) {
+		// a Cache reads its first layer with GetInto, which Batched has
+		ctx := context.Background()
+		c := cachex.New[string](newSource(map[string]string{"ok": "v", "bad": "v"}), []cachex.Layer[string]{
+			cachex.NewLayer[string](cachex.Batched[string](&singleMap{Map: cachextest.NewMap[string](), failKey: "bad"}), cachex.TTL(time.Hour, 0)),
+		})
+		got, err := c.GetMany(ctx, []string{"ok", "bad"})
+		var be *cachex.BatchError
+		require.ErrorAs(t, err, &be)
+		assert.ErrorIs(t, be.Errors["bad"], errBoom)
+		assert.Equal(t, map[string]string{"ok": "v"}, got)
+	})
 }
 
 func TestMapBackend(t *testing.T) {

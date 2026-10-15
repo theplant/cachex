@@ -35,6 +35,9 @@ type Backend[T any] interface {      // 后端：一层的存储，单 key 和�
     GetMany(ctx, keys) (map[string]Entry[T], error)
     Set / SetMany / Del / DelMany
 }
+type SliceGetter[T any] interface {  // 可选，给第一层：GetMany 读它时不构造 map（ADR 0024）
+    GetInto(ctx, keys, entries []Entry[T], found []bool) error
+}
 
 type ByteBackend interface {         // 字节后端：只存字节和过期时间
     Get / GetMany / Set(ctx, key, data, expiresAt) / SetMany / Del / DelMany

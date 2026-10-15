@@ -173,6 +173,14 @@ func (m *Map[T]) GetMany(ctx context.Context, keys []string) (map[string]cachex.
 	return out, nil
 }
 
+// GetInto is GetMany into slices (see cachex.SliceGetter).
+func (m *Map[T]) GetInto(ctx context.Context, keys []string, entries []cachex.Entry[T], found []bool) error {
+	for i, key := range keys {
+		entries[i], found[i], _ = m.Get(ctx, key)
+	}
+	return nil
+}
+
 func (m *Map[T]) Set(_ context.Context, key string, e cachex.Entry[T]) error {
 	m.lock()
 	defer m.unlock()

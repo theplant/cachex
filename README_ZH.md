@@ -162,7 +162,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 
 `rediscachex.New` 和 `bigcachex.New` 返回 `cachex.Backend[T]`；`gormcachex.New` 返回 `*gormcachex.Backend[T]`，它也是一个 `cachex.Backend[T]`，另有 `Migrate`。
 
-自己的存储实现 `Backend[T]`，或者实现 `SingleBackend[T]` 再用 `cachex.Batched` 包一层。存字节的存储实现 `cachex.ByteBackend`，再用 `cachex.Encoded` 包一层：它用 `Codec` 编码条目，把解不出来的数据当作未命中，已经腐烂的条目不写、改为删除。
+自己的存储实现 `Backend[T]`，或者实现 `SingleBackend[T]` 再用 `cachex.Batched` 包一层。存字节的存储实现 `cachex.ByteBackend`，再用 `cachex.Encoded` 包一层：它用 `Codec` 编码条目，把解不出来的数据当作未命中，已经腐烂的条目不写、改为删除。用作第一层的存储还可以实现 `cachex.SliceGetter[T]`（`GetInto`，把多个 key 读进切片）：`GetMany` 读这一层时就不用构造 map，缓存的值是较大的值类型时，每个 key 少一次内存分配。`ottercachex`、`bigcachex`、`cachextest.Map` 和 `Batched` 包装的存储都实现了它。
 
 ## 注意事项
 

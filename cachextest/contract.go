@@ -208,6 +208,23 @@ func TestBackend[T any](t *testing.T, newBackend func(t *testing.T) cachex.Backe
 		require.NoError(t, b.DelMany(ctx, nil))
 	})
 
+	if _, ok := newBackend(t).(cachex.SliceGetter[T]); ok {
+		t.Run("GetInto reads what Get reads", func(t *testing.T) {
+			b := newBackend(t)
+			require.NoError(t, b.SetMany(ctx, map[string]cachex.Entry[T]{"a": entry(0), "n": notFound, "c": entry(2)}))
+			keys := []string{"c", "missing", "a", "n"}
+			entries, found := make([]cachex.Entry[T], len(keys)), make([]bool, len(keys))
+			require.NoError(t, b.(cachex.SliceGetter[T]).GetInto(ctx, keys, entries, found))
+			for i, key := range keys {
+				want, ok := get(t, b, key)
+				require.Equal(t, ok, found[i], key)
+				if ok {
+					same(t, want, entries[i])
+				}
+			}
+		})
+	}
+
 	if _, local := newBackend(t).(cachex.LocalBackend); local {
 		t.Run("Clear drops every entry", func(t *testing.T) {
 			b := newBackend(t)

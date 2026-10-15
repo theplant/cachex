@@ -356,3 +356,46 @@ func BenchmarkZipfMixed(b *testing.B) {
 		})
 	}
 }
+
+// answer is a value type of 56 bytes, as a struct cached by value often is:
+// its Entry is 136 bytes, over the 128 a Go map stores in place.
+type answer struct {
+	ID, Version, Score int64
+	Text               string
+	Tags               []string
+}
+
+// BenchmarkGetManyHitByValue reads n keys that all hit the memory layer, with
+// values cached by value.
+func BenchmarkGetManyHitByValue(b *testing.B) {
+	ctx := context.Background()
+	keys := benchKeys(200)
+	src := cachex.SourceFunc[answer](func(context.Context, string) (answer, error) { return answer{ID: 1, Text: "t"}, nil })
+	mem, err := ottercachex.New[answer](ottercachex.Config[answer]{MaximumSize: 10_000})
+	if err != nil {
+		b.Fatal(err)
+	}
+	backends := map[string]cachex.Backend[answer]{"otter": mem, "map": cachextest.NewMap[answer]()}
+	for name, be := range backends {
+		c := cachex.New[answer](src, []cachex.Layer[answer]{cachex.NewLayer(be, cachex.TTL(time.Hour, 0))})
+		if _, err := c.GetMany(ctx, keys); err != nil {
+			b.Fatal(err)
+		}
+		b.Run(name+"/GetMany", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := c.GetMany(ctx, keys); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(name+"/backend-GetMany", func(b *testing.B) { // the layer's own share
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := be.GetMany(ctx, keys); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

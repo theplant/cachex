@@ -75,6 +75,14 @@ func (b *Backend[T]) GetMany(_ context.Context, keys []string) (map[string]cache
 	return out, nil
 }
 
+// GetInto is GetMany into slices (see cachex.SliceGetter).
+func (b *Backend[T]) GetInto(_ context.Context, keys []string, entries []cachex.Entry[T], found []bool) error {
+	for i, key := range keys {
+		entries[i], found[i] = b.cache.GetIfPresent(key)
+	}
+	return nil
+}
+
 func (b *Backend[T]) Set(_ context.Context, key string, e cachex.Entry[T]) error {
 	b.cache.Set(key, e)
 	return nil

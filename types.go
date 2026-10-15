@@ -72,6 +72,16 @@ type Backend[T any] interface {
 	DelMany(ctx context.Context, keys []string) error
 }
 
+// SliceGetter is an optional Backend method for the first layer: GetInto
+// reads keys into entries and found (both as long as keys), entries[i] and
+// found[i] being what Get returns for keys[i], with errors as GetMany's. A
+// GetMany of the Cache uses it instead of the backend's GetMany: that map
+// allocates once per entry when Entry[T] is over 128 bytes (a value type of
+// over 48 bytes, say), as Go maps hold larger values out of line.
+type SliceGetter[T any] interface {
+	GetInto(ctx context.Context, keys []string, entries []Entry[T], found []bool) error
+}
+
 // SingleBackend is a Backend without the Many methods; see Batched.
 type SingleBackend[T any] interface {
 	Get(ctx context.Context, key string) (Entry[T], bool, error)
@@ -172,6 +182,21 @@ type batchedLocal[T any] struct{ batched[T] }
 
 func (b batchedLocal[T]) Clear(ctx context.Context) error {
 	return b.SingleBackend.(LocalBackend).Clear(ctx)
+}
+
+// GetInto is GetMany into slices (see SliceGetter).
+func (b batched[T]) GetInto(ctx context.Context, keys []string, entries []Entry[T], found []bool) error {
+	errs := map[string]error{}
+	for i, key := range keys {
+		e, ok, err := b.Get(ctx, key)
+		switch {
+		case err != nil:
+			errs[key] = err
+		case ok:
+			entries[i], found[i] = e, true
+		}
+	}
+	return batchError(errs)
 }
 
 func (b batched[T]) GetMany(ctx context.Context, keys []string) (map[string]Entry[T], error) {

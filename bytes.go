@@ -88,10 +88,31 @@ func (e *encoded[T]) GetMany(ctx context.Context, keys []string) (map[string]Ent
 		return nil, err
 	}
 	out := make(map[string]Entry[T], len(m))
+	e.decodeMany(ctx, keys, m, func(i int, entry Entry[T]) { out[keys[i]] = entry })
+	return out, err
+}
+
+// GetInto is GetMany into slices (see SliceGetter).
+func (e *encoded[T]) GetInto(ctx context.Context, keys []string, entries []Entry[T], found []bool) error {
+	m, err := e.b.GetMany(ctx, keys)
+	if _, partial := err.(*BatchError); err != nil && !partial { //nolint:errorlint // only an unwrapped one is partial
+		return err
+	}
+	e.decodeMany(ctx, keys, m, func(i int, entry Entry[T]) { entries[i], found[i] = entry, true })
+	return err
+}
+
+// decodeMany decodes what m holds of keys, passing each entry to put with
+// its key's index; data that does not decode is deleted (see Encoded).
+func (e *encoded[T]) decodeMany(ctx context.Context, keys []string, m map[string][]byte, put func(i int, entry Entry[T])) {
 	var bad []string
-	for key, data := range m {
+	for i, key := range keys {
+		data, ok := m[key]
+		if !ok {
+			continue
+		}
 		if entry, ok := e.decode(ctx, key, data); ok {
-			out[key] = entry
+			put(i, entry)
 		} else {
 			bad = append(bad, key)
 		}
@@ -99,7 +120,6 @@ func (e *encoded[T]) GetMany(ctx context.Context, keys []string) (map[string]Ent
 	if len(bad) > 0 {
 		_ = e.b.DelMany(ctx, bad)
 	}
-	return out, err
 }
 
 func (e *encoded[T]) Set(ctx context.Context, key string, entry Entry[T]) error {

@@ -303,8 +303,8 @@ func TestASourceCallingBackForAKeyItsFetchJoinedFailsAtOnce(t *testing.T) {
 	var once sync.Once
 	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
 		if key == "a" {
-			once.Do(func() { close(releaseB) })
 			v, err := c.Get(ctx, "b")
+			once.Do(func() { close(releaseB) }) // b's refresh answers only once a's call for it returned
 			return "a+" + v, err
 		}
 		close(bStarted)
