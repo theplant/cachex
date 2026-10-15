@@ -12,5 +12,6 @@
 
 ## 后果
 
-- 新增一个可选接口，第一层实现它才有收益；包装后端（比如测试里的钩子）不转发它时，回到 `GetMany`，行为不变。
+- 新增一个可选接口，第一层实现它才有收益；包装后端内嵌的是接口（比如测试里的钩子、`gormcachex` 的 `*Backend[T]`）时，`GetInto` 不会被提升，回到 `GetMany`，行为不变。
+- 包装后端内嵌的是具体类型（比如 `*ottercachex.Backend[T]`）、又重写了 `GetMany` 时，内层的 `GetInto` 会被提升上来，`Cache` 读第一层就绕过了重写的 `GetMany`。这类包装要么也重写 `GetInto`，要么改为内嵌接口；`SliceGetter` 的注释和 README 写明了。
 - `GetInto` 的语义和 `GetMany` 一致，契约测试 `TestBackend` 检查实现了它的后端读到的和 `Get` 一致。

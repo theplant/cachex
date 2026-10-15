@@ -36,7 +36,7 @@ import "github.com/theplant/cachex/v2"
 | `GORMCache` | `gormcachex.New`，返回带 `Migrate` 的 `*gormcachex.Backend[T]` |
 | `WithGORMTx`、`GetGORMTx` | 已删除：`gormcachex` 从不加入你的事务，见下文 |
 | `SyncMap` | `cachextest.Map`，只用于测试（没有容量上限） |
-| — | `Cache.GetMany`，配合 `BatchSource[T]`、`WithGetManyConcurrency`、`WithGetManyChunkSize`；`Cache.SetMany`、`Cache.DelMany`、`Cache.Close`、`IsShared` |
+| — | `Cache.GetMany`，配合 `BatchSource[T]`、`WithGetManyConcurrency`、`WithGetManyChunkSize`；`Cache.SetMany`、`Cache.DelMany`、`Cache.Close`、`IsShared`；`SliceGetter[T]`，第一层可选实现 |
 | — | `cachextest.TestBackend(t, newBackend, values)` 和 `cachextest.TestByteBackend(t, newBackend)`，给自写后端用的契约测试 |
 
 ## 行为

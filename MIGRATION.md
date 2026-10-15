@@ -36,7 +36,7 @@ Backends moved to their own packages: `github.com/theplant/cachex/v2/ottercachex
 | `GORMCache` | `gormcachex.New`, which returns a `*gormcachex.Backend[T]` with `Migrate` |
 | `WithGORMTx`, `GetGORMTx` | removed: `gormcachex` never joins your transaction, see below |
 | `SyncMap` | `cachextest.Map`, for tests only (unbounded) |
-| — | `Cache.GetMany` with `BatchSource[T]`, `WithGetManyConcurrency` and `WithGetManyChunkSize`; `Cache.SetMany`, `Cache.DelMany`, `Cache.Close`, `IsShared` |
+| — | `Cache.GetMany` with `BatchSource[T]`, `WithGetManyConcurrency` and `WithGetManyChunkSize`; `Cache.SetMany`, `Cache.DelMany`, `Cache.Close`, `IsShared`; `SliceGetter[T]`, optional for a first layer |
 | — | `cachextest.TestBackend(t, newBackend, values)` and `cachextest.TestByteBackend(t, newBackend)`, contract tests for your own backends |
 
 ## Behavior

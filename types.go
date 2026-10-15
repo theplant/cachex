@@ -77,7 +77,9 @@ type Backend[T any] interface {
 // found[i] being what Get returns for keys[i], with errors as GetMany's. A
 // GetMany of the Cache uses it instead of the backend's GetMany: that map
 // allocates once per entry when Entry[T] is over 128 bytes (a value type of
-// over 48 bytes, say), as Go maps hold larger values out of line.
+// over 48 bytes, say), as Go maps hold larger values out of line. A wrapper
+// that embeds a backend having GetInto and overrides GetMany must override
+// GetInto too (or embed the Backend interface), or reads bypass its GetMany.
 type SliceGetter[T any] interface {
 	GetInto(ctx context.Context, keys []string, entries []Entry[T], found []bool) error
 }

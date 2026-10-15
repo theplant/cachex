@@ -136,6 +136,17 @@ func TestGetMany(t *testing.T) {
 		assert.Empty(t, src.batchCalls())
 	})
 
+	t.Run("a first layer with GetInto is read with it, not GetMany", func(t *testing.T) {
+		mem := &intoCounting{Map: cachextest.NewMap[string]()}
+		c := cachex.New[string](newBatchSource(map[string]string{"a": "1"}), oneLayer(mem))
+		require.NoError(t, mem.Set(ctx, "a", cachex.Entry[string]{Value: "1", ExpiresAt: time.Now().Add(time.Hour)}))
+		got, err := c.GetMany(ctx, []string{"a"})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"a": "1"}, got)
+		assert.Equal(t, int32(1), mem.into.Load())
+		assert.Zero(t, mem.many.Load())
+	})
+
 	t.Run("lower layers are read in one call each", func(t *testing.T) {
 		src := newBatchSource(map[string]string{"a": "1", "b": "2", "c": "3"})
 		var reads atomic.Int64
@@ -382,4 +393,20 @@ func TestGetManyInChunks(t *testing.T) {
 		slices.Sort(sizes)
 		assert.Equal(t, []int{2, 2, 4, 4}, sizes, "two chunks to fetch, two to refresh")
 	})
+}
+
+// intoCounting counts the reads of a cachextest.Map through GetInto and GetMany.
+type intoCounting struct {
+	*cachextest.Map[string]
+	into, many atomic.Int32
+}
+
+func (m *intoCounting) GetInto(ctx context.Context, keys []string, entries []cachex.Entry[string], found []bool) error {
+	m.into.Add(1)
+	return m.Map.GetInto(ctx, keys, entries, found)
+}
+
+func (m *intoCounting) GetMany(ctx context.Context, keys []string) (map[string]cachex.Entry[string], error) {
+	m.many.Add(1)
+	return m.Map.GetMany(ctx, keys)
 }

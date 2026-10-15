@@ -41,7 +41,7 @@ func Encoded[T any](b ByteBackend, codec Codec[T], logger *slog.Logger) Backend[
 - 后端可以从 `ExpiresAt` 起丢掉条目（`rediscachex`、`ottercachex` 原生过期），也可以留着：Cache 不会返回腐烂的条目。在那之前也可以因为容量淘汰而丢掉条目，那只是一次未命中。
 - 单 key 的方法返回普通的 error；`*BatchError` 只出现在批量方法里（`NewBatchError(errs)` 构造它，`errs` 为空时返回 nil）。
 - 契约测试见下文 [cachextest](#cachextest)，每个内置后端都要过。
-- **第一层可以另外实现 `SliceGetter`**（`GetInto(ctx, keys, entries, found)`，按 key 的顺序读进调用方给的切片）。`GetMany` 读第一层时有它就用它：Go 的 map 存不下超过 128 字节的值，会给每个值单独分配一次，`Entry[T]` 带三个时间字段，值类型稍大（约 48 字节以上）就会超过；200 个 key 全部命中时，分配从 219 次降到 16 次、耗时少约 22%（基准测试 `BenchmarkGetManyHitByValue`，值是 56 字节的结构体）。决策见 [ADR 0024](../adr/0024-first-layer-reads-into-slices.md)。`ottercachex`、`Encoded`（所以 `bigcachex`）、`cachextest.Map`、`Batched` 实现了它；`Encoded` 的 `GetInto` 和 `GetMany` 共用解码和删除坏条目的逻辑。语义和 `GetMany` 一样（部分失败返回 `*BatchError`），契约测试检查它读到的和 `Get` 一致。只用在第一层：下面的层未命中时才读，读的 key 少，回填还要 map。
+- **第一层可以另外实现 `SliceGetter`**（`GetInto(ctx, keys, entries, found)`，按 key 的顺序读进调用方给的切片）。`GetMany` 读第一层时有它就用它：Go 的 map 存不下超过 128 字节的值，会给每个值单独分配一次，`Entry[T]` 带三个时间字段，值类型稍大（约 48 字节以上）就会超过；200 个 key 全部命中时，分配从 219 次降到 16 次、耗时少约 22%（基准测试 `BenchmarkGetManyHitByValue`，值是 56 字节的结构体）。决策见 [ADR 0024](../adr/0024-first-layer-reads-into-slices.md)。`ottercachex`、`Encoded`（所以 `bigcachex`、`rediscachex`）、`cachextest.Map`、`Batched` 实现了它，`gormcachex` 的 `*Backend[T]` 内嵌接口，把它挡住了（数据库本来不做第一层）；包装后端内嵌具体类型、又重写 `GetMany` 的，要连 `GetInto` 一起重写（见 ADR 0024）；`Encoded` 的 `GetInto` 和 `GetMany` 共用解码和删除坏条目的逻辑。语义和 `GetMany` 一样（部分失败返回 `*BatchError`），契约测试检查它读到的和 `Get` 一致。只用在第一层：下面的层未命中时才读，读的 key 少，回填还要 map。
 
 ## 字节后端与 Encoded
 

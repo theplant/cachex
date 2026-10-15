@@ -166,6 +166,7 @@ func TestEncoded(t *testing.T) {
 			"SetMany":            b.SetMany(ctx, map[string]cachex.Entry[string]{"ok": e, "bad": e}),
 			"SetMany of expired": b.SetMany(ctx, map[string]cachex.Entry[string]{"ok": past, "bad": past}),
 			"GetMany":            func() error { _, err := b.GetMany(ctx, []string{"ok", "bad"}); return err }(),
+			"GetInto":            b.(cachex.SliceGetter[string]).GetInto(ctx, []string{"ok", "bad"}, make([]cachex.Entry[string], 2), make([]bool, 2)),
 			"DelMany":            b.DelMany(ctx, []string{"ok", "bad"}),
 		} {
 			var be *cachex.BatchError
@@ -183,6 +184,20 @@ func TestEncoded(t *testing.T) {
 			assert.ErrorIs(t, err, errBoom, name)
 			assert.NotErrorAs(t, err, &be, name)
 		}
+	})
+
+	t.Run("a whole failed read fails, not reads as all absent", func(t *testing.T) {
+		m := newByteMap()
+		b := cachex.Encoded[string](failingGetMany{m}, nil, nil)
+		require.NoError(t, b.Set(ctx, "k", cachex.Entry[string]{Value: "v", ExpiresAt: later}))
+		_, err := b.GetMany(ctx, []string{"k"})
+		assert.ErrorIs(t, err, errBoom)
+		found := make([]bool, 1)
+		err = b.(cachex.SliceGetter[string]).GetInto(ctx, []string{"k"}, make([]cachex.Entry[string], 1), found)
+		assert.ErrorIs(t, err, errBoom)
+		var be *cachex.BatchError
+		assert.NotErrorAs(t, err, &be)
+		assert.False(t, found[0])
 	})
 
 	t.Run("a value that does not encode fails its key alone", func(t *testing.T) {
@@ -205,4 +220,11 @@ func keysOf[V any](m map[string]V) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// failingGetMany fails every GetMany as a whole.
+type failingGetMany struct{ *byteMap }
+
+func (failingGetMany) GetMany(context.Context, []string) (map[string][]byte, error) {
+	return nil, errBoom
 }

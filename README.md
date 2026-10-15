@@ -163,7 +163,7 @@ It uses Redis Pub/Sub (Redis Cluster too); without Redis but with PostgreSQL, `g
 
 `rediscachex.New` and `bigcachex.New` return a `cachex.Backend[T]`; `gormcachex.New` returns a `*gormcachex.Backend[T]`, which is one and adds `Migrate`.
 
-Your own store implements `Backend[T]`, or `SingleBackend[T]` wrapped with `cachex.Batched`. A store of bytes implements `cachex.ByteBackend` and is wrapped with `cachex.Encoded`, which encodes entries with a `Codec`, treats data that does not decode as a miss, and deletes an entry already rotten instead of writing it. A store used as the first layer may also implement `cachex.SliceGetter[T]` (`GetInto`, which reads many keys into slices): `GetMany` then reads that layer without building a map, which spares an allocation per key when the cached value is a large value type. `ottercachex`, `bigcachex`, `cachextest.Map` and `Batched` stores have it.
+Your own store implements `Backend[T]`, or `SingleBackend[T]` wrapped with `cachex.Batched`. A store of bytes implements `cachex.ByteBackend` and is wrapped with `cachex.Encoded`, which encodes entries with a `Codec`, treats data that does not decode as a miss, and deletes an entry already rotten instead of writing it. A store used as the first layer may also implement `cachex.SliceGetter[T]` (`GetInto`, which reads many keys into slices): `GetMany` then reads that layer without building a map, which spares an allocation per key when the cached value is a large value type. `ottercachex`, `bigcachex`, `rediscachex`, `cachextest.Map` and `Batched` stores have it. A wrapper of such a store that overrides `GetMany` must override `GetInto` too, or the first layer is read without its `GetMany`.
 
 ## Pitfalls
 
