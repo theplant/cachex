@@ -173,7 +173,7 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 - **不存在的 key 返回 `nil, nil`。** 零值会被当成真实的值缓存起来。应该返回 `cachex.ErrNotFound`（包装一层也可以）。
 - **`BatchSource.GetMany` 返回 `ErrNotFound`。** 这次调用的所有 key 都会读成不存在，但什么也不缓存，所以每次读取都会再回源。不存在的 key 不放进 map 就行；部分 key 失败时，原样返回 `*cachex.BatchError`，不要再包装。
 - **在数据源里依赖调用方的取消。** 一次回源由等这个 key 的所有调用方共用，所以它的 ctx 不会因为某个调用方离开而结束，而是由 `WithFetchTimeout` 限时，并保留调用方的值。不要使用里面属于某个调用方的状态，比如数据库事务（`cachex.IsShared(ctx)` 能判断这是回源用的 ctx）。
-- **在数据源里通过同一个 `Cache` 读这次回源正在取的 key。** 同一个 key，或者同一次 `GetMany` 同一段里的另一个 key，可能正在等这次调用本身：这种调用会立即失败，错误里写明原因。读别的 key 照常进行。经别的回源绕成的环（a 的数据源读 b，b 的又读 a）认不出来，到回源超时才失败。数据源需要的东西直接从数据库读，或者用另一个 `Cache`。
+- **在数据源里通过同一个 `Cache` 读一个「正在等这次调用的回源」在取的 key。** 同一个 key，同一次 `GetMany` 同一段或同一次刷新里的另一个 key，或者调用链更上层那次回源的 key（a 的数据源读 b，b 的数据源又读 a），都可能正在等这次调用本身：这种调用会立即失败，错误里写明原因。读别的 key 照常进行。互不相干的两个请求绕成的环（一个读 a、一个读 b，两边的数据源各读对方的 key），或者数据源换了 ctx，认不出来，到回源超时才失败。数据源需要的东西直接从数据库读，或者用另一个 `Cache`。
 - **数据源没有 `GetMany`，却有大批量的 `GetMany` 调用。** key 会逐个回源（同时最多 `WithGetManyConcurrency` 个），默认情况下并发的 `Get` 碰上还在排队的 key，要等它轮到。请实现 `BatchSource`，或者把 `WithGetManyChunkSize` 设成 `WithGetManyConcurrency` 左右。
 
 **读取**

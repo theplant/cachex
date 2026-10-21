@@ -465,3 +465,63 @@ func TestARefreshStartedFromASourceIsNotItsCall(t *testing.T) {
 	close(releaseI)
 	require.NoError(t, <-xErr)
 }
+
+// A refresh of {a, b}: a's source reads b through the Cache after b rotted in
+// the layer. That read's fetch takes the refresh's answer for b, which comes
+// only after a's call (one at a time): it fails at once instead of waiting.
+func TestARefreshsSourceCallingBackForAKeyOfTheRefreshFailsAtOnce(t *testing.T) {
+	clock, now := newClock()
+	var c *cachex.Cache[string]
+	inner := make(chan error, 1)
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		if key == "a" {
+			clock.Advance(10 * time.Minute) // b rots meanwhile
+			_, err := c.Get(ctx, "b")
+			inner <- err
+			return "a2", nil
+		}
+		return key + "2", nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 2*time.Minute), cachex.Jitter(0))},
+		cachex.WithFetchTimeout(10*time.Second), cachex.WithGetManyConcurrency(1), now)
+	defer func() { _ = c.Close() }()
+	ctx := context.Background()
+	require.NoError(t, c.SetMany(ctx, map[string]string{"a": "a1", "b": "b1"}))
+	clock.Advance(90 * time.Second)
+	_, err := c.GetMany(ctx, []string{"a", "b"}) // both stale: one refresh of {a, b}
+	require.NoError(t, err)
+	select {
+	case err := <-inner:
+		requireCallbackError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a's source waited for the refresh's own call for b")
+	}
+}
+
+// a's source reads b, whose source reads a: b's fetch was started by a's
+// source call, which waits for it, so b's source waiting for a would wait
+// for itself. It fails at once.
+func TestASourceCallingBackForAKeyOfTheFetchThatCalledItFailsAtOnce(t *testing.T) {
+	var c *cachex.Cache[string]
+	inner := make(chan error, 1)
+	c = cachex.New[string](cachex.SourceFunc[string](func(ctx context.Context, key string) (string, error) {
+		switch key {
+		case "a":
+			v, err := c.Get(ctx, "b")
+			return "a+" + v, err
+		case "b":
+			_, err := c.Get(ctx, "a")
+			inner <- err
+			return "b", nil
+		}
+		return key, nil
+	}), []cachex.Layer[string]{cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0))},
+		cachex.WithFetchTimeout(10*time.Second))
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = c.Get(context.Background(), "a") }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("b's source waited for a, whose source waits for b")
+	}
+	requireCallbackError(t, <-inner)
+}

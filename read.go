@@ -47,7 +47,7 @@ func (c *Cache[T]) Get(ctx context.Context, key string) (T, error) {
 	fk := flightKey{key: key}
 	f, leader := c.flights.Claim(fk)
 	if leader {
-		p := c.claim(false)
+		p := c.claim(ctx, false)
 		p.add(key, fk, f, seen)
 		fctx := sharedCtx(ctx)
 		c.background(func() { c.resolve(fctx, p, 1) })
@@ -215,7 +215,7 @@ func (c *Cache[T]) fetchChunks(ctx context.Context, stop <-chan struct{}, keys [
 			flights[i] = f
 			if leader {
 				if p == nil {
-					p = c.claim(refresh)
+					p = c.claim(ctx, refresh)
 				}
 				p.add(keys[i], fk, f, seen[i])
 			}
@@ -232,16 +232,27 @@ func (c *Cache[T]) fetchChunks(ctx context.Context, stop <-chan struct{}, keys [
 	return flights
 }
 
-// await waits for f, the flight of key, or for ctx.
+// await waits for f, the flight of key, or for ctx; ctx is a caller's, or a
+// source's call of a fetch (see inSourceKey).
 func (c *Cache[T]) await(ctx context.Context, key string, f *flight.Flight[T]) (T, error) {
+	by, _ := ctx.Value(inSourceKey{}).(*claimed[T])
+	return c.wait(ctx, key, f, by)
+}
+
+// wait waits for f, the flight of key, or for ctx, on behalf of the fetch by
+// (nil: none). Every wait for another fetch's answer goes through it: a read
+// waiting for a flight (await) and a fetch taking another fetch's call to the
+// source (joinSource). If by, or a fetch up its chain (see claimed.up), leads
+// f, f's answer waits for this very wait, so it fails at once instead.
+func (c *Cache[T]) wait(ctx context.Context, key string, f *flight.Flight[T], by *claimed[T]) (T, error) {
 	select {
 	case <-f.Done():
 		return f.Result()
 	default:
 	}
-	if p, ok := ctx.Value(inSourceKey{}).(*claimed[T]); ok && p.c == c && p.leads(f) {
+	if by.waitsFor(f) {
 		var zero T
-		return zero, fmt.Errorf("cachex: the source called back into the same Cache for %q, which its fetch is fetching", key)
+		return zero, fmt.Errorf("cachex: the source called back into the same Cache for %q, which a fetch waiting for that call is fetching", key)
 	}
 	select {
 	case <-f.Done():
@@ -286,6 +297,11 @@ type claimed[T any] struct {
 	keys    []string        // the keys, for the backends' calls
 	ks      []claimedKey[T] // what the fetch knows of each key, in the same order
 	refresh bool            // stale entries below do not count
+	// up is the fetch whose call to the source made the request that
+	// claimed this one (nil: none, or a refresh, which nobody waits for):
+	// that call waits for this fetch, so this fetch waiting for a flight up
+	// the chain would wait for itself (see wait).
+	up *claimed[T]
 }
 
 // claimedKey is what a fetch knows of one key it leads.
@@ -298,12 +314,30 @@ type claimedKey[T any] struct {
 	source *sourceCall[T] // set while the fetch asks the source for the key (see askSource)
 }
 
-func (c *Cache[T]) claim(refresh bool) *claimed[T] { return &claimed[T]{c: c, refresh: refresh} }
+// claim starts a fetch for a request with ctx (see claimed.up).
+func (c *Cache[T]) claim(ctx context.Context, refresh bool) *claimed[T] {
+	p := &claimed[T]{c: c, refresh: refresh}
+	if !refresh {
+		p.up, _ = ctx.Value(inSourceKey{}).(*claimed[T])
+	}
+	return p
+}
 
 // inSourceKey marks the context a fetch passes to the source with the fetch
 // (*claimed), so that a call of the source back into the Cache for a key the
-// fetch leads fails at once instead of waiting for itself (see await).
+// fetch, or a fetch up its chain, leads fails at once instead of waiting for
+// itself (see wait).
 type inSourceKey struct{}
+
+// waitsFor reports whether p, or a fetch up its chain, leads the flight f.
+func (p *claimed[T]) waitsFor(f *flight.Flight[T]) bool {
+	for ; p != nil; p = p.up {
+		if p.leads(f) {
+			return true
+		}
+	}
+	return false
+}
 
 // leads reports whether p leads the flight f.
 func (p *claimed[T]) leads(f *flight.Flight[T]) bool {
@@ -533,7 +567,7 @@ func (c *Cache[T]) askSource(ctx context.Context, p *claimed[T], idxs []int, con
 	// the common single-key miss, with a small frame: a bigger one grows the
 	// fetch goroutine's stack, and copying it doubles the cost of a miss
 	if call := c.claimSource(p, idxs[0]); call != nil {
-		c.joinSource(p, idxs[0], call)
+		c.joinSource(ctx, p, idxs[0], call)
 		return
 	}
 	c.askSourceOne(ctx, p, idxs[0])
@@ -553,7 +587,7 @@ func (c *Cache[T]) askSourceMany(ctx context.Context, p *claimed[T], idxs []int,
 	}
 	c.askSourceOwn(ctx, p, own, conc)
 	for j, i := range joined {
-		c.joinSource(p, i, calls[j])
+		c.joinSource(ctx, p, i, calls[j])
 	}
 }
 
@@ -571,14 +605,15 @@ func (c *Cache[T]) claimSource(p *claimed[T], i int) *sourceCall[T] {
 }
 
 // joinSource answers flight i with the answer of call, another fetch's
-// request to the source; that fetch backfills it.
+// request to the source; that fetch backfills it. The answer is published
+// within that fetch, whatever happens to it (ctx is a fetch's, which does not
+// end), unless it waits for p (see wait).
 //
 //go:noinline
-func (c *Cache[T]) joinSource(p *claimed[T], i int, call *sourceCall[T]) {
+func (c *Cache[T]) joinSource(ctx context.Context, p *claimed[T], i int, call *sourceCall[T]) {
 	call.waiters.Add(1)
-	<-call.flight.Done() // published within its own fetch, whatever happens to it
+	value, err := c.wait(ctx, p.keys[i], call.flight, p)
 	call.waiters.Add(-1)
-	value, err := call.flight.Result()
 	p.publish(i, value, err)
 }
 
