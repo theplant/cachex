@@ -186,6 +186,10 @@ key 列一律以 `clause.Column` 传给 GORM（条件用 `clause.IN`，PostgreSQ
 
 这几种做法的实测对比（包括锁表）见 [research/2026-10-gorm-deadlock.md](../research/2026-10-gorm-deadlock.md)，决策见 [ADR 0010](../adr/0010-gorm-deadlock-ordering-and-retry.md)。
 
+### 时间与时区
+
+写进 SQL 的时间一律转成 UTC（SQLite 把时间存成带偏移的文本、按文本比较，偏移不同就比错）。MySQL 的 `expires_at`、`lease_until` 是 `datetime(3)`，不带时区：驱动按 DSN 的 `loc` 把时间换算成那个时区的墙上时间存进去、读出来再按它解释。默认 `loc=UTC` 没有问题；用 `loc=Local` 而实例分布在不同时区时，一个实例写的时间被另一个实例读偏了时差，租约提前或推迟过期，`DeleteExpired` 删早或删晚。所以 MySQL 的 DSN 保持 `loc=UTC`。PostgreSQL 的列是 `timestamptz`，没有这个问题。
+
 ### 事务
 
 gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立提交，行锁不跨语句持有。写入要是留在事务里，行锁会跨 `Cache` 调用持有，和分片锁形成数据库检测不到的死锁，见 [ADR 0017](../adr/0017-gorm-never-joins-a-caller-transaction.md)。正确的用法是在事务里改数据源，提交之后再 `Set`/`Del`。
@@ -196,6 +200,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 
 - **每批两条语句，各自提交**：先读出至多 `ChunkSize` 个腐烂的 key（不加锁，走 `expires_at` 索引），再删除它们；删除时再核对一次仍然腐烂，两步之间刚被写入、变新鲜的行不会被误删。删除的加锁顺序和写入一致（PostgreSQL 上先按字节序锁行），不会和写入死锁。没有用事务加 `SKIP LOCKED`：MySQL 不允许在 `DELETE` 的子查询里用 `LIMIT`、也不能读写同一张表，硬做就要一个跨两条语句持锁的事务。
 - **不删还有有效租约的行**：那个 key 正在回源，持有者马上会回填它；删了的话回填找不到行，白回源一次。
+- **不看 `KeyPrefix`**：几份缓存共用一张表时，任何一个实例都会清掉所有前缀的腐烂行。这无害：删的只是已经腐烂、读起来本来就是未命中的行；实例之间时钟有偏差时，最多让某个 key 早一点未命中、多回源一次。
 - **谁来跑、多久跑一次交给应用**：同时跑几个是安全的，只是浪费。PostgreSQL 上可以用 `goquecachex.StartCleanup` 让一个实例定时跑它（见下文）。
 - `ctx` 结束就停在批与批之间，返回已经删掉的数量。
 

@@ -199,7 +199,8 @@ products := cachex.New(source, layers, cachex.WithBroadcast(
 - **值的类型有不兼容的改动，却不换 `KeyPrefix`。** JSON 解码很宽松：改了名的字段会读成零值。改类型时一起换 `KeyPrefix`。
 - **`ottercachex` 没设上限。** `New` 会失败：设置 `MaximumSize`，或者 `MaximumWeight` 加 `Weigher`。
 - **`bigcachex` 的 `LifeWindow` 比层的 TTL 短。** 条目会提前消失。只在内存层有数百万条、profile 里 GC 明显时才用它；每次读取都要解码。
-- **`gormcachex` 不调 `Migrate`，或者 MySQL 表不是 `utf8mb4_0900_bin`。** `Migrate` 会建表，并拒绝 key 列用其他任何排序规则的已有 MySQL 表。key 连同 `KeyPrefix` 最长 255 个字符，必须是合法的 UTF-8、不含 NUL；别的 key 总是未命中，写入失败。过期的行不会自动删除：定期调用 `DeleteExpired`（`goquecachex.StartCleanup` 让一个实例定时跑它，需要 PostgreSQL）。只支持各数据库默认的隔离级别。
+- **`gormcachex` 不调 `Migrate`，或者 MySQL 表不是 `utf8mb4_0900_bin`。** `Migrate` 会建表，并拒绝 key 列用其他任何排序规则的已有 MySQL 表。key 连同 `KeyPrefix` 最长 255 个字符，必须是合法的 UTF-8、不含 NUL；别的 key 总是未命中，写入失败。过期的行不会自动删除：定期调用 `DeleteExpired`（`goquecachex.StartCleanup` 让一个实例定时跑它，需要 PostgreSQL）；它清理整张表，不管行是哪个 `KeyPrefix` 写的。只支持各数据库默认的隔离级别。
+- **`gormcachex` 在 MySQL 上、DSN 里写了 `loc=Local`。** 过期时间和租约时间存成 `datetime(3)`，不带时区：保持驱动默认的 `loc=UTC`。用 `loc=Local` 时，不同时区的实例读别人写的时间会差出时差，租约和 `DeleteExpired` 都会出错。
 - **在修改数据源的事务里调用 `Set`/`Del`。** `gormcachex` 从不加入事务：每条语句独立提交，事务回滚不会撤销缓存的写入。在提交之后再调用。
 - **`cachextest.Clock` 远远落后于真实时钟，后端又会让条目过期。** 不管 `WithNow` 怎么设，后端都按真实时钟让条目过期，所以按这个时钟算出的条目会被当场丢掉，每次读取都未命中。让时钟从 `time.Now()` 开始，或者用 `cachextest.Map`。
 
