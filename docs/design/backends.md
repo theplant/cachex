@@ -232,7 +232,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 - 载荷是 `[]byte`，go-bus 把它编成 base64 的 JSON 字符串；解不开的消息直接销毁，不重试。处理完的消息也用 `Destroy` 删掉：go-que 的 `Done` 只给行打上完成时间，没有任何东西会再删它，`goque_jobs` 会一直长。`Destroy` 失败后重试过的任务，退订时 go-bus 本来就有意保留。
 - 在 PostgreSQL 16 容器上跑 `TestBroadcast`、订阅过期后续订、两个实例的端到端测试；没有 Docker 时跳过。
 
-依赖 go-bus 时要注意：go-bus v0.1.2 的 go.mod 要求被撤回的 `go-sqlite3 v2.0.3+incompatible`，Go 会按版本号选中它，把每个依赖 cachex、自己也用 go-sqlite3 的项目降级到 2020 年的版本。所以这里依赖的是 go-bus 的集成分支 `molon/cachex-deps` 上的提交，它合了 #36（go-sqlite3）、#37（依赖修好 mutex 的 go-que）、#38（`UnsubscribeExpired`）三个 PR；go-que 同样依赖 qor5/go-que#16 的提交。两边发版后换成正式版本（见 [todo](../todo.md)）。
+依赖 go-bus 时要注意：go-bus v0.1.2 的 go.mod 要求被撤回的 `go-sqlite3 v2.0.3+incompatible`，Go 会按版本号选中它，把每个依赖 cachex、自己也用 go-sqlite3 的项目降级到 2020 年的版本。所以这里依赖的是 go-bus 的集成分支 `molon/cachex-deps` 上的提交，它合了 #36（go-sqlite3）、#37（依赖修好 mutex 的 go-que）、#38（`UnsubscribeExpired`）、#39（分批清空；发布不再搭上订阅之前开始的订阅查询，刚订阅的实例不会漏掉一条消息）四个 PR；go-que 同样依赖 qor5/go-que#16 的提交。两边发版后换成正式版本（见 [todo](../todo.md)）。
 
 ## goquecachex
 
