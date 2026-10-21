@@ -39,8 +39,9 @@ type Config[T any] struct {
 	ChunkSize int
 	// Leases turns leases on (see cachex.Leaser), for a Redis that several
 	// instances share: a fetch leases a key it misses, with SET NX PX on a
-	// lease key in the key's Cluster slot, a write deletes the lease first,
-	// and a backfill writes the key, with a Lua script, only if its lease
+	// lease key in the key's Cluster slot, a write deletes the lease first
+	// (with leases off too, so an instance without them, in a rolling deploy
+	// that turns them on, say, still ends them), and a backfill writes the key, with a Lua script, only if its lease
 	// still holds the fetch's token. So a value read from the source before
 	// another instance wrote the key is never written over that write. The
 	// empty key under an empty KeyPrefix has no lease key in its slot ("{}" is
@@ -162,8 +163,8 @@ func (b *byteBackend) DelMany(ctx context.Context, keys []string) error {
 }
 
 // write sets the keys that have an entry in entries and deletes the others,
-// in pipelines of ChunkSize keys; with leases on, each key's lease is deleted
-// first (see endLease).
+// in pipelines of ChunkSize keys; each key's lease is deleted first (see
+// endLease).
 func (b *byteBackend) write(ctx context.Context, keys []string, entries map[string]cachex.ByteEntry) map[string]error {
 	errs := map[string]error{}
 	for chunk := range slices.Chunk(keys, b.chunkSize) {

@@ -214,16 +214,19 @@ func (l leaser) runScripts(ctx context.Context, op string, script *redis.Script,
 	return cachex.NewBatchError(errs)
 }
 
-// endLease queues, for a write of key with leases on, the deletion of its
-// lease, before the write itself: deleted after, a backfill holding the
-// token could land between the two.
+// endLease queues, for a write of key, the deletion of its lease, before the
+// write itself: deleted after, a backfill holding the token could land
+// between the two. With leases off too: an instance with them on may share
+// the Redis (a rolling deploy turning them on). A key without a lease key
+// fails with leases on, and has no lease to end with them off: no instance
+// can lease it.
 func (b *byteBackend) endLease(ctx context.Context, pipe redis.Pipeliner, key string) (*redis.IntCmd, error) {
-	if !b.leases {
-		return nil, nil
-	}
 	lk, ok := leaseKey(b.prefix + key)
-	if !ok {
+	switch {
+	case ok:
+		return pipe.Del(ctx, lk), nil
+	case b.leases:
 		return nil, errNoLeaseKey(key)
 	}
-	return pipe.Del(ctx, lk), nil
+	return nil, nil
 }

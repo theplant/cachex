@@ -125,7 +125,7 @@ When several processes share a Redis layer, one of them may read a value from th
 shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
 ```
 
-`gormcachex` has the same `Leases` option, for a table several instances share (after `Migrate`). A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. Turn leases on for every instance sharing the layer at once: a write from an instance without them does not end the leases of one with them, which may then write its older value over it. Leases do not reach other instances' memory layers. For that, turn on the invalidation broadcast: after a write, each instance drops the written keys from its memory layers.
+`gormcachex` has the same `Leases` option, for a table several instances share (after `Migrate`). A fetch leases each key it misses in Redis, a write of the key ends the lease, and the fetch writes Redis only if it still holds its lease. A miss whose lease another instance holds is still answered, without writing Redis; a background refresh then leaves the key to that instance. A write ends the key's lease even from an instance whose leases are off, so leases can be turned on by a rolling deploy. Leases do not reach other instances' memory layers. For that, turn on the invalidation broadcast: after a write, each instance drops the written keys from its memory layers.
 
 ```go
 products := cachex.New(source, layers, cachex.WithBroadcast(

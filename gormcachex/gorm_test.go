@@ -100,7 +100,7 @@ func TestTheKeyColumnIsQuoted(t *testing.T) {
 func TestOnlyTheRowOfExactlyTheKeyIsServed(t *testing.T) {
 	ctx := context.Background()
 	db := newSQLite(t)
-	require.NoError(t, db.Exec("CREATE TABLE nocase (`key` TEXT COLLATE NOCASE PRIMARY KEY, `value` BLOB NOT NULL, `expires_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL)").Error)
+	require.NoError(t, db.Exec("CREATE TABLE nocase (`key` TEXT COLLATE NOCASE PRIMARY KEY, `value` BLOB NOT NULL, `expires_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL, `lease_token` TEXT, `lease_until` DATETIME)").Error)
 	b := New[string](Config[string]{DB: db, TableName: "nocase"})
 	require.NoError(t, b.Set(ctx, "ABC", entry("upper")))
 	_, ok, err := b.Get(ctx, "abc")

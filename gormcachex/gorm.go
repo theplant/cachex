@@ -40,8 +40,8 @@ import (
 const DefaultChunkSize = 1000
 
 // maxChunkSize keeps every statement under the databases' bound parameter
-// limits: an upsert binds 4 parameters per row (6 with leases, whose chunks
-// are bounded by maxLeaseChunk instead), and SQLite allows 32766.
+// limits: SQLite allows 32766. A read or a delete binds a parameter per key;
+// a write binds 6 per row, and its chunks are bounded by maxLeaseChunk.
 const maxChunkSize = 8000
 
 // deadlockAttempts is how many times a write chosen as a deadlock victim is
@@ -71,9 +71,10 @@ type Config[T any] struct {
 	// Logger reports dropped entries that do not decode. Default slog.Default().
 	Logger *slog.Logger
 	// Leases turns leases on (see cachex.Leaser), for a table that several
-	// instances share; they need the lease columns Migrate creates. A fetch
-	// leases a key it misses (a row holding only the lease if the key is
-	// missing), a write clears the lease in the same statement, and a
+	// instances share. A fetch leases a key it misses (a row holding only the
+	// lease if the key is missing), a write clears the lease in the same
+	// statement (with leases off too, so an instance without them, in a
+	// rolling deploy that turns them on, say, still ends them), and a
 	// backfill updates the row only if its lease still holds the fetch's
 	// token. Leases expire by each instance's clock.
 	Leases bool
@@ -116,7 +117,8 @@ type leasedRow struct {
 	LeaseUntil *time.Time
 }
 
-// New returns a Backend on cfg.TableName; call Migrate to create the table.
+// New returns a Backend on cfg.TableName; call Migrate to create the table,
+// whose lease columns it needs whether its leases are on or not.
 func New[T any](cfg Config[T]) *Backend[T] {
 	if cfg.DB == nil {
 		panic("gormcachex: DB is required")
@@ -143,14 +145,12 @@ var errUnstorable = errors.New("the key column holds 255 characters of valid UTF
 // reserved word in MySQL.
 var keyColumn = clause.Column{Name: "key"}
 
+// upsert also ends the row's lease, in the same statement as the write, with
+// leases off too: an instance with them on may share the table (a rolling
+// deploy turning them on), and its backfill must not land over this write.
+// The key is written too: on a key column that is not byte-exact, a shared
+// row belongs to the key written last.
 var upsert = clause.OnConflict{
-	Columns:   []clause.Column{keyColumn},
-	DoUpdates: clause.AssignmentColumns([]string{"key", "value", "expires_at", "updated_at"}), // the key too: on a key column that is not byte-exact, a shared row belongs to the key written last
-}
-
-// upsertLeased is upsert that also ends the row's lease, in the same
-// statement as the write.
-var upsertLeased = clause.OnConflict{
 	Columns:   []clause.Column{keyColumn},
 	DoUpdates: clause.AssignmentColumns([]string{"key", "value", "expires_at", "updated_at", "lease_token", "lease_until"}),
 }
@@ -328,7 +328,7 @@ func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.Byt
 	now := time.Now().UTC() // see utc
 	type pending struct {
 		key string
-		row row
+		row leasedRow
 	}
 	rows := make([]pending, 0, len(entries))
 	for key, e := range entries {
@@ -336,28 +336,17 @@ func (b *byteBackend) setMany(ctx context.Context, entries map[string]cachex.Byt
 			errs[key] = fmt.Errorf("gormcachex: set %q: %w", key, errUnstorable)
 			continue
 		}
-		rows = append(rows, pending{key, row{Key: b.prefix + key, Value: e.Data, ExpiresAt: e.ExpiresAt.UTC(), UpdatedAt: now}})
+		rows = append(rows, pending{key, leasedRow{Key: b.prefix + key, Value: e.Data, ExpiresAt: e.ExpiresAt.UTC(), UpdatedAt: now}})
 	}
 	// one row order for every writer, or overlapping batches lock rows in
 	// opposite orders and deadlock
 	slices.SortFunc(rows, func(a, b pending) int { return strings.Compare(a.row.Key, b.row.Key) })
-	size := b.chunkSize
-	if b.leases {
-		size = min(size, maxLeaseChunk) // a leased row binds 6 parameters
-	}
-	for chunk := range slices.Chunk(rows, size) {
-		batch := make([]row, len(chunk))
+	for chunk := range slices.Chunk(rows, min(b.chunkSize, maxLeaseChunk)) { // a row binds 6 parameters
+		batch := make([]leasedRow, len(chunk))
 		for i, p := range chunk {
 			batch[i] = p.row
 		}
 		if err := b.write(ctx, func(db *gorm.DB) error {
-			if b.leases {
-				leased := make([]leasedRow, len(batch))
-				for i, r := range batch {
-					leased[i] = leasedRow{Key: r.Key, Value: r.Value, ExpiresAt: r.ExpiresAt, UpdatedAt: r.UpdatedAt}
-				}
-				return db.Table(b.table).Clauses(upsertLeased).Create(&leased).Error
-			}
 			return db.Table(b.table).Clauses(upsert).Create(&batch).Error
 		}); err != nil {
 			for _, p := range chunk {

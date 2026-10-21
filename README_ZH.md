@@ -124,7 +124,7 @@ if errors.As(err, &be) {
 shared := rediscachex.New[*Product](rediscachex.Config[*Product]{Client: rdb, KeyPrefix: "product:v1:", Leases: true})
 ```
 
-`gormcachex` 也有同样的 `Leases` 选项，给多个实例共用的表用（要先调 `Migrate`）。一次回源在 Redis 未命中的每个 key 上领租约，写入这个 key 会结束租约，回源只有还持有租约时才写 Redis。别的实例持有租约时，未命中照样返回结果，只是不写 Redis；后台刷新则把这个 key 交给那个实例。共用这一层的所有实例要同时打开租约：没打开的实例写入时不会结束别的实例的租约，后者可能把更旧的值写在它上面。租约管不到其他实例的内存层。要让写入也到达那里，打开失效广播：一次写入之后，每个实例都从自己的内存层里删掉写过的 key。
+`gormcachex` 也有同样的 `Leases` 选项，给多个实例共用的表用（要先调 `Migrate`）。一次回源在 Redis 未命中的每个 key 上领租约，写入这个 key 会结束租约，回源只有还持有租约时才写 Redis。别的实例持有租约时，未命中照样返回结果，只是不写 Redis；后台刷新则把这个 key 交给那个实例。没打开租约的实例写入时也会结束租约，所以可以靠滚动发布打开租约。租约管不到其他实例的内存层。要让写入也到达那里，打开失效广播：一次写入之后，每个实例都从自己的内存层里删掉写过的 key。
 
 ```go
 products := cachex.New(source, layers, cachex.WithBroadcast(

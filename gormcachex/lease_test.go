@@ -80,19 +80,44 @@ func TestLeasesAreOffByDefault(t *testing.T) {
 	assert.Nil(t, newBackend(t, Config[string]{}).Leaser())
 }
 
-func TestATableWithoutLeaseColumnsWorksWithLeasesOff(t *testing.T) {
-	// a table made before leases, or by hand: only leases need Migrate's columns
+func TestMigrateAddsTheLeaseColumnsToATableWithout(t *testing.T) {
 	ctx := context.Background()
 	db := newSQLite(t)
 	require.NoError(t, db.Exec("CREATE TABLE old (`key` TEXT PRIMARY KEY, `value` BLOB NOT NULL, `expires_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL)").Error)
-	b := New[string](Config[string]{DB: db, TableName: "old"})
-	require.NoError(t, b.Set(ctx, "a", entry("v")))
-	require.NoError(t, b.SetMany(ctx, map[string]cachex.Entry[string]{"b": entry("v"), "c": entry("v")}))
-	m, err := b.GetMany(ctx, []string{"a", "b", "c"})
-	require.NoError(t, err)
-	assert.Len(t, m, 3)
-	require.NoError(t, b.Migrate(ctx))
-	assert.True(t, db.Table("old").Migrator().HasColumn(&leasedRow{}, "lease_token"), "Migrate adds the lease columns")
+	require.NoError(t, New[string](Config[string]{DB: db, TableName: "old"}).Migrate(ctx))
+	assert.True(t, db.Table("old").Migrator().HasColumn(&leasedRow{}, "lease_token"))
+	assert.True(t, db.Table("old").Migrator().HasColumn(&leasedRow{}, "lease_until"))
+}
+
+func TestAWriteWithLeasesOffEndsTheLease(t *testing.T) {
+	// a rolling deploy that turns leases on: an old instance's write must
+	// still win over the backfill of a fetch that leased the key before it
+	ctx := context.Background()
+	for name, write := range map[string]func(b *Backend[string]) error{
+		"Set": func(b *Backend[string]) error { return b.Set(ctx, "k", entry("new")) },
+		"SetMany": func(b *Backend[string]) error {
+			return b.SetMany(ctx, map[string]cachex.Entry[string]{"k": entry("new")})
+		},
+		"Del":     func(b *Backend[string]) error { return b.Del(ctx, "k") },
+		"DelMany": func(b *Backend[string]) error { return b.DelMany(ctx, []string{"k"}) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := newSQLite(t)
+			on := newBackend(t, Config[string]{DB: db, KeyPrefix: "p:", Leases: true})
+			off := New[string](Config[string]{DB: db, TableName: "cache", KeyPrefix: "p:"})
+			require.NoError(t, on.Set(ctx, "k", entry("before")))
+			tokens := mustLease(t, on.Leaser(), "k")
+			require.NotEmpty(t, tokens["k"])
+			require.NoError(t, write(off))
+			want, wantOK, err := off.Get(ctx, "k")
+			require.NoError(t, err)
+			require.NoError(t, on.Leaser().PutLeased(ctx, tokens, map[string]cachex.Entry[string]{"k": entry("old")}))
+			got, ok, err := on.Get(ctx, "k")
+			require.NoError(t, err)
+			assert.Equal(t, wantOK, ok)
+			assert.Equal(t, want.Value, got.Value, "the backfill wrote its older value over the write")
+		})
+	}
 }
 
 func TestItIsNotLocal(t *testing.T) {

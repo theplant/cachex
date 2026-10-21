@@ -64,6 +64,56 @@ func TestLeasesAreOffByDefault(t *testing.T) {
 	assert.Nil(t, l.Leaser())
 }
 
+func TestAWriteWithLeasesOffEndsTheLease(t *testing.T) {
+	// a rolling deploy that turns leases on: an old instance's write must
+	// still win over the backfill of a fetch that leased the key before it
+	ctx := context.Background()
+	e := func(v string) cachex.Entry[string] {
+		return cachex.Entry[string]{Value: v, ExpiresAt: time.Now().Add(time.Hour)}
+	}
+	for name, write := range map[string]func(b cachex.Backend[string]) error{
+		"Set": func(b cachex.Backend[string]) error { return b.Set(ctx, "k", e("new")) },
+		"SetMany": func(b cachex.Backend[string]) error {
+			return b.SetMany(ctx, map[string]cachex.Entry[string]{"k": e("new")})
+		},
+		"Del":     func(b cachex.Backend[string]) error { return b.Del(ctx, "k") },
+		"DelMany": func(b cachex.Backend[string]) error { return b.DelMany(ctx, []string{"k"}) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, client := newRedis(t)
+			on := New[string](Config[string]{Client: client, KeyPrefix: "p:", Leases: true})
+			off := New[string](Config[string]{Client: client, KeyPrefix: "p:"})
+			l := on.(cachex.Leasing[string]).Leaser()
+			require.NoError(t, on.Set(ctx, "k", e("before")))
+			tokens, err := l.Lease(ctx, []string{"k"}, time.Minute)
+			require.NoError(t, err)
+			require.NotEmpty(t, tokens["k"])
+			require.NoError(t, write(off))
+			want, wantOK, err := off.Get(ctx, "k")
+			require.NoError(t, err)
+			require.NoError(t, l.PutLeased(ctx, tokens, map[string]cachex.Entry[string]{"k": e("old")}))
+			got, ok, err := on.Get(ctx, "k")
+			require.NoError(t, err)
+			assert.Equal(t, wantOK, ok)
+			assert.Equal(t, want.Value, got.Value, "the backfill wrote its older value over the write")
+		})
+	}
+}
+
+func TestAKeyWithoutALeaseKeyIsWrittenWithLeasesOff(t *testing.T) {
+	// no instance can lease it, so there is no lease to end
+	ctx := context.Background()
+	_, client := newRedis(t)
+	b := New[string](Config[string]{Client: client})
+	for _, key := range []string{"", "a}b"} {
+		require.NoError(t, b.Set(ctx, key, cachex.Entry[string]{Value: "v", ExpiresAt: time.Now().Add(time.Hour)}), "%q", key)
+		_, ok, err := b.Get(ctx, key)
+		require.NoError(t, err)
+		assert.True(t, ok, "%q", key)
+		require.NoError(t, b.Del(ctx, key), "%q", key)
+	}
+}
+
 func TestTheLeaseKeySharesTheDataKeysSlot(t *testing.T) {
 	for prefixed, want := range map[string]string{
 		"p:user:1":         "cachex-lease:{p:user:1}",

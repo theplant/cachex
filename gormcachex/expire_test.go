@@ -99,17 +99,6 @@ func TestDeleteExpired(t *testing.T) {
 	})
 }
 
-func TestDeleteExpiredOnATableWithoutLeaseColumns(t *testing.T) {
-	ctx := context.Background()
-	db := newSQLite(t)
-	require.NoError(t, db.Exec("CREATE TABLE old (`key` TEXT PRIMARY KEY, `value` BLOB NOT NULL, `expires_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL)").Error)
-	b := New[string](Config[string]{DB: db, TableName: "old"})
-	require.NoError(t, b.bytes.SetMany(ctx, map[string]cachex.ByteEntry{"a": {Data: []byte("x"), ExpiresAt: time.Now().Add(-time.Hour)}}))
-	n, err := b.DeleteExpired(ctx)
-	require.NoError(t, err, "leases off: the lease columns are not needed")
-	assert.Equal(t, int64(1), n)
-}
-
 func TestTimesInAnotherOffsetCompareRightOnSQLite(t *testing.T) {
 	// SQLite compares times as text with their offsets: an hour ahead in
 	// UTC-10 reads as long past next to now in UTC or local time
