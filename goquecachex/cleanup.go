@@ -51,7 +51,8 @@ type Cleanup struct {
 
 // StartCleanup starts running cfg.Cleaner every cfg.Interval as a go-que
 // job of its own, and returns once its worker runs; it is meant to be called
-// on every instance. The job reschedules itself: each run destroys it and
+// on every instance. Each instance's worker polls for the job at most every
+// 10 seconds (or every Interval, if shorter). The job reschedules itself: each run destroys it and
 // enqueues the next in one transaction, and a job's UniqueID keeps one job
 // in the queue, so one instance runs it at a time. A failed run is logged and
 // tried again within a minute (or the interval, if shorter). A failed
@@ -93,7 +94,7 @@ func StartCleanup(ctx context.Context, cfg CleanupConfig) (*Cleanup, error) {
 		Queue:                     j.name,
 		Mutex:                     q.Mutex(),
 		Perform:                   j.perform,
-		MaxLockPerSecond:          2,
+		MaxLockPerSecond:          pollRate(cfg.Interval),
 		MaxBufferJobsCount:        1,
 		MaxPerformPerSecond:       2,
 		MaxConcurrentPerformCount: 1,
@@ -103,6 +104,11 @@ func StartCleanup(ctx context.Context, cfg CleanupConfig) (*Cleanup, error) {
 	}
 	return &Cleanup{worker: worker}, nil
 }
+
+// pollRate is how many times a second each instance's worker asks the
+// database for the job: once an interval, but no more than every 10 seconds,
+// which is how late a run may start.
+func pollRate(interval time.Duration) float64 { return max(0.1, 1/interval.Seconds()) }
 
 // Stop stops the instance's worker; a run in progress finishes first, unless
 // ctx ends. The job stays queued for the other instances.

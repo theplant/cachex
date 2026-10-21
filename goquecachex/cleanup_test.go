@@ -114,6 +114,13 @@ func TestTheJobIsRetriedForever(t *testing.T) {
 	assert.True(t, more)
 }
 
+func TestTheWorkerPollsNoMoreThanItNeeds(t *testing.T) {
+	// an hourly job needs no database query twice a second on every instance
+	assert.InDelta(t, 0.1, pollRate(time.Hour), 1e-9, "every 10s")
+	assert.InDelta(t, 0.1, pollRate(10*time.Second), 1e-9)
+	assert.InDelta(t, 10, pollRate(100*time.Millisecond), 1e-9, "a shorter interval: once an interval")
+}
+
 func TestADeletedJobComesBackWithAnInstance(t *testing.T) {
 	db := newDB(t)
 	c := &cleaner{}
