@@ -89,16 +89,25 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 		}
 	}
 	db := l.b.db.WithContext(ctx)
-	orphans := map[string]string{} // tokens a failed chunk may have left in rows
-	defer func() {
-		if len(orphans) == 0 {
-			return
-		}
-		// end them, or nobody could lease the keys until the TTL; best
-		// effort, once, with a budget of its own (ctx may be what ended)
+	// tokens a failed chunk left in rows (orphans), or may have (unsure: an
+	// insert that failed may have committed, its reply lost); end them, or
+	// nobody could lease the keys until the TTL. Best effort, once, with a
+	// budget of their own (ctx may be what ended). The unsure ones are
+	// released in the background: the database may be what failed, and the
+	// caller should not wait on it for what probably is not there.
+	orphans, unsure := map[string]string{}, map[string]string{}
+	release := func(tokens map[string]string) {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		_ = l.Release(rctx, orphans)
+		_ = l.Release(rctx, tokens)
+	}
+	defer func() {
+		if len(unsure) > 0 {
+			go release(unsure)
+		}
+		if len(orphans) > 0 {
+			release(orphans)
+		}
 	}()
 	for _, c := range l.chunks(keys) {
 		chunk, prefixed := c[0], c[1]
@@ -138,10 +147,12 @@ func (l leaser) Lease(ctx context.Context, keys []string, ttl time.Duration) (ma
 			for _, key := range chunk {
 				errs[key] = fmt.Errorf("gormcachex: lease %q: %w", key, err)
 			}
-			if inserted { // its rows (or the leases the second statement took) hold tokens the caller never gets
-				for i, key := range chunk {
-					orphans[key] = tokens[i]
-				}
+			left := orphans // its rows (or the leases the second statement took) hold tokens the caller never gets
+			if !inserted {
+				left = unsure
+			}
+			for i, key := range chunk {
+				left[key] = tokens[i]
 			}
 			continue
 		}

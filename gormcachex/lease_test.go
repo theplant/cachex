@@ -187,6 +187,29 @@ func TestAFailedLeaseLeavesNoLeaseBehind(t *testing.T) {
 	assert.NotEmpty(t, tokens["k"], "nobody holds k's lease")
 }
 
+func TestALeaseWhoseInsertCommittedButFailedLeavesNoLeaseBehind(t *testing.T) {
+	// the insert's reply can be lost after it committed (ctx ended, the
+	// connection broke): its rows hold tokens the caller never gets
+	ctx := context.Background()
+	db := newSQLite(t)
+	var fail atomic.Bool
+	require.NoError(t, db.Callback().Create().After("gorm:create").Register("test:lostreply", func(tx *gorm.DB) {
+		if fail.Load() {
+			_ = tx.AddError(errors.New("bad connection"))
+		}
+	}))
+	l := newBackend(t, Config[string]{DB: db, Leases: true}).Leaser()
+	fail.Store(true)
+	tokens, err := l.Lease(ctx, []string{"k"}, time.Minute)
+	require.Error(t, err)
+	require.Empty(t, tokens)
+	fail.Store(false)
+	assert.Eventually(t, func() bool {
+		tokens, err := l.Lease(ctx, []string{"k"}, time.Minute)
+		return err == nil && tokens["k"] != ""
+	}, 5*time.Second, 5*time.Millisecond, "nobody holds k's lease")
+}
+
 func TestALeaseOnAHungDatabaseKeepsToItsContext(t *testing.T) {
 	db := newSQLite(t)
 	b := newBackend(t, Config[string]{DB: db, Leases: true, ChunkSize: 1})
@@ -198,5 +221,5 @@ func TestALeaseOnAHungDatabaseKeepsToItsContext(t *testing.T) {
 	start := time.Now()
 	_, err := b.Leaser().Lease(ctx, []string{"a", "b"}, time.Minute)
 	require.Error(t, err)
-	assert.Less(t, time.Since(start), time.Second, "nothing was inserted: nothing to release")
+	assert.Less(t, time.Since(start), time.Second, "the release of what a failed insert may have left runs in the background")
 }
