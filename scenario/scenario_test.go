@@ -412,7 +412,13 @@ func (s *switchable) Listen(ctx context.Context, ready func(), deliver func([]by
 		s.mu.Lock()
 		s.cancel, s.stopped = cancel, stopped
 		s.mu.Unlock()
-		err := s.inner.Listen(lctx, func() { ready(); s.ready <- struct{}{} }, deliver)
+		err := s.inner.Listen(lctx, func() {
+			ready()
+			select { // waitReady needs one; a long run subscribes again and again
+			case s.ready <- struct{}{}:
+			default:
+			}
+		}, deliver)
 		cancel()
 		close(stopped)
 		if ctx.Err() != nil {
