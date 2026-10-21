@@ -410,3 +410,18 @@ func (m *intoCounting) GetMany(ctx context.Context, keys []string) (map[string]c
 	m.many.Add(1)
 	return m.Map.GetMany(ctx, keys)
 }
+
+func TestABackendsNilBatchErrorIsNoError(t *testing.T) {
+	// a common slip: returning a nil *BatchError as an error, which is not nil
+	mem := &hooked[string]{Backend: cachextest.NewMap[string](), hook: func(op string, _ []string, many bool) error {
+		if op == "get" && many {
+			var be *cachex.BatchError
+			return be // read as: no key failed (and none found)
+		}
+		return nil
+	}}
+	c := cachex.New[string](newBatchSource(map[string]string{"a": "1", "b": "2"}), oneLayer(mem))
+	got, err := c.GetMany(context.Background(), []string{"a", "b"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"a": "1", "b": "2"}, got)
+}

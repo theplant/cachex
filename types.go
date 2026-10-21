@@ -153,9 +153,13 @@ func batchError(errs map[string]error) error {
 // errForKey returns the error a batch call reported for key: the key's own
 // entry if err is a *BatchError, otherwise err itself (the whole call failed).
 // Only an unwrapped *BatchError is partial: a wrapped or joined one may sit
-// next to an error that failed the whole call.
+// next to an error that failed the whole call. A nil *BatchError, returned
+// by mistake as an error that is not nil, fails no key.
 func errForKey(err error, key string) error {
 	if batchErr, ok := err.(*BatchError); ok { //nolint:errorlint // see above
+		if batchErr == nil {
+			return nil
+		}
 		return batchErr.Errors[key]
 	}
 	return err
