@@ -181,6 +181,16 @@ func TestNewRejectsAMissingDBOrTable(t *testing.T) {
 	assert.Panics(t, func() { New[string](Config[string]{DB: &gorm.DB{}}) })
 }
 
+func TestNewRejectsAKeyPrefixNoKeyCanBeStoredUnder(t *testing.T) {
+	// every key would miss on every read, and fail to be written
+	for _, prefix := range []string{"p\xff:", "p\x00:", strings.Repeat("p", 256)} {
+		assert.Panics(t, func() { New[string](Config[string]{DB: &gorm.DB{}, TableName: "t", KeyPrefix: prefix}) }, "%q", prefix)
+	}
+	assert.NotPanics(t, func() {
+		New[string](Config[string]{DB: &gorm.DB{}, TableName: "t", KeyPrefix: strings.Repeat("é", 255)})
+	})
+}
+
 type item struct {
 	ID   int
 	Tags []string

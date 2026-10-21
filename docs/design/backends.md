@@ -146,7 +146,7 @@ type row struct {
 }
 ```
 
-`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用；key 列最长 255 个字符，**包括前缀**，而且必须是合法的 UTF-8、不含 NUL。别的 key 不进 SQL：读成未命中，写入只让它自己失败（回填失败只记 WARN，这个 key 就每次都未命中），删除什么也不做。数据库拒收一个 key 时会让整条语句失败，所以要先拦下，否则同一条语句里的其他 key 跟着失败（PostgreSQL 连读取都会失败）。`New` 返回 `*gormcachex.Backend[T]`，它嵌入 `cachex.Backend[T]`，另有 `Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要定期调用 `DeleteExpired` 删掉（见下文「清理腐烂的行」）。
+`KeyPrefix` 会拼在 key 前面，同一张表可以给多个用途使用；key 列最长 255 个字符，**包括前缀**，而且必须是合法的 UTF-8、不含 NUL。别的 key 不进 SQL：读成未命中，写入只让它自己失败（回填失败只记 WARN，这个 key 就每次都未命中），删除什么也不做。数据库拒收一个 key 时会让整条语句失败，所以要先拦下，否则同一条语句里的其他 key 跟着失败（PostgreSQL 连读取都会失败）。前缀本身就存不下（不是 UTF-8、含 NUL、超过 255 个字符）时，`New` 直接 panic：否则每个 key 都永远未命中。`New` 返回 `*gormcachex.Backend[T]`，它嵌入 `cachex.Backend[T]`，另有 `Migrate` 建表。表不会自动清理，过了 `expires_at` 的行要定期调用 `DeleteExpired` 删掉（见下文「清理腐烂的行」）。
 
 ### key 必须精确比较
 
@@ -216,7 +216,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 
 只有失效广播的传输，不存条目：`NewBroadcast` 返回一个基于 go-bus（github.com/qor5/go-bus，PostgreSQL 上的发布订阅）的 `cachex.Broadcast`。go-bus 只支持 PostgreSQL，所以它只适合数据库是 PostgreSQL、又没有 Redis 的部署；缓存表在 MySQL 的项目要用它，得另起一个 PostgreSQL，不如用 `rediscachex.NewBroadcast`。机制见 [consistency.md](consistency.md#失效广播)。
 
-- **主题**默认 `cachex.invalidate`；几份缓存共用一个 go-bus 时，各给各的（只能是小写、用点分隔）。
+- **主题**默认 `cachex.invalidate`；几份缓存共用一个 go-bus 时，各给各的（只能是小写、用点分隔）。go-bus 拒收的主题，和不是整数微秒的 TTL（go-bus 按微秒存），`NewBroadcast` 直接 panic：否则 `Listen` 每次订阅都失败、一直重试，永远不调用 `ready`。
 - **发布不进调用方的事务**：go-bus 会从 ctx 里取事务（`bussql.NewContext`），调用方按惯例用同一个 ctx 改完数据源、提交、再写缓存时，发布会跑进已经结束的事务。`Publish` 用 `bussql.NewContext(ctx, nil)` 把它屏蔽掉，消息总是独立提交（[ADR 0023](../adr/0023-invalidation-broadcast.md#修订2026-10-15)）。数据库断开所有连接后的第一次发布可能用到池里已断的连接而失败，`Cache` 会重试。
 - **每次 `Listen` 订阅一个自己的队列**（`cachex-` 加随机后缀），带 TTL（默认 1 分钟）和自动清空，订阅成功就调用 `ready`；`ctx` 结束时停掉消费者、退订（go-bus 的退订是软删除）。
 - **心跳**：go-bus 提供 `Heartbeat`，但要使用者自己定期调用，这里每 TTL 的三分之一调一次。订阅过期后 go-bus 不再往它的队列投递，`Heartbeat` 返回 `ErrSubscriptionNotFound`：这时可能漏了消息，就重新订阅，再调用一次 `ready`，`Cache` 清空本地层。数据库暂时连不上导致的心跳失败只记 WARN，下次再试，订阅在 TTL 内仍然有效。过期按数据库的 `NOW()` 判断，不受实例之间的时钟偏差影响。消费者自己停下（比如数据库出错）时也重新订阅。

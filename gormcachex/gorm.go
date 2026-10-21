@@ -59,7 +59,8 @@ type Config[T any] struct {
 	// caches. The key column holds 255 characters of valid UTF-8 without NUL,
 	// prefix included: any other key fails to be written (a backfill only logs
 	// it, so the key misses on every read), without failing the other keys of
-	// its call. Change it when the value type changes incompatibly (see
+	// its call; New panics on a prefix no key can be stored under. Change it
+	// when the value type changes incompatibly (see
 	// rediscachex.Config.KeyPrefix).
 	KeyPrefix string
 	// ChunkSize is how many keys one statement carries; a larger call runs
@@ -125,6 +126,9 @@ func New[T any](cfg Config[T]) *Backend[T] {
 	}
 	if cfg.TableName == "" {
 		panic("gormcachex: TableName is required")
+	}
+	if !storable(cfg.KeyPrefix) {
+		panic("gormcachex: KeyPrefix: " + errUnstorable.Error())
 	}
 	b := &byteBackend{db: cfg.DB, table: cfg.TableName, prefix: cfg.KeyPrefix,
 		chunkSize: min(cmp.Or(max(cfg.ChunkSize, 0), DefaultChunkSize), maxChunkSize), leases: cfg.Leases}

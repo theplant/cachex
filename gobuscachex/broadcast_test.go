@@ -78,6 +78,24 @@ func TestNewBroadcastNeedsABus(t *testing.T) {
 	assert.Panics(t, func() { NewBroadcast(BroadcastConfig{}) })
 }
 
+func TestNewBroadcastRejectsWhatGoBusWouldRejectForever(t *testing.T) {
+	// Listen would retry the subscription for good, never calling ready
+	b := struct{ bus.Bus }{}
+	for name, cfg := range map[string]BroadcastConfig{
+		"a TTL not in whole microseconds": {TTL: time.Minute + time.Nanosecond},
+		"uppercase":                       {Subject: "Cachex.invalidate"},
+		"an empty token":                  {Subject: "cachex..invalidate"},
+		"a wildcard":                      {Subject: "cachex.*"},
+		"a space":                         {Subject: "cachex invalidate"},
+	} {
+		cfg.Bus = b
+		assert.Panics(t, func() { NewBroadcast(cfg) }, name)
+	}
+	assert.NotPanics(t, func() {
+		NewBroadcast(BroadcastConfig{Bus: b, Subject: "my-app.cache_1.invalidate", TTL: 1500 * time.Microsecond})
+	})
+}
+
 func TestAnExpiredSubscriptionIsRenewedAndCallsReady(t *testing.T) {
 	// a subscription that missed its heartbeats expired, and with it what was
 	// published meanwhile: the Cache clears its local layers on the new ready

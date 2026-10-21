@@ -30,13 +30,15 @@ type BroadcastConfig struct {
 	// Bus is the bus. Required.
 	Bus bus.Bus
 	// Subject is the subject the instances of one cache publish to and
-	// subscribe to: lowercase tokens separated by dots. Default
+	// subscribe to: up to 16 tokens of lowercase letters, digits, '_' and '-',
+	// separated by dots (NewBroadcast panics on another). Default
 	// "cachex.invalidate"; give each cache its own when several share a bus.
 	Subject string
 	// TTL is how long an instance's subscription lives without a heartbeat;
 	// it beats every third of it. Once it expired, what was published is
 	// lost: the instance subscribes again, and the Cache clears its local
-	// layers. Default DefaultTTL.
+	// layers. A whole number of microseconds, as go-bus stores it
+	// (NewBroadcast panics on another). Default DefaultTTL.
 	TTL time.Duration
 	// WorkerConfig tunes the consumer; its MaxLockPerSecond is how often it
 	// polls the database, which bounds how soon a message arrives. Default
@@ -69,8 +71,14 @@ func NewBroadcast(cfg BroadcastConfig) cachex.Broadcast {
 	if cfg.Subject == "" {
 		cfg.Subject = "cachex.invalidate"
 	}
+	if err := bus.ValidateSubject(cfg.Subject); err != nil { // a subject is also a pattern to subscribe to
+		panic("gobuscachex: NewBroadcast: " + err.Error())
+	}
 	if cfg.TTL <= 0 {
 		cfg.TTL = DefaultTTL
+	}
+	if cfg.TTL%time.Microsecond != 0 { // go-bus stores it in microseconds, and rejects it otherwise
+		panic("gobuscachex: NewBroadcast: TTL must be a whole number of microseconds")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
