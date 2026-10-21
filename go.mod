@@ -7,8 +7,8 @@ require (
 	github.com/allegro/bigcache/v3 v3.1.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/maypok86/otter/v2 v2.3.0
-	github.com/qor5/go-bus v0.1.3-0.20261014191129-f7e5dcadccf4
-	github.com/qor5/go-que v1.1.3-0.20261014191037-b635c33e212d
+	github.com/qor5/go-bus v0.1.3-0.20261021181205-d06b11338446
+	github.com/qor5/go-que v1.1.3-0.20261021175641-4ce8264f2615
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.44.0

@@ -1,9 +1,13 @@
 package gobuscachex
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -270,4 +274,57 @@ func TestPublishNeverJoinsTheCallersTransaction(t *testing.T) {
 	require.NoError(t, tx.Commit())
 	cfg := BroadcastConfig{Bus: b, Subject: "cachex.invalidate.tx", WorkerConfig: fast}
 	assert.NoError(t, NewBroadcast(cfg).Publish(bussql.NewContext(ctx, tx), []byte("x")))
+}
+
+// cannotUnsubscribeExpired is a bus whose dialect cannot unsubscribe expired
+// subscriptions.
+type cannotUnsubscribeExpired struct {
+	bus.Bus
+	calls atomic.Int32
+}
+
+func (b *cannotUnsubscribeExpired) UnsubscribeExpired(context.Context) (int, error) {
+	b.calls.Add(1)
+	return 0, bus.ErrNotSupported
+}
+
+func TestABusThatCannotUnsubscribeExpiredIsAskedOnce(t *testing.T) {
+	// asking again on every heartbeat would log the same warning each time
+	b, _ := newBus(t)
+	cb := &cannotUnsubscribeExpired{Bus: b}
+	var logs syncBuffer
+	cfg := BroadcastConfig{Bus: cb, Subject: "cachex.invalidate.unsupported", TTL: 300 * time.Millisecond, WorkerConfig: fast,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{}, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = NewBroadcast(cfg).Listen(ctx, func() { ready <- struct{}{} }, func([]byte) {})
+	}()
+	waitFor(t, ready)
+	require.Eventually(t, func() bool { return cb.calls.Load() > 0 }, 10*time.Second, 10*time.Millisecond)
+	time.Sleep(time.Second) // ponytail: ten more heartbeat ticks
+	cancel()
+	<-done
+	assert.EqualValues(t, 1, cb.calls.Load())
+	assert.Equal(t, 1, strings.Count(logs.String(), "cannot unsubscribe expired subscriptions"), logs.String())
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent writes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

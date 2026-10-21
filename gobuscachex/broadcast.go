@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bus "github.com/qor5/go-bus"
@@ -86,7 +87,12 @@ func NewBroadcast(cfg BroadcastConfig) cachex.Broadcast {
 	return &broadcast{cfg: cfg}
 }
 
-type broadcast struct{ cfg BroadcastConfig }
+type broadcast struct {
+	cfg BroadcastConfig
+	// cannotUnsubscribeExpired: the bus said it cannot (bus.ErrNotSupported),
+	// so it is not asked again
+	cannotUnsubscribeExpired atomic.Bool
+}
 
 // Publish sends msg as the payload, which go-bus encodes as base64 JSON.
 func (b *broadcast) Publish(ctx context.Context, msg []byte) error {
@@ -174,19 +180,16 @@ func (b *broadcast) subscribe(ctx context.Context, ready func(), handler bus.Han
 			case err != nil && ctx.Err() == nil: // the database may be down: try again on the next tick
 				b.cfg.Logger.WarnContext(ctx, "gobuscachex: heartbeat failed", "subject", b.cfg.Subject, "error", err)
 			}
-			if u, ok := b.cfg.Bus.(expiredUnsubscriber); ok {
-				if _, err := u.UnsubscribeExpired(ctx); err != nil && ctx.Err() == nil {
+			if u, ok := b.cfg.Bus.(bus.ExpiredUnsubscriber); ok && !b.cannotUnsubscribeExpired.Load() {
+				_, err := u.UnsubscribeExpired(ctx)
+				switch {
+				case errors.Is(err, bus.ErrNotSupported):
+					b.cannotUnsubscribeExpired.Store(true)
+					b.cfg.Logger.WarnContext(ctx, "gobuscachex: the bus cannot unsubscribe expired subscriptions: those of instances that died stay with their messages", "error", err)
+				case err != nil && ctx.Err() == nil:
 					b.cfg.Logger.WarnContext(ctx, "gobuscachex: unsubscribing expired subscriptions failed", "error", err)
 				}
 			}
 		}
 	}
-}
-
-// expiredUnsubscriber is a bus that unsubscribes, on their owners' behalf,
-// subscriptions whose TTL ran out (go-bus's BusImpl): an instance that died
-// without unsubscribing (SIGKILL, OOM) would leave its subscription and its
-// queue's messages behind for good. It handles a bounded batch a call.
-type expiredUnsubscriber interface {
-	UnsubscribeExpired(ctx context.Context) (int, error)
 }
