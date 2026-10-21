@@ -124,6 +124,23 @@ func TestASilentlyDeadSubscriptionIsReplaced(t *testing.T) {
 	}
 }
 
+func TestAQuietHealthySubscriptionIsKept(t *testing.T) {
+	// a ping answered is enough: subscribing anew calls ready, and the Cache
+	// clears its local layers each time
+	defer func(d time.Duration) { healthCheck = d }(healthCheck)
+	healthCheck = 50 * time.Millisecond
+	_, client := newRedis(t)
+	b := NewBroadcast(BroadcastConfig{Client: client})
+	ctx, cancel := context.WithCancel(context.Background())
+	var readies atomic.Int64
+	done := make(chan struct{})
+	go func() { defer close(done); _ = b.Listen(ctx, func() { readies.Add(1) }, func([]byte) {}) }()
+	time.Sleep(20 * healthCheck) // nothing to wait for: what is checked is that nothing happens
+	cancel()
+	<-done
+	assert.EqualValues(t, 1, readies.Load(), "subscribed once")
+}
+
 // blackhole proxies to addr; freeze makes the connections open so far drop
 // every byte both ways without closing (a half-open TCP connection). Later
 // connections work.
