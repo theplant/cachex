@@ -15,8 +15,13 @@ import (
 // Bus is an in-memory hub for cachex.Broadcast, for tests: each Broadcast it
 // hands out stands for one instance. Messages reach the listening instances
 // in the order they were published. Disconnect and Reconnect stand for a lost
-// subscription: what is published in between is lost.
+// subscription: what is published in between is lost. A listener that falls
+// 1024 messages behind holds Publish up until it catches up or goes away.
 type Bus struct {
+	// send lets one Publish or Reconnect run at a time, so messages keep
+	// their order; it may wait on a slow listener, so mu, which a listener
+	// takes to go away, is never held while sending
+	send       sync.Mutex
 	mu         sync.Mutex
 	listeners  map[*listener]struct{}
 	online     bool
@@ -27,6 +32,16 @@ type Bus struct {
 type listener struct {
 	msgs  chan []byte
 	ready chan struct{}
+	gone  chan struct{} // closed when its Listen returns: nothing is sent to it then
+}
+
+// snapshot returns the listeners.
+func (b *Bus) snapshot() []*listener {
+	ls := make([]*listener, 0, len(b.listeners))
+	for l := range b.listeners {
+		ls = append(ls, l)
+	}
+	return ls
 }
 
 // NewBus returns a connected Bus.
@@ -45,11 +60,17 @@ func (b *Bus) Disconnect() {
 
 // Reconnect resubscribes every listener, each of which calls its ready.
 func (b *Bus) Reconnect() {
+	b.send.Lock()
+	defer b.send.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	b.online = true
-	for l := range b.listeners {
-		l.ready <- struct{}{}
+	ls := b.snapshot()
+	b.mu.Unlock()
+	for _, l := range ls {
+		select {
+		case l.ready <- struct{}{}:
+		case <-l.gone:
+		}
 	}
 }
 
@@ -73,27 +94,34 @@ type busBroadcast struct{ b *Bus }
 
 func (bb busBroadcast) Publish(_ context.Context, msg []byte) error {
 	b := bb.b
+	b.send.Lock()
+	defer b.send.Unlock()
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.fail != nil {
-		return b.fail
+	fail, online, ls := b.fail, b.online, b.snapshot()
+	b.mu.Unlock()
+	if fail != nil {
+		return fail
 	}
-	if !b.online {
+	if !online {
 		return nil
 	}
-	for l := range b.listeners {
-		l.msgs <- append([]byte(nil), msg...)
+	for _, l := range ls {
+		select {
+		case l.msgs <- append([]byte(nil), msg...):
+		case <-l.gone:
+		}
 	}
 	return nil
 }
 
 func (bb busBroadcast) Listen(ctx context.Context, ready func(), deliver func(msg []byte)) error {
 	b := bb.b
-	l := &listener{msgs: make(chan []byte, 1024), ready: make(chan struct{}, 16)}
+	l := &listener{msgs: make(chan []byte, 1024), ready: make(chan struct{}, 16), gone: make(chan struct{})}
 	b.mu.Lock()
 	b.listeners[l] = struct{}{}
 	b.mu.Unlock()
 	defer func() {
+		close(l.gone)
 		b.mu.Lock()
 		delete(b.listeners, l)
 		b.mu.Unlock()

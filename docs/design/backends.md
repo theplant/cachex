@@ -249,7 +249,7 @@ gormcachex 不进调用方的事务，每条语句都在 `Config.DB` 上独立�
 - `TestBackend[T](t, newBackend, values)`：`Backend` 的契约测试。`values` 至少 3 个不同的值；用 `string` 和一个结构体各跑一遍，编码值的后端就覆盖了编解码器的主要分支。检查未命中不是错误、条目原样读回（包括不存在记录）、值和不存在记录互相覆盖、写入一个已经腐烂的条目不会让旧值还能读到、key 精确比较（大小写、末尾空格、重音）、批量操作、批量里重复的 key、空批量，以及多个 goroutine 同时读写（各自的 key 读回正确、共享 key 最后是写过的某个值，配合 `-race`）。
 - `TestByteBackend(t, newBackend)`：`ByteBackend` 的契约测试：未命中不是错误、字节原样读回并能覆盖、传进去和拿出来的字节归调用方、key 精确比较、批量操作、空批量、多个 goroutine 同时读写。
 - `NewLeasingMap[T]()`：打开了租约的 `LeasingMap`，几个 `Cache` 共用它，就是共用一个共享层的几个实例；它不是本地层，不能清空。
-- `NewBus()`：内存里的失效广播，`Broadcast()` 给每个实例一个端点；`Disconnect`、`Reconnect` 模拟断线丢消息，`Subscribed` 用来等实例订阅完成，`FailPublish` 让发布失败。
+- `NewBus()`：内存里的失效广播，`Broadcast()` 给每个实例一个端点；`Disconnect`、`Reconnect` 模拟断线丢消息，`Subscribed` 用来等实例订阅完成，`FailPublish` 让发布失败。落后 1024 条消息的实例会让 `Publish` 等它；发送时不拿着它退出时要拿的锁，退出了的实例直接跳过，所以不会死锁。
 - `TestBroadcast(t, newPair)`：`Broadcast` 的契约测试：订阅成功调用 `ready`，一个实例发布的字节原样到达另一个，`ctx` 结束后 `Listen` 返回。
 - `TestLeaser(t, newBackend, value)`：打开了租约的 `Backend` 的契约测试：租约只能领一次，直到结束或过期；`Set`、`SetMany`、`Del`、`DelMany` 都结束租约；`PutLeased` 只在令牌对得上时写入或删除，并结束租约；别的令牌既不能写也不能释放；`Release` 结束租约、不写；已经腐烂的条目不会让旧值还能读到；批量。
 
