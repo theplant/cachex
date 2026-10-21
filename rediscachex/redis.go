@@ -41,8 +41,8 @@ type Config[T any] struct {
 	// instances share: a fetch leases a key it misses, with SET NX PX on a
 	// lease key in the key's Cluster slot, a write deletes the lease first
 	// (with leases off too, so an instance without them, in a rolling deploy
-	// that turns them on, say, still ends them), and a backfill writes the key, with a Lua script, only if its lease
-	// still holds the fetch's token. So a value read from the source before
+	// that turns them on, say, still ends them), and a backfill writes the
+	// key, with a Lua script, only if its lease still holds the fetch's token. So a value read from the source before
 	// another instance wrote the key is never written over that write. The
 	// empty key under an empty KeyPrefix has no lease key in its slot ("{}" is
 	// no hash tag): with leases on, writes of it fail with
