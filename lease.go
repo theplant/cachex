@@ -3,6 +3,7 @@ package cachex
 import (
 	"context"
 	"errors"
+	"math"
 	"runtime/debug"
 	"slices"
 	"time"
@@ -133,7 +134,7 @@ func (c *Cache[T]) lease(ctx context.Context, p *claimed[T], li int, idxs []int)
 	l := c.leasers[li]
 	lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
 	at := time.Now() // no later than the backend starts the lease's TTL
-	tokens, err := l.Lease(lctx, keysAt(p.keys, idxs), 2*c.opts.fetchTimeout)
+	tokens, err := l.Lease(lctx, keysAt(p.keys, idxs), c.leaseTTL())
 	cancel()
 	warn := false
 	for _, i := range idxs {
@@ -187,7 +188,7 @@ func (c *Cache[T]) renew(ctx context.Context, p *claimed[T], i int) {
 		}
 		c.releaseLeases(ctx, li, c.leasers[li], map[string]string{key: token})
 		lctx, cancel := context.WithTimeout(ctx, c.opts.fetchTimeout)
-		tokens, err := c.leasers[li].Lease(lctx, []string{key}, 2*c.opts.fetchTimeout)
+		tokens, err := c.leasers[li].Lease(lctx, []string{key}, c.leaseTTL())
 		cancel()
 		if err != nil {
 			c.opts.logger.WarnContext(ctx, "cachex: lease failed", "layer", li, "error", err)
@@ -307,4 +308,10 @@ func (c *Cache[T]) putLeased(ctx context.Context, j int, fills []fill[T], idxs [
 //go:noinline
 func (c *Cache[T]) putLeasedOne(ctx context.Context, j int, f *fill[T], copied bool, now time.Time) {
 	c.putLeased(ctx, j, []fill[T]{*f}, []int{0}, copied, now)
+}
+
+// leaseTTL is how long a lease holds: two fetch timeouts, capped so that a
+// timeout of "never" (math.MaxInt64) does not overflow into a negative one.
+func (c *Cache[T]) leaseTTL() time.Duration {
+	return 2 * min(c.opts.fetchTimeout, math.MaxInt64/2)
 }

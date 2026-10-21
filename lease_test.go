@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -236,4 +237,21 @@ func TestAPanicInReleaseIsLogged(t *testing.T) {
 	require.ErrorIs(t, err, errBoom)
 	require.NoError(t, c.Close())
 	assert.Contains(t, logs.String(), "release blew up")
+}
+
+// A fetch timeout of "never" (math.MaxInt64) still leases: a lease holds two
+// fetch timeouts, which must not overflow into a lease that never holds.
+func TestAFetchTimeoutOfNeverStillLeases(t *testing.T) {
+	shared := cachextest.NewLeasingMap[string]()
+	c := cachex.New[string](newSource(map[string]string{"k": "v"}), []cachex.Layer[string]{
+		cachex.NewLayer[string](cachextest.NewMap[string](), cachex.TTL(time.Minute, 0)),
+		cachex.NewLayer[string](shared, cachex.TTL(time.Hour, 0)),
+	}, cachex.WithFetchTimeout(math.MaxInt64))
+	ctx := context.Background()
+	_, err := c.Get(ctx, "k")
+	require.NoError(t, err)
+	cachex.Settle(c)
+	_, ok, err := shared.Get(ctx, "k")
+	require.NoError(t, err)
+	assert.True(t, ok, "the shared layer is backfilled")
 }
