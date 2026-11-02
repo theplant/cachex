@@ -63,7 +63,7 @@ func main() {
     upstream := cachex.UpstreamFunc[*cachex.Entry[*Product]](
         func(ctx context.Context, key string) (*cachex.Entry[*Product], error) {
             // Fetch from database or API
-            // Return cachex.ErrKeyNotFound for non-existent keys
+            // Return &cachex.ErrKeyNotFound{} for non-existent keys
             product := &Product{ID: key, Name: "Product " + key, Price: 9900}
             return &cachex.Entry[*Product]{
                 Data:     product,
@@ -192,11 +192,11 @@ defer cache.Close()
 Distributed cache with customizable serialization.
 
 ```go
-cache := cachex.NewRedisCache[*Product](
-    redisClient,
-    "product:",     // key prefix
-    30*time.Second, // TTL
-)
+cache := cachex.NewRedisCache[*Product](&cachex.RedisCacheConfig{
+    Client:    redisClient,
+    KeyPrefix: "product:",     // key prefix
+    TTL:       30*time.Second,
+})
 ```
 
 ### GORM (Database)
@@ -204,11 +204,14 @@ cache := cachex.NewRedisCache[*Product](
 Use your database as a cache layer (useful for persistence).
 
 ```go
-cache := cachex.NewGORMCache(
-    db,
-    "cache_products",
-    30*time.Second,
-)
+cache := cachex.NewGORMCache[*Product](&cachex.GORMCacheConfig{
+    DB:        db,
+    TableName: "cache_products",
+})
+// Create the table if needed
+if err := cache.Migrate(ctx); err != nil {
+    // handle error
+}
 ```
 
 ### Custom Cache
@@ -217,13 +220,15 @@ Implement the `Cache[T]` interface:
 
 ```go
 type Cache[T any] interface {
-    Set(ctx context.Context, key string, value T, ttl time.Duration) error
     Get(ctx context.Context, key string) (T, error)
+    Set(ctx context.Context, key string, value T) error
     Del(ctx context.Context, key string) error
 }
 ```
 
-**Important**: When a key does not exist, the `Get` method must return `cachex.ErrKeyNotFound` error, so the Client can correctly distinguish between cache misses and other error conditions.
+**Important**: When a key does not exist, the `Get` method must return a `*cachex.ErrKeyNotFound` error (for example `&cachex.ErrKeyNotFound{}`, optionally wrapped), so the Client can correctly distinguish between cache misses and other error conditions. Use `cachex.IsErrKeyNotFound(err)` to check for it.
+
+`Set` takes no TTL: expiry is decided by the Client (`WithStale` / `EntryWithTTL`), and backends that support a hard TTL take it in their config (`RistrettoCacheConfig.TTL`, `RedisCacheConfig.TTL`).
 
 ## Advanced Features
 
@@ -233,9 +238,11 @@ Combine multiple cache layers for optimal performance. Client implements both `C
 
 ```go
 // L2: Redis cache with database upstream
-l2Cache := cachex.NewRedisCache[*cachex.Entry[*Product]](
-    redisClient, "product:", 10*time.Minute,
-)
+l2Cache := cachex.NewRedisCache[*cachex.Entry[*Product]](&cachex.RedisCacheConfig{
+    Client:    redisClient,
+    KeyPrefix: "product:",
+    TTL:       10 * time.Minute,
+})
 
 dbUpstream := cachex.UpstreamFunc[*cachex.Entry[*Product]](
     func(ctx context.Context, key string) (*cachex.Entry[*Product], error) {
@@ -355,10 +362,14 @@ Transform between different cache types:
 
 ```go
 // Cache stores JSON strings
-stringCache := cachex.NewRedisCache[string](client, "user:", time.Hour)
+stringCache := cachex.NewRedisCache[string](&cachex.RedisCacheConfig{
+    Client:    client,
+    KeyPrefix: "user:",
+    TTL:       time.Hour,
+})
 
 // Transform to User objects
-userCache := cachex.JSONTransform[string, *User](stringCache)
+userCache := cachex.StringJSONTransform[*User](stringCache)
 
 // Use as Cache[*User]
 user, err := userCache.Get(ctx, "user:123")

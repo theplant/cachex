@@ -63,7 +63,7 @@ func main() {
     upstream := cachex.UpstreamFunc[*cachex.Entry[*Product]](
         func(ctx context.Context, key string) (*cachex.Entry[*Product], error) {
             // Fetch from database or API
-            // Return cachex.ErrKeyNotFound for non-existent keys
+            // Return &cachex.ErrKeyNotFound{} for non-existent keys
             product := &Product{ID: key, Name: "Product " + key, Price: 9900}
             return &cachex.Entry[*Product]{
                 Data:     product,
@@ -192,11 +192,11 @@ defer cache.Close()
 支持自定义序列化的分布式缓存。
 
 ```go
-cache := cachex.NewRedisCache[*Product](
-    redisClient,
-    "product:",     // key 前缀
-    30*time.Second, // TTL
-)
+cache := cachex.NewRedisCache[*Product](&cachex.RedisCacheConfig{
+    Client:    redisClient,
+    KeyPrefix: "product:",     // key 前缀
+    TTL:       30*time.Second,
+})
 ```
 
 ### GORM（数据库）
@@ -204,11 +204,14 @@ cache := cachex.NewRedisCache[*Product](
 将数据库用作缓存层（适用于持久化需求）。
 
 ```go
-cache := cachex.NewGORMCache(
-    db,
-    "cache_products",
-    30*time.Second,
-)
+cache := cachex.NewGORMCache[*Product](&cachex.GORMCacheConfig{
+    DB:        db,
+    TableName: "cache_products",
+})
+// 需要时建表
+if err := cache.Migrate(ctx); err != nil {
+    // 处理错误
+}
 ```
 
 ### 自定义缓存
@@ -217,13 +220,15 @@ cache := cachex.NewGORMCache(
 
 ```go
 type Cache[T any] interface {
-    Set(ctx context.Context, key string, value T, ttl time.Duration) error
     Get(ctx context.Context, key string) (T, error)
+    Set(ctx context.Context, key string, value T) error
     Del(ctx context.Context, key string) error
 }
 ```
 
-**重要**：当 key 不存在时，`Get` 方法必须返回 `cachex.ErrKeyNotFound` 错误，以便 Client 能够正确区分缓存未命中和其他错误情况。
+**重要**：当 key 不存在时，`Get` 方法必须返回 `*cachex.ErrKeyNotFound` 类型的错误（比如 `&cachex.ErrKeyNotFound{}`，可以再包一层），以便 Client 能够正确区分缓存未命中和其他错误情况。判断时用 `cachex.IsErrKeyNotFound(err)`。
+
+`Set` 不带 TTL 参数：过期由 Client 判断（`WithStale` / `EntryWithTTL`），支持硬过期的后端在各自的配置里设（`RistrettoCacheConfig.TTL`、`RedisCacheConfig.TTL`）。
 
 ## 高级特性
 
@@ -233,9 +238,11 @@ type Cache[T any] interface {
 
 ```go
 // L2: Redis cache with database upstream
-l2Cache := cachex.NewRedisCache[*cachex.Entry[*Product]](
-    redisClient, "product:", 10*time.Minute,
-)
+l2Cache := cachex.NewRedisCache[*cachex.Entry[*Product]](&cachex.RedisCacheConfig{
+    Client:    redisClient,
+    KeyPrefix: "product:",
+    TTL:       10 * time.Minute,
+})
 
 dbUpstream := cachex.UpstreamFunc[*cachex.Entry[*Product]](
     func(ctx context.Context, key string) (*cachex.Entry[*Product], error) {
@@ -355,10 +362,14 @@ client := cachex.NewClient(
 
 ```go
 // 缓存存储 JSON 字符串
-stringCache := cachex.NewRedisCache[string](client, "user:", time.Hour)
+stringCache := cachex.NewRedisCache[string](&cachex.RedisCacheConfig{
+    Client:    client,
+    KeyPrefix: "user:",
+    TTL:       time.Hour,
+})
 
 // 转换为 User 对象
-userCache := cachex.JSONTransform[string, *User](stringCache)
+userCache := cachex.StringJSONTransform[*User](stringCache)
 
 // 作为 Cache[*User] 使用
 user, err := userCache.Get(ctx, "user:123")
